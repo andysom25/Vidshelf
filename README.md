@@ -119,6 +119,7 @@ All optional — see `.env.example` for the full template.
 | `PLEX_CLIENT_ID` / `PLEX_PRODUCT` | This deployment's identity for Plex's OAuth flow. Auto-generated/persisted if unset. |
 | `NAS_SMB_USER` / `NAS_SMB_PASS` / `NAS_SMB_DEVICE` | Only needed if you use the Docker Compose `cifs` volume for a network share — see the comments in `docker-compose.yml`. |
 | `FFMPEG_PATH` | Override the ffmpeg/ffprobe binary location if not on `PATH`. |
+| `MAX_CONCURRENT_DOWNLOADS` | Max downloads (and their format-conversion re-encodes) running at once, across all download types combined. Defaults to `2` — format conversion is CPU/memory-heavy, so raise this only if your hardware can handle more concurrent encodes. |
 
 ### `config.json`
 
@@ -366,7 +367,6 @@ config.json / downloaded_videos.json / active_downloads.json
 
 ## Known Limitations
 
-- No rate limiting on parallel downloads
 - No download scheduling
 - Music Video search relies on YouTube search (no dedicated data API)
 - Plex library titles/collections assume an "Artist - Song" convention in the source video's title; a handful of stylistic variants are normalized automatically, but an artist whose uploads never include the artist name in a recognizable form won't be matched

@@ -940,13 +940,23 @@
                             <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
                                 <span style="font-size:1.5em;">📚</span>
                                 <div>
-                                    <div style="font-weight:600;color:#fff;">Step 3: Discover Library</div>
-                                    <div style="font-size:0.85em;color:#8888a0;">Auto-detect your Music Videos library in Plex</div>
+                                    <div style="font-weight:600;color:#fff;">Step 3: Choose Library</div>
+                                    <div style="font-size:0.85em;color:#8888a0;">Find your Music Videos library and confirm it's the right one before saving</div>
                                 </div>
                             </div>
-                            <button class="btn btn-secondary" onclick="discoverPlexLibrary()" id="plex-discover-btn">
-                                🔍 Discover Library
+                            <button class="btn btn-secondary" onclick="findPlexLibraries()" id="plex-discover-btn">
+                                🔍 Find Libraries
                             </button>
+                            <div id="plex-library-picker" style="display:none;margin-top:14px;">
+                                <div class="form-group">
+                                    <label for="plex-library-select">Music Video Library</label>
+                                    <select id="plex-library-select" style="width:100%;"></select>
+                                    <div class="help-text" id="plex-library-auto-note"></div>
+                                </div>
+                                <button class="btn btn-primary btn-sm" onclick="savePlexLibrary()" id="plex-save-library-btn">
+                                    💾 Save Selected Library
+                                </button>
+                            </div>
                             <div id="plex-library-status" style="margin-top:12px;font-size:0.9em;color:#8888a0;"></div>
                         </div>
                     </div>
@@ -1020,6 +1030,20 @@
                         <div id="conversion-progress-bar" style="height:100%;width:0%;background:#e94560;border-radius:4px;transition:width 0.5s ease;"></div>
                     </div>
                     <div id="conversion-current-file" style="font-size:0.78em;color:#707080;margin-top:6px;word-break:break-all;"></div>
+                </div>
+            </div>
+
+            <!-- System Health -->
+            <div class="section">
+                <div class="section-header">
+                    <h3>🩺 System Health</h3>
+                </div>
+                <p class="text-muted mb-12">
+                    Checks the external tools this app depends on — most useful if you're running
+                    without Docker, since the Docker image always bundles these.
+                </p>
+                <div id="system-health-list" style="display:flex;flex-direction:column;gap:8px;">
+                    <div class="loading"><div class="spinner"></div></div>
                 </div>
             </div>
 
@@ -1218,6 +1242,7 @@
                     loadPlexBasePath();
                     loadMusicVideoPath();
                     resumeConversionPollingIfRunning();
+                    loadSystemHealth();
                 }
                 if (page === 'dashboard') loadDashboardStats();
                 if (page === 'swap-art') loadSwapArtArtists();
@@ -1911,6 +1936,10 @@
                 container.innerHTML = `
                     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;">
                         <div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);">
+                            <div style="font-size:0.75em;color:#8888a0;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Vidshelf Version</div>
+                            <div style="font-size:1.1em;font-weight:600;color:#fff;">${data.app_version}</div>
+                        </div>
+                        <div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);">
                             <div style="font-size:0.75em;color:#8888a0;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Python</div>
                             <div style="font-size:1.1em;font-weight:600;color:#fff;">${data.python_version}</div>
                         </div>
@@ -2507,20 +2536,74 @@
             }
         }
 
-        async function discoverPlexLibrary() {
+async function findPlexLibraries() {
             const btn = document.getElementById('plex-discover-btn');
             const statusEl = document.getElementById('plex-library-status');
+            const picker = document.getElementById('plex-library-picker');
             btn.disabled = true;
-            btn.textContent = '⏳ Discovering...';
-            statusEl.innerHTML = '<div style="color:#e9c46a;">⏳ Scanning Plex libraries...</div>';
+            btn.textContent = '⏳ Searching...';
+            statusEl.innerHTML = '<div style="color:#e9c46a;">⏳ Listing Plex libraries...</div>';
+            picker.style.display = 'none';
 
             try {
-                const resp = await fetch('/api/plex/discover-library', { method: 'POST' });
+                const resp = await fetch('/api/plex/libraries');
                 const data = await resp.json();
+                const libraries = data.libraries || [];
 
+                if (libraries.length === 0) {
+                    statusEl.innerHTML = '<div style="color:#f8a5b0;">❌ No libraries found. Check server_url and token.</div>';
+                    return;
+                }
+
+                const select = document.getElementById('plex-library-select');
+                select.innerHTML = '';
+                let autoTitle = null;
+                libraries.forEach(lib => {
+                    const opt = document.createElement('option');
+                    opt.value = lib.key;
+                    opt.textContent = `${lib.title} (${lib.type}, key=${lib.key})${lib.is_auto_discovered ? ' — suggested' : ''}`;
+                    if (lib.is_auto_discovered) {
+                        opt.selected = true;
+                        autoTitle = lib.title;
+                    }
+                    select.appendChild(opt);
+                });
+
+                document.getElementById('plex-library-auto-note').textContent = autoTitle
+                    ? `Auto-detected "${autoTitle}" from its name — double-check this is actually your music-video library before saving.`
+                    : 'Could not auto-detect which library is for music videos — pick the right one manually.';
+
+                picker.style.display = 'block';
+                statusEl.innerHTML = `<div style="color:#8888a0;">Found ${libraries.length} librar${libraries.length === 1 ? 'y' : 'ies'} — confirm the right one below, then save.</div>`;
+            } catch (e) {
+                statusEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🔍 Find Libraries';
+            }
+        }
+
+        async function savePlexLibrary() {
+            const btn = document.getElementById('plex-save-library-btn');
+            const statusEl = document.getElementById('plex-library-status');
+            const select = document.getElementById('plex-library-select');
+            const libraryKey = select.value;
+            const libraryTitle = select.options[select.selectedIndex].textContent;
+            if (!libraryKey) return;
+
+            btn.disabled = true;
+            btn.textContent = '⏳ Saving...';
+            try {
+                const resp = await fetch('/api/plex/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ music_video_library_key: libraryKey })
+                });
+                const data = await resp.json();
                 if (data.success) {
-                    statusEl.innerHTML = `<div style="color:#7ddf90;">✅ ${data.message}</div>`;
-                    document.getElementById('plex-library-key').textContent = data.library_key;
+                    statusEl.innerHTML = `<div style="color:#7ddf90;">✅ Saved: ${escapeHtml(libraryTitle)}</div>`;
+                    document.getElementById('plex-library-key').textContent = libraryKey;
+                    showToast('✅ Library saved', 'success');
                     checkPlexConnection();
                 } else {
                     statusEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
@@ -2529,7 +2612,7 @@
                 statusEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
             } finally {
                 btn.disabled = false;
-                btn.textContent = '🔍 Discover Library';
+                btn.textContent = '💾 Save Selected Library';
             }
         }
 
@@ -2723,6 +2806,48 @@
             } finally {
                 btn.disabled = false;
                 btn.textContent = '🧬 Remove Duplicate Collections';
+            }
+        }
+
+        // ---------- System Health ----------
+        async function loadSystemHealth() {
+            const list = document.getElementById('system-health-list');
+            try {
+                const resp = await fetch('/api/system/health');
+                const data = await resp.json();
+                if (data.error) {
+                    list.innerHTML = `<div style="color:#f8a5b0;">${escapeHtml(data.error)}</div>`;
+                    return;
+                }
+
+                const rows = [
+                    { key: 'ffmpeg', label: 'ffmpeg', why: 'downloading and merging video/audio streams' },
+                    { key: 'ffprobe', label: 'ffprobe', why: 'checking video/audio codecs for format conversion' },
+                    { key: 'pillow', label: 'Pillow', why: 'generating per-video title-card posters' },
+                    { key: 'fonts', label: 'DejaVu fonts', why: 'legible text on title-card posters (falls back to a tiny bitmap font without it)' },
+                ];
+
+                let html = '';
+                rows.forEach(r => {
+                    const info = data[r.key] || {};
+                    const ok = !!info.found;
+                    const icon = ok ? '✅' : '❌';
+                    const color = ok ? '#7ddf90' : '#f8a5b0';
+                    let detail = ok ? 'found' : 'not found';
+                    if (ok && info.version) detail = `v${escapeHtml(info.version)}`;
+                    if (ok && info.path) detail += ` <span style="color:#606070;">(${escapeHtml(info.path)})</span>`;
+                    html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(255,255,255,0.03);border-radius:6px;">
+                        <div>
+                            <span style="color:${color};">${icon}</span>
+                            <strong style="margin-left:4px;">${r.label}</strong>
+                            <span style="color:#707080;font-size:0.85em;"> — ${r.why}</span>
+                        </div>
+                        <div style="font-size:0.85em;color:#8888a0;">${detail}</div>
+                    </div>`;
+                });
+                list.innerHTML = html;
+            } catch (e) {
+                list.innerHTML = `<div style="color:#f8a5b0;">Failed to check system health: ${e.message}</div>`;
             }
         }
 
