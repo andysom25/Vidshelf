@@ -1,0 +1,24 @@
+{
+    "channels": [
+        {
+            "url": "https://www.youtube.com/@ExampleChannel",
+            "download_path": "./downloads",
+            "plex_media_path": "./downloads",
+            "download_mode": "manual"
+        }
+    ],
+    "plex_base_path": "./downloads",
+    "music_video_plex_path": "./downloads/music_videos",
+    "artwork_sync": {
+        "root_path": "/app/music_videos_final",
+        "watch_interval": 120,
+        "plex_refresh_on_sync": false,
+        "plex_collection_sync_on_artwork": true,
+        "fanarttv_api_key": ""
+    },
+    "plex": {
+        "server_url": "",
+        "token": "",
+        "music_video_library_key": ""
+    }
+}

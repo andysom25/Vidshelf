@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Downloads / media output
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.mp3
+*.part
+*.ytdl
+
+# Env / secrets
+.env
+*.log
+config.json
+cookies.txt
+
+# Runtime state (regenerated automatically, not source)
+active_downloads.json
+downloaded_videos.json
+
+# Aider
+.aider*
+!.aider.conf.yml
+!.aider.model.settings.yml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code — settings.local.json is per-developer, not shared config
+.claude/settings.local.json

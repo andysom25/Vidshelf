@@ -1,0 +1,43 @@
+name: vidshelf
+
+services:
+  vidshelf:
+    build: .
+    container_name: vidshelf
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      # Mount a persistent downloads directory so files survive container rebuilds
+      - ./downloads:/app/downloads
+      # Mount config.json so you can edit it from the host
+      - ./config.json:/app/config.json
+      # Mount json tracker files for persistence
+      - ./active_downloads.json:/app/active_downloads.json
+      - ./downloaded_videos.json:/app/downloaded_videos.json
+      # Native Linux CIFS mount of the NAS share (see volumes: below). Do NOT
+      # bind-mount a Windows drive letter or UNC path here - Docker Desktop
+      # silently substitutes a small local decoy volume instead of erroring,
+      # which is why this used to fail with "No space left on device".
+      - music_videos_final:/app/music_videos_final
+    environment:
+      - FLASK_ENV=production
+      # Optional — see .env.example. If unset: SECRET_KEY is auto-generated
+      # and persisted into config.json on first run; ADMIN_USERNAME defaults
+      # to "admin" and ADMIN_PASSWORD is auto-generated and printed once to
+      # `docker logs` on first run if not set.
+      - SECRET_KEY=${SECRET_KEY:-}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-false}
+      - PLEX_CLIENT_ID=${PLEX_CLIENT_ID:-}
+      - PLEX_PRODUCT=${PLEX_PRODUCT:-}
+    cap_add:
+      - SYS_ADMIN
+
+volumes:
+  music_videos_final:
+    driver_opts:
+      type: cifs
+      o: "username=${NAS_SMB_USER},password=${NAS_SMB_PASS},vers=3.0,uid=1000,gid=1000,file_mode=0777,dir_mode=0777"
+      device: "${NAS_SMB_DEVICE}"
