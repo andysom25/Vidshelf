@@ -701,6 +701,24 @@
                 <h1>Dashboard</h1>
                 <p>Overview of your YouTube media automation</p>
             </div>
+
+            <div id="getting-started-card" style="display:none;background:rgba(233,69,96,0.06);border:1px solid rgba(233,69,96,0.2);border-radius:10px;padding:18px 20px;margin-bottom:20px;position:relative;">
+                <button onclick="dismissGettingStarted()" title="Dismiss" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#8888a0;font-size:1.1em;cursor:pointer;line-height:1;">✕</button>
+                <h3 style="margin:0 0 4px 0;font-size:1.05em;">👋 Getting Started</h3>
+                <p class="text-muted" style="margin:0 0 12px 0;font-size:0.88em;">A few things to try to get the most out of Vidshelf:</p>
+                <div style="display:flex;flex-direction:column;gap:8px;">
+                    <div id="gs-step-channel" class="gs-step" style="cursor:pointer;font-size:0.9em;" onclick="navigateTo('channels')">
+                        <span class="gs-step-icon">⬜</span> Add a YouTube channel to monitor — <span style="color:#8888a0;">Channels page</span>
+                    </div>
+                    <div id="gs-step-download" class="gs-step" style="cursor:pointer;font-size:0.9em;" onclick="navigateTo('music-videos')">
+                        <span class="gs-step-icon">⬜</span> Download your first video — try the <span style="color:#8888a0;">Music Videos</span> search
+                    </div>
+                    <div id="gs-step-plex" class="gs-step" style="cursor:pointer;font-size:0.9em;" onclick="navigateTo('settings')">
+                        <span class="gs-step-icon">⬜</span> (Optional) Connect Plex for automatic artwork, collections &amp; title cards — <span style="color:#8888a0;">Settings page</span>
+                    </div>
+                </div>
+            </div>
+
             <div class="stats-grid">
                 <div class="stat-card" onclick="navigateTo('channels')">
                     <div class="stat-icon">📺</div>
@@ -1321,6 +1339,8 @@
 
         // ---------- Dashboard Stats ----------
         async function loadDashboardStats() {
+            let channelCount = 0;
+            let downloadsCount = 0;
             try {
                 const [chResp, statsResp] = await Promise.all([
                     fetch('/api/channels'),
@@ -1329,13 +1349,15 @@
                 const chData = await chResp.json();
                 const statsData = await statsResp.json();
                 if (chData.channels) {
-                    document.getElementById('stat-channels').textContent = chData.channels.length;
+                    channelCount = chData.channels.length;
+                    document.getElementById('stat-channels').textContent = channelCount;
                 }
                 if (statsData.videos_count !== undefined) {
                     document.getElementById('stat-videos').textContent = statsData.videos_count;
                 }
                 if (statsData.downloads_count !== undefined) {
-                    document.getElementById('stat-downloads').textContent = statsData.downloads_count;
+                    downloadsCount = statsData.downloads_count;
+                    document.getElementById('stat-downloads').textContent = downloadsCount;
                 }
                 if (statsData.disk_usage !== undefined) {
                     const disk = statsData.disk_usage;
@@ -1352,6 +1374,55 @@
             } catch (e) {
                 console.error('Failed to load stats:', e);
             }
+            loadGettingStarted(channelCount, downloadsCount);
+        }
+
+        // ---------- Getting Started checklist ----------
+        const GETTING_STARTED_DISMISSED_KEY = 'vidshelf_getting_started_dismissed';
+
+        async function loadGettingStarted(channelCount, downloadsCount) {
+            const card = document.getElementById('getting-started-card');
+            if (localStorage.getItem(GETTING_STARTED_DISMISSED_KEY) === 'true') {
+                card.style.display = 'none';
+                return;
+            }
+
+            let plexConnected = false;
+            try {
+                const plexResp = await fetch('/api/plex/config');
+                const plexData = await plexResp.json();
+                plexConnected = !!plexData.token;
+            } catch (e) { /* leave plexConnected false if this fails */ }
+
+            const hasChannel = channelCount > 0;
+            const hasDownload = downloadsCount > 0;
+
+            // Once the two non-optional steps are done, there's nothing left
+            // this card can usefully remind someone about - auto-hide rather
+            // than making them dismiss it themselves. Plex stays optional by
+            // design (see README) so it doesn't gate auto-hiding.
+            if (hasChannel && hasDownload) {
+                card.style.display = 'none';
+                return;
+            }
+
+            card.style.display = 'block';
+            setGettingStartedStep('gs-step-channel', hasChannel);
+            setGettingStartedStep('gs-step-download', hasDownload);
+            setGettingStartedStep('gs-step-plex', plexConnected);
+        }
+
+        function setGettingStartedStep(elId, done) {
+            const el = document.getElementById(elId);
+            const icon = el.querySelector('.gs-step-icon');
+            icon.textContent = done ? '✅' : '⬜';
+            el.style.opacity = done ? '0.55' : '1';
+            el.style.textDecoration = done ? 'line-through' : 'none';
+        }
+
+        function dismissGettingStarted() {
+            localStorage.setItem(GETTING_STARTED_DISMISSED_KEY, 'true');
+            document.getElementById('getting-started-card').style.display = 'none';
         }
 
         // ---------- Channels ----------

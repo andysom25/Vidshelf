@@ -272,6 +272,37 @@ Everything else lives in `config.json` (created automatically, gitignored — co
 | `./active_downloads.json` | `/app/active_downloads.json` | Runtime progress |
 | `music_videos_final` (named volume) | `/app/music_videos_final` | Music-video library — a native `cifs` mount if you're pointing at a network share (see `docker-compose.yml`); swap for a plain bind mount if you're storing locally instead |
 
+### Simple local-storage setup
+
+The `docker-compose.yml` in this repo is set up for a network share (a
+native `cifs` volume, since Docker Desktop can't reliably bind-mount a
+Windows drive letter or UNC path — see `REFERENCE.md` for why). If you
+just want to store your music-video library on local disk instead of a
+NAS, replace the `music_videos_final` volume with a plain bind mount:
+
+```yaml
+services:
+  vidshelf:
+    build: .
+    container_name: vidshelf
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./config.json:/app/config.json
+      - ./active_downloads.json:/app/active_downloads.json
+      - ./downloaded_videos.json:/app/downloaded_videos.json
+      - ./music_videos:/app/music_videos_final   # local folder instead of a NAS share
+    environment:
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+```
+
+No `cap_add`/`driver_opts`/`NAS_SMB_*` variables needed for this version —
+those only matter for the `cifs` network-share setup. See `.env.example`
+for every environment variable this app recognizes.
+
 ### Commands
 
 ```bash

@@ -2478,6 +2478,67 @@ rather than trusting an initial grep pass — the first attempt here missed
 the `.env.example` comment and the docstring in `artwork_sync.py` until a
 second full-repo sweep caught them.
 
+## ADDED (2026-07-23): first-run experience for new users (dashboard checklist + login hint + a simpler Docker example)
+
+Now that this is a public repo, first-time users get none of the
+hand-holding a private/personal deployment implicitly had. Three small
+additions to close that gap:
+
+### Dashboard "Getting Started" checklist
+
+New card in `templates/dashboard.html`'s `#page-dashboard`, above the
+stats grid: three items (add a channel, download a video, optionally
+connect Plex), each a clickable link to the relevant page
+(`navigateTo('channels'|'music-videos'|'settings')`).
+
+- `loadGettingStarted(channelCount, downloadsCount)` is called from the
+  tail of the existing `loadDashboardStats()` (which already fetches
+  channel/download counts for the stat cards — reused rather than adding a
+  second round-trip), plus its own `fetch('/api/plex/config')` to check
+  whether `token` is set.
+- **Auto-hides once the two non-optional steps are done** (channel added
+  + at least one download) — Plex stays optional by design (see README),
+  so it doesn't gate auto-hiding on its own.
+- **Manually dismissible** any time via a `✕` button, persisted in
+  `localStorage` (`vidshelf_getting_started_dismissed`) — no backend
+  state, so this is purely a per-browser preference, not tied to the
+  account.
+
+**Verified live**: confirmed the card's markup (`getting-started-card`,
+`gs-step-channel`, `gs-step-download`, `gs-step-plex`) is served on
+`/dashboard`. Auto-hide behavior wasn't separately visually verified in a
+browser this session (this deployment already has channels and downloads,
+so it auto-hides immediately, which is itself the expected/correct
+behavior for an existing install) — if a fresh install ever shows the card
+not appearing/disappearing correctly, check `loadGettingStarted()`'s early
+`localStorage` check first (a stale `true` value from an unrelated earlier
+dismiss would suppress it silently).
+
+### Login page password hint
+
+`templates/login.html` previously gave zero indication of *how* to get
+the first-run admin password if `ADMIN_PASSWORD` wasn't set (see the
+"replace hardcoded credentials" security fix earlier in this file) — a
+new user would just see a blank login form with no clue to check
+`docker compose logs`. Added a small permanent note below the login form
+pointing at the `[SECURITY]`-prefixed log line and the relevant env vars.
+Deliberately not conditional on anything (no way for the login page's
+Flask route to know whether a password was auto-generated vs.
+explicitly set without adding a new state check) — the note is accurate
+and harmless to show either way.
+
+### Simpler Docker Compose example in README
+
+The repo's actual `docker-compose.yml` is tailored to this account's own
+NAS/CIFS setup (`type: cifs` driver, `SYS_ADMIN` capability — see the
+CIFS mount RESOLVED section above for why). A first-time user without a
+NAS share would hit that complexity immediately with no simpler option
+shown. Added a "Simple local-storage setup" section to `README.md`'s
+Docker section with a minimal example swapping the `music_videos_final`
+CIFS volume for a plain bind mount (`./music_videos:/app/music_videos_final`)
+and no `cap_add`/`driver_opts`/`NAS_SMB_*` variables — those only matter
+for the network-share case.
+
 `ast.parse()` on all four touched Python files (`app.py`, `artwork_sync.py`,
 `artwork_swap.py`, `downloader.py`) after every edit — syntax-valid.
 
