@@ -2744,3 +2744,40 @@ just this app's collections, which is more exposure than the ask
 warranted. The in-app Artists page (artist name + artwork + video
 count) is the source of truth for what becomes a Plex collection here
 anyway, so it was captioned as such instead.
+
+## RELEASED (2026-07-25): v1.0.0 — first stable release
+
+Preceded by a diff-scoped security review (`git diff origin/main...dev`,
+the two commits ahead of `main` at the time: system health check +
+bounded concurrency + Plex library confirmation, and the README
+screenshots commit). Methodology: an independent sub-agent searched for
+new vulnerabilities against the categories a security engineer would
+check (injection, auth bypass, secrets, SSRF, XSS, unsafe
+deserialization), explicitly scoped to what the diff *introduced* —
+not the pre-existing, already-documented findings in the "SECURITY
+AUDIT (2026-07-20)" section above. **Result: no findings met the
+≥0.8-confidence bar.** Specifically verified clean: the two new routes
+(`/api/system/health`, `/api/plex/libraries`) follow the same
+session-check pattern as every other route; `download_id` is never
+used as a filesystem path or subprocess argument; the new dashboard.html
+JS routes every server string through the existing `escapeHtml()`
+helper (and is actually *stricter* than the code it replaced — the old
+`discoverPlexLibrary()` interpolated `data.message` into `innerHTML`
+unescaped; that path no longer exists after this diff).
+
+**Release mechanics** (see `CLAUDE.md`'s "Branching & release workflow"
+— followed exactly, no deviations): bumped `VERSION` to `1.0.0` on
+`dev` (was `0.1.0`), pushed; merged `dev` → `main` with an explicit
+`--no-ff` merge commit (`557b6d3`) rather than a fast-forward, so
+`main`'s log shows one merge commit per release instead of looking like
+linear direct-to-main work; tagged that merge commit `v1.0.0`; pushed
+`main` and the tag; published a GitHub Release from the tag via `gh
+release create` with a summary of highlights + the security posture.
+`dev` was left checked out afterward as the active branch, per the
+"day-to-day work happens on dev" convention.
+
+**If picking up new work after this point**: `main` is now at the
+`v1.0.0` tag; `dev` is even with `main` (no unmerged commits either
+direction) until the next feature/fix lands. Confirm with `git log
+origin/main..dev --oneline` (should be empty right after a release) if
+that's ever in doubt.
