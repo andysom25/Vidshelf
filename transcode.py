@@ -44,6 +44,42 @@ def _ffprobe_bin():
     return os.path.join(override, 'ffprobe') if override else 'ffprobe'
 
 
+def _check_binary(bin_getter, version_flag='-version'):
+    """Resolve a binary (respecting FFMPEG_PATH the same way _ffmpeg_bin()/
+    _ffprobe_bin() do) and report whether it's actually runnable, not just
+    present on PATH — a corrupt/non-executable binary would otherwise look
+    identical to a healthy one from a bare shutil.which() check."""
+    binary = bin_getter()
+    path = shutil.which(binary)
+    if not path and os.path.isfile(binary):
+        path = binary
+    if not path:
+        return {'found': False, 'path': None, 'version': None}
+    try:
+        result = subprocess.run([binary, version_flag], capture_output=True, text=True, timeout=10)
+        first_line = (result.stdout or result.stderr or '').splitlines()[0] if (result.stdout or result.stderr) else ''
+        version = None
+        if 'version' in first_line:
+            # e.g. "ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 ..."
+            after = first_line.split('version', 1)[1].strip()
+            version = after.split(' ')[0] if after else None
+        return {'found': True, 'path': path, 'version': version}
+    except Exception as exc:
+        _log.warning("Found %s at %s but it failed to run: %s", binary, path, exc)
+        return {'found': True, 'path': path, 'version': None}
+
+
+def check_dependencies():
+    """Report on the external binaries this module needs. Used by the
+    Settings page's System Health panel — most useful for the local
+    (non-Docker) install path, since the Docker image always bakes these
+    in, but even there this catches a misconfigured FFMPEG_PATH."""
+    return {
+        'ffmpeg': _check_binary(_ffmpeg_bin),
+        'ffprobe': _check_binary(_ffprobe_bin),
+    }
+
+
 def probe_media(path):
     """Return {'container': ext, 'video_codec': ..., 'audio_codec': ...},
     or None if ffprobe fails (missing/corrupt/unreadable file)."""

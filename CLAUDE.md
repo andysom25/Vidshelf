@@ -4,6 +4,13 @@ See [REFERENCE.md](REFERENCE.md) for architecture, file responsibilities, and th
 
 **Keep REFERENCE.md up to date.** Any time you change code in this project — a new feature, a bug fix, a design change, a regression and its fix — add or update the relevant section in REFERENCE.md before finishing up, in the same style as the existing sections (what broke, why, the fix, how to verify, what to check first if it regresses). This file is what keeps the next session (yours or another agent's) from re-diagnosing something that's already been solved once — it's already saved real time twice in this project (the CIFS mount bug, and the Plex OAuth/collections bug stack). Skipping this because a change feels small is exactly how the next regression report turns into a from-scratch investigation.
 
+## Branching & release workflow
+
+- **`main` is releases-only.** Every commit on `main` should correspond to a tagged release (see `VERSION` file — bump it as part of the merge that cuts a release, following semver: patch for fixes, minor for new features, major for breaking changes).
+- **`dev` is where active work happens.** Day-to-day commits — features, fixes, refactors — go on `dev`, not `main`. Don't push directly to `main` outside of a release merge.
+- **Cutting a release** = merge `dev` → `main`, bump `VERSION`, tag the merge commit (`git tag vX.Y.Z`), push both the branch and the tag, then optionally draft a GitHub Release from that tag.
+- If you're picking up work in this repo and aren't sure which branch you're on, check with `git branch --show-current` before committing — don't assume `main`.
+
 ## Known gotcha #1: Docker Desktop on Windows cannot bind-mount a network share
 
 `Y:\` (or any UNC path like `\\192.168.1.100\ppv\MusicVideos`) is a Windows-mapped SMB drive, not a real local path. Docker Desktop **cannot bind-mount it** — and critically, it doesn't error when you try. It silently substitutes a small local decoy volume instead. This looked exactly like "the CIFS mount doesn't support X syscall" for a long time: `/app/music_videos_final` showed up as `/dev/sdd`, type `ext4`, 137MB total, 100% full — never once actually touching the NAS.

@@ -32,8 +32,6 @@ downloaded_videos.json
 
 # Aider
 .aider*
-!.aider.conf.yml
-!.aider.model.settings.yml
 
 # OS / editor
 .DS_Store

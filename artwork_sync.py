@@ -778,6 +778,18 @@ _REGULAR_FONT_CANDIDATES = (
 )
 
 
+def check_title_card_dependencies():
+    """Report on what title-card generation needs. Used by the Settings
+    page's System Health panel — Pillow missing means no title cards at
+    all (generate_title_card() just returns False); fonts missing means
+    they'll render with Pillow's tiny bitmap default instead of DejaVu."""
+    font_found = any(os.path.isfile(p) for p in _BOLD_FONT_CANDIDATES + _REGULAR_FONT_CANDIDATES)
+    return {
+        'pillow': {'found': _PIL_AVAILABLE},
+        'fonts': {'found': font_found},
+    }
+
+
 def _load_font(size, bold=False):
     candidates = _BOLD_FONT_CANDIDATES if bold else _REGULAR_FONT_CANDIDATES
     for path in candidates:
@@ -1295,6 +1307,53 @@ def plex_find_library_key(config):
     except Exception as exc:
         _log.warning("Failed to discover Plex library key: %s", exc)
         return None
+
+
+def plex_list_libraries(config):
+    """List every library on the connected Plex server, flagging which one
+    auto-discovery (plex_find_library_key()) would pick.
+
+    Auto-discovery guesses from the library *title* containing "music
+    video" - a real account hit this exact failure mode with a library
+    titled "Muisc Videos" (transposed typo), where discovery silently fell
+    back to an unrelated movies library with no way to know it had guessed
+    wrong short of manually cross-checking (see the Plex OAuth/collections
+    bug stack in REFERENCE.md). Returning the full list lets the UI show a
+    confirm/pick step instead of trusting the guess blindly.
+
+    Returns a list of {'key', 'title', 'type', 'is_auto_discovered'} dicts,
+    or [] on any failure.
+    """
+    base_url = _plex_url(config)
+    if not base_url:
+        return []
+    headers = _plex_headers(config)
+    plex_config = config.get('plex', {})
+    token = plex_config.get('token', '')
+
+    try:
+        resp = requests.get(f"{base_url}/library/sections", headers=headers, timeout=10)
+        if resp.status_code == 401:
+            resp = requests.get(f"{base_url}/library/sections?X-Plex-Token={token}", timeout=10)
+        resp.raise_for_status()
+        directories = resp.json().get('MediaContainer', {}).get('Directory', [])
+    except Exception as exc:
+        _log.warning("Failed to list Plex libraries: %s", exc)
+        return []
+
+    auto_key = plex_find_library_key(config)
+    libraries = []
+    for d in directories:
+        key = str(d.get('key', ''))
+        if not key:
+            continue
+        libraries.append({
+            'key': key,
+            'title': d.get('title', ''),
+            'type': d.get('type', ''),
+            'is_auto_discovered': key == auto_key,
+        })
+    return libraries
 
 
 _TRAILING_YOUTUBE_ID_RE = re.compile(r'-[A-Za-z0-9_-]{11}$')

@@ -2566,3 +2566,181 @@ for the network-share case.
 - `docker exec vidshelf cat /app/config.json` directly confirmed both
   `_secret_key` and `_auth.password_hash` are present on disk (as expected —
   only the API response is filtered, not the file itself).
+
+## ADDED (2026-07-23): system health check, bounded download concurrency, Plex library confirmation
+
+Three more first-run/reliability improvements, continuing the same theme.
+
+### System Health panel (Settings page)
+
+New checks, both read-only and side-effect-free:
+- `transcode.check_dependencies()` — resolves `ffmpeg`/`ffprobe` the same
+  way `_ffmpeg_bin()`/`_ffprobe_bin()` already do (respecting
+  `FFMPEG_PATH`), confirms the binary actually **runs** (not just present
+  via `shutil.which()` — a corrupt/non-executable binary would otherwise
+  look identical to a healthy one), and parses the version string.
+- `artwork_sync.check_title_card_dependencies()` — reports `_PIL_AVAILABLE`
+  and whether any of the DejaVu font paths `_load_font()` already checks
+  exist.
+
+Exposed via `GET /api/system/health`, rendered as a simple ✅/❌ list on the
+Settings page (`loadSystemHealth()`, called when the page loads). Most
+useful for the **local (non-Docker) install path** — the Docker image
+always bakes in ffmpeg/Pillow/fonts, so this mostly matters there if
+`FFMPEG_PATH` is misconfigured; for a bare `pip install` setup, this turns
+"why isn't conversion working" into a visible answer instead of a support
+question.
+
+**Verified live**: `GET /api/system/health` against the real container
+returned `ffmpeg`/`ffprobe` v7.1.5 found at `/usr/bin/`, `pillow`/`fonts`
+both `true` — matches what the earlier format-conversion work already
+confirmed was installed.
+
+### Bounded download concurrency
+
+**Real gap, not theoretical**: `api_channels_download_all()` spawned one
+raw `threading.Thread` per video with **no concurrency cap** — up to 20 at
+once for a "Download All" click. Combined with automatic format
+conversion (CPU/memory-heavy — see the `transcode.py` ADDED section
+above), this is exactly what produced the real OOM-killed ffmpeg
+conversions and contributed to the Docker Desktop crash documented
+earlier in this file. Two download threads both encoding at once already
+exceeded the container's memory limit once; 20 would guarantee it.
+
+**Fix**: a single module-level `concurrent.futures.ThreadPoolExecutor`
+(`_DOWNLOAD_EXECUTOR` in `app.py`, `max_workers` from
+`MAX_CONCURRENT_DOWNLOADS` env var, default `2`) that every download entry
+point submits to instead of spawning its own thread — `api_download()`,
+`api_channels_download_all()`'s per-video loop, and
+`api_music_videos_download()` all go through the same bounded pool now.
+Excess submissions queue automatically (stdlib `ThreadPoolExecutor`
+behavior — no custom semaphore logic needed).
+
+**Also fixed as part of this**: pre-registering each download as
+`'queued'` *before* submitting it to the pool, not after. Previously,
+`_init_download()` (which sets the initial `'queued'` status) only ran
+once `download_video()` itself started executing — with unbounded
+threads that was immediate, so it was never noticed, but with a
+2-worker cap, a video queued behind the first two wouldn't have appeared
+in the progress UI **at all** until a worker actually picked it up
+(`get_active_downloads()` only returns entries that have been
+`_init_download()`-ed). Added `downloader.queue_download(video_id, title,
+channel_url, final_path)` — generates the `download_id` and calls
+`_init_download()` immediately, returning the ID to pass through to
+`download_video(..., download_id=download_id)` (which already supported
+an externally-supplied ID). All three download routes now call this
+before `_DOWNLOAD_EXECUTOR.submit(...)`, so a 20-video "Download All"
+shows all 20 as `queued` immediately, with 2 transitioning to
+`downloading` at a time as the pool works through them.
+
+Minor known side effect, not fixed: `download_video()` still
+unconditionally re-calls `_init_download()` internally once it actually
+starts (resetting `started_at` to that later time) — harmless
+(`get_active_downloads()` sorting by `started_at` just reflects "when did
+this actually start downloading" rather than "when was it queued", a
+reasonable reading either way), not worth restructuring further for.
+
+**Not stress-tested with real concurrent downloads** this session (would
+have meant deliberately queuing multiple real videos against the live
+NAS) — verified via container startup (no import/initialization errors
+from the new `ThreadPoolExecutor` or the `queue_download` import) and
+code review of all three call sites, not an actual multi-download queue
+depth check. If downloads ever seem to silently stop progressing past 2
+at a time with more expected to be running, check
+`_DOWNLOAD_EXECUTOR._max_workers` / the `MAX_CONCURRENT_DOWNLOADS` env var
+first — that's the cap working as designed, not a hang.
+
+### Plex library confirmation step
+
+**Real gap, already hit once**: `api_plex_discover_library()` guessed a
+library from its **title** containing "music video" and saved whatever it
+picked immediately, with no confirmation - exactly how the "Muisc Videos"
+typo (see Bug C in the Plex OAuth/collections section above) silently
+pointed collection sync at an unrelated library before. Re-running
+discovery fresh against this account's real server *right now*, live,
+during this session, picked **"4KMovies"** — a movies library — instead
+of "Muisc Videos" (the actual, typo'd, currently-correctly-configured
+library) confirming this isn't a hypothetical: the exact same class of
+silent-wrong-guess is still one click away for any new user connecting
+Plex for the first time.
+
+**Fix**: new `plex_list_libraries(config)` in `artwork_sync.py` — lists
+*every* library on the server (not just the auto-picked one), flagging
+which one `plex_find_library_key()` would choose
+(`is_auto_discovered: true`). Exposed via `GET /api/plex/libraries`
+(read-only — confirmed live it doesn't touch `config.json`). The
+Settings page's "Step 3" now calls this into a `<select>` dropdown
+(auto-discovered entry pre-selected, labeled "— suggested") instead of
+auto-discovering-and-saving in one step; saving is a separate explicit
+action (`savePlexLibrary()` → existing `POST /api/plex/config`, which
+already accepted `music_video_library_key` — no new save endpoint
+needed).
+
+`api_plex_discover_library()` (the old auto-save endpoint) is left in
+place for API compatibility but the dashboard no longer calls it directly.
+
+**Verified live against the real Plex server**: `GET
+/api/plex/libraries` correctly listed all 10 libraries with
+`"4KMovies"` flagged `is_auto_discovered: true` and `"Muisc Videos"`
+(key 14, the actually-correct one) flagged `false` — confirming both that
+the endpoint works and that this feature would have caught the exact
+real misconfiguration this account already has a documented history of
+hitting. Confirmed the saved `config.json` `music_video_library_key`
+(still `"14"`) was unaffected by just listing.
+
+## ADDED (2026-07-25): README screenshots
+
+Added a "Screenshots" section to `README.md` (dashboard, channels,
+downloads, music video finder, artists, swap-artwork, create-collection),
+images checked into `screenshots/`. Excluded from the Docker image via
+`.dockerignore` (`screenshots/`, `README.md`) — they're docs-only, no
+reason to bloat the image.
+
+**How the screenshots were captured** (no project-specific run skill
+existed for this yet — `chromium-cli` wasn't installed, so this used
+`npx playwright` directly against the already-running `vidshelf`
+container): a small Playwright script (`chromium.launch()` headless,
+1440×900 viewport) logged in via the real `/login` form, navigated the
+sidebar's `data-page` links, and screenshotted each page. Two gotchas
+worth remembering if this is redone:
+- **Fixed `page.waitForTimeout(N)` after a nav click is unreliable** —
+  the Channels page's `data-page="channels"` link resolves before its
+  `fetch('/api/channels')` populates `.video-card` elements, and the
+  Music Videos search takes several seconds (yt-dlp + ranking) before
+  results replace the spinner. Wait on the actual DOM state instead:
+  `page.waitForSelector('.video-card')` for Channels,
+  `page.waitForFunction(...)` polling the search button's text for
+  Music Videos, then `page.waitForLoadState('networkidle')` before the
+  screenshot so YouTube thumbnail images finish loading (otherwise they
+  screenshot as solid black boxes).
+- **Relative screenshot paths resolve against the shell's cwd, not the
+  script's directory** — running `node shoot.js` from a different
+  directory than intended silently wrote a stray `shots/` folder into
+  this repo's root instead of the scratchpad. Always confirm with `ls`
+  after the first run, or use an absolute path in the script.
+
+**Privacy pass before committing anything**: the Channels page shows
+real monitored YouTube channel names/URLs and a real local download
+path — genuinely identifying, unlike the Artists/Downloads pages which
+only show public band/song names. Rather than pixel-editing the PNG
+after the fact, the channel data was redacted **in the live DOM** via
+`page.evaluate()` (replacing the `.video-card` name/URL/path text with
+placeholders) immediately before that one screenshot — cleaner than
+blurring since the layout/styling stays pixel-accurate.
+
+**Also confirmed live (a genuine, if minor, security-audit win)**: the
+user's first guess at admin credentials was the old pre-fix default
+(`admin`/`adminadmin`, see the C2/H1 security audit above) — it was
+correctly rejected with "Invalid username or password.", confirming
+that fix is actually active on this running container and not just
+documented.
+
+**Artists page stands in for "what a Plex collection looks like"**: a
+live Plex Web UI screenshot was deliberately not attempted — the
+already-authorized OAuth token in `config.json` could have been used to
+open an authenticated Plex Web session without a fresh login, but doing
+so would expose whatever else is in the user's live Plex library beyond
+just this app's collections, which is more exposure than the ask
+warranted. The in-app Artists page (artist name + artwork + video
+count) is the source of truth for what becomes a Plex collection here
+anyway, so it was captioned as such instead.

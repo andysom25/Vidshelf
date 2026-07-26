@@ -1,6 +1,7 @@
 import os
 import json
 import threading
+import concurrent.futures
 import time
 import math
 import datetime
@@ -8,17 +9,18 @@ import secrets
 import requests
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
-from downloader import download_video, get_active_downloads
+from downloader import download_video, get_active_downloads, queue_download
 from artwork_sync import (
     ArtworkWatcher, sync_artist_artwork, sync_all_artists,
     trigger_plex_refresh, setup_logging, folder_to_artist,
-    plex_sync_artist_collection, plex_find_library_key,
+    plex_sync_artist_collection, plex_find_library_key, plex_list_libraries,
     plex_oauth_start, plex_oauth_check_pin,
     plex_get_account_info, plex_get_servers,
     plex_clean_video_titles, search_artist_images,
     has_artwork, _clean_video_title,
     plex_generate_title_cards_for_all,
     plex_find_duplicate_collections, plex_dedupe_collections,
+    check_title_card_dependencies,
 )
 # Import the new swap helper
 from artwork_swap import plex_swap_collection_artwork
@@ -31,6 +33,12 @@ try:
     from yt_dlp.version import __version__ as yt_dlp_version
 except ImportError:
     yt_dlp_version = getattr(yt_dlp, '__version__', 'unknown')
+
+try:
+    with open('VERSION', 'r') as _f:
+        APP_VERSION = _f.read().strip()
+except FileNotFoundError:
+    APP_VERSION = 'unknown'
 
 
 class _SuppressNoisyPollingEndpoints(logging.Filter):
@@ -66,6 +74,22 @@ ARTWORK_SEARCH_PAGE_SIZE = 5
 _MUSIC_VIDEO_SEARCH_CACHE = {}
 _MUSIC_VIDEO_SEARCH_CACHE_TTL = 600  # seconds
 MUSIC_VIDEO_SEARCH_PAGE_SIZE = 9
+
+# Every download (single-click, bulk "download all", or music video) is
+# submitted here instead of a raw threading.Thread — an unbounded thread
+# per download meant "Download All" (up to 20 videos) could kick off 20
+# concurrent downloads *and* 20 concurrent format-conversion encodes at
+# once. That combination is what actually OOM-killed ffmpeg during the
+# format-conversion work (see REFERENCE.md) - capping concurrency here
+# fixes it at the source instead of hoping conversions don't overlap.
+# Extra requests past the cap queue automatically; queue_download() (see
+# downloader.py) pre-registers each one as 'queued' before submission so
+# they all show up in the progress UI immediately, not just once a worker
+# picks them up.
+_DOWNLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=int(os.environ.get('MAX_CONCURRENT_DOWNLOADS', '2')),
+    thread_name_prefix='download'
+)
 
 CONFIG_FILE = 'config.json'
 TRACKER_FILE = 'downloaded_videos.json'
@@ -722,17 +746,18 @@ def api_download():
             plex_media_path = _resolve_plex_path(ch.get('plex_media_path', './downloads'))
             break
 
+    download_id = queue_download(video_id, title, channel_url, final_path=plex_media_path)
+
     def _do_download():
         try:
             os.makedirs(plex_media_path, exist_ok=True)
             download_video(video_id, download_path, plex_media_path,
-                          title=title, channel_url=channel_url)
+                          title=title, channel_url=channel_url, download_id=download_id)
             mark_video_downloaded(video_id, channel_url)
         except Exception:
             pass
 
-    thread = threading.Thread(target=_do_download, daemon=True)
-    thread.start()
+    _DOWNLOAD_EXECUTOR.submit(_do_download)
     return jsonify({'success': True, 'message': f'Download started for {video_id}', 'video_id': video_id})
 
 @app.route('/api/downloads/progress')
@@ -846,11 +871,11 @@ def api_channels_download_all():
     except Exception as e:
         return jsonify({'error': f'Failed to fetch videos: {str(e)}'}), 500
 
-    def _download_one(video, path, plex, url):
+    def _download_one(video, path, plex, url, download_id):
         vid = video['id']
         title = video.get('title', 'Unknown')
         try:
-            download_video(vid, path, plex, title=title, channel_url=url)
+            download_video(vid, path, plex, title=title, channel_url=url, download_id=download_id)
             mark_video_downloaded(vid, url)
         except Exception:
             pass
@@ -861,12 +886,9 @@ def api_channels_download_all():
         if mode == 'new' and is_video_downloaded(vid, channel_url):
             continue
 
-        thread = threading.Thread(
-            target=_download_one,
-            args=(video, download_path, plex_media_path, channel_url),
-            daemon=True
-        )
-        thread.start()
+        title = video.get('title', 'Unknown')
+        download_id = queue_download(vid, title, channel_url, final_path=plex_media_path)
+        _DOWNLOAD_EXECUTOR.submit(_download_one, video, download_path, plex_media_path, channel_url, download_id)
         started.append(vid)
 
     return jsonify({
@@ -1071,7 +1093,8 @@ def api_music_videos_download():
     artist = _resolve_existing_artist(artist, final_path)
 
     channel_url = f"music_video_{artist.replace(' ', '_')}"
-    
+    download_id = queue_download(video_id, title, channel_url, final_path=final_path)
+
     def _do_download():
         print(f"DEBUG: _do_download thread started for video_id={video_id}")
         try:
@@ -1083,7 +1106,7 @@ def api_music_videos_download():
             print(f"DEBUG: Directories created/ensured: download_path='{download_path}', artist_final_path='{artist_final_path}'")
             # Download locally, then download_video copies to artist_final_path
             download_video(video_id, download_path, artist_final_path,
-                          title=title, channel_url=channel_url)
+                          title=title, channel_url=channel_url, download_id=download_id)
             mark_video_downloaded(video_id, channel_url)
             print(f"DEBUG: Music video download completed successfully for video_id={video_id} into artist folder '{artist_folder}'")
 
@@ -1106,8 +1129,7 @@ def api_music_videos_download():
             traceback.print_exc()
             print(f"[ERROR] Music video download failed for video_id={video_id}: {exc}")
     
-    thread = threading.Thread(target=_do_download, daemon=True)
-    thread.start()
+    _DOWNLOAD_EXECUTOR.submit(_do_download)
     return jsonify({
         'success': True,
         'message': f'Download started for {title}',
@@ -1455,6 +1477,7 @@ def api_system_info():
         total = used = free = 0
 
     return jsonify({
+        'app_version': APP_VERSION,
         'python_version': platform.python_version(),
         'platform': platform.platform(),
         'yt_dlp_version': yt_dlp_version,
@@ -1464,6 +1487,24 @@ def api_system_info():
         'disk_used': used,
         'disk_free': free,
         'plex_base_path': config.get('plex_base_path', './downloads')
+    })
+
+
+@app.route('/api/system/health')
+def api_system_health():
+    """Dependency check for the Settings page's System Health panel.
+    Most useful for the local (non-Docker) install path — the Docker image
+    always bakes in ffmpeg/Pillow/fonts, but even there this catches a
+    misconfigured FFMPEG_PATH."""
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    binaries = transcode.check_dependencies()
+    title_card_deps = check_title_card_dependencies()
+    return jsonify({
+        'ffmpeg': binaries['ffmpeg'],
+        'ffprobe': binaries['ffprobe'],
+        'pillow': title_card_deps['pillow'],
+        'fonts': title_card_deps['fonts'],
     })
 
 # ---------- Download Verification ----------
@@ -1854,11 +1895,19 @@ def api_plex_config():
 
 @app.route('/api/plex/discover-library', methods=['POST'])
 def api_plex_discover_library():
-    """Auto-discover the music video library key from Plex."""
+    """Auto-discover the music video library key from Plex.
+
+    Kept for API compatibility, but the dashboard no longer calls this
+    directly — auto-discovering and saving in one step with no way to see
+    what was actually picked is exactly how a mistyped library title
+    ("Muisc Videos") silently pointed collection sync at the wrong library
+    before (see REFERENCE.md). The UI now uses GET /api/plex/libraries to
+    show every library with the auto-discovered one pre-selected, and only
+    saves once the user confirms via POST /api/plex/config."""
     if 'username' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
-    
+
     library_key = plex_find_library_key(config)
     if library_key:
         # Save it
@@ -1874,6 +1923,18 @@ def api_plex_discover_library():
         })
     else:
         return jsonify({'error': 'Could not discover library key. Check server_url and token.'}), 400
+
+
+@app.route('/api/plex/libraries', methods=['GET'])
+def api_plex_libraries():
+    """List every library on the connected Plex server, flagging which one
+    auto-discovery would pick — lets the UI show a confirm/pick step
+    instead of trusting the guess blindly."""
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    config = load_config()
+    libraries = plex_list_libraries(config)
+    return jsonify({'libraries': libraries})
 
 
 @app.route('/api/plex/oauth/start', methods=['POST'])

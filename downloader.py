@@ -46,6 +46,18 @@ def _init_download(download_id, video_id, title, channel_url, final_path=None):
         _save_active(data)
     return entry
 
+def queue_download(video_id, title, channel_url, final_path=None):
+    """Pre-register a download as 'queued' before it's actually submitted
+    to the bounded worker pool (see app.py's _DOWNLOAD_EXECUTOR), so bulk
+    downloads all show up immediately in the progress UI instead of only
+    appearing once a worker actually picks them up — with the pool capped
+    at a small number of concurrent downloads, that could otherwise be a
+    long wait for anything past the first few. Returns the download_id to
+    pass through to download_video()."""
+    download_id = f"{video_id}_{int(time.time())}"
+    _init_download(download_id, video_id, title, channel_url, final_path=final_path)
+    return download_id
+
 def _update_progress(download_id, **kwargs):
     with _lock:
         data = _load_active()
