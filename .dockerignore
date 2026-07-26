@@ -23,6 +23,7 @@ downloads/
 .env
 *.log
 config.json
+cookies.txt
 
 # Aider
 .aider*
@@ -40,3 +41,7 @@ Thumbs.db
 # Docker
 .dockerignore
 docker-compose.yml
+
+# Docs assets (not needed inside the image)
+screenshots/
+README.md

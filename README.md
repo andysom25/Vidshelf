@@ -16,6 +16,23 @@ This project is not affiliated with, endorsed by, or sponsored by YouTube, Googl
 
 ---
 
+## Screenshots
+
+| | |
+|---|---|
+| **Dashboard** | **Channels** |
+| ![Dashboard](screenshots/dashboard.png) | ![Channels](screenshots/channels.png) |
+| **Downloads** | **Music Video Finder** |
+| ![Downloads](screenshots/downloads.png) | ![Music Videos](screenshots/music-videos.png) |
+| **Artists** (one entry per Plex collection) | **Swap Artwork** |
+| ![Artists](screenshots/artists.png) | ![Swap Artwork](screenshots/swap-artwork.png) |
+
+The Artists page mirrors what shows up in Plex: each tracked artist here becomes its own smart collection there, with the same artwork and video count. "Create Plex Collection" lets you back-fill a collection for an artist on demand:
+
+![Create Plex Collection](screenshots/create-collection.png)
+
+---
+
 ## Features
 
 ### YouTube Channel Management

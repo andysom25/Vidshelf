@@ -2687,3 +2687,60 @@ the endpoint works and that this feature would have caught the exact
 real misconfiguration this account already has a documented history of
 hitting. Confirmed the saved `config.json` `music_video_library_key`
 (still `"14"`) was unaffected by just listing.
+
+## ADDED (2026-07-25): README screenshots
+
+Added a "Screenshots" section to `README.md` (dashboard, channels,
+downloads, music video finder, artists, swap-artwork, create-collection),
+images checked into `screenshots/`. Excluded from the Docker image via
+`.dockerignore` (`screenshots/`, `README.md`) — they're docs-only, no
+reason to bloat the image.
+
+**How the screenshots were captured** (no project-specific run skill
+existed for this yet — `chromium-cli` wasn't installed, so this used
+`npx playwright` directly against the already-running `vidshelf`
+container): a small Playwright script (`chromium.launch()` headless,
+1440×900 viewport) logged in via the real `/login` form, navigated the
+sidebar's `data-page` links, and screenshotted each page. Two gotchas
+worth remembering if this is redone:
+- **Fixed `page.waitForTimeout(N)` after a nav click is unreliable** —
+  the Channels page's `data-page="channels"` link resolves before its
+  `fetch('/api/channels')` populates `.video-card` elements, and the
+  Music Videos search takes several seconds (yt-dlp + ranking) before
+  results replace the spinner. Wait on the actual DOM state instead:
+  `page.waitForSelector('.video-card')` for Channels,
+  `page.waitForFunction(...)` polling the search button's text for
+  Music Videos, then `page.waitForLoadState('networkidle')` before the
+  screenshot so YouTube thumbnail images finish loading (otherwise they
+  screenshot as solid black boxes).
+- **Relative screenshot paths resolve against the shell's cwd, not the
+  script's directory** — running `node shoot.js` from a different
+  directory than intended silently wrote a stray `shots/` folder into
+  this repo's root instead of the scratchpad. Always confirm with `ls`
+  after the first run, or use an absolute path in the script.
+
+**Privacy pass before committing anything**: the Channels page shows
+real monitored YouTube channel names/URLs and a real local download
+path — genuinely identifying, unlike the Artists/Downloads pages which
+only show public band/song names. Rather than pixel-editing the PNG
+after the fact, the channel data was redacted **in the live DOM** via
+`page.evaluate()` (replacing the `.video-card` name/URL/path text with
+placeholders) immediately before that one screenshot — cleaner than
+blurring since the layout/styling stays pixel-accurate.
+
+**Also confirmed live (a genuine, if minor, security-audit win)**: the
+user's first guess at admin credentials was the old pre-fix default
+(`admin`/`adminadmin`, see the C2/H1 security audit above) — it was
+correctly rejected with "Invalid username or password.", confirming
+that fix is actually active on this running container and not just
+documented.
+
+**Artists page stands in for "what a Plex collection looks like"**: a
+live Plex Web UI screenshot was deliberately not attempted — the
+already-authorized OAuth token in `config.json` could have been used to
+open an authenticated Plex Web session without a fresh login, but doing
+so would expose whatever else is in the user's live Plex library beyond
+just this app's collections, which is more exposure than the ask
+warranted. The in-app Artists page (artist name + artwork + video
+count) is the source of truth for what becomes a Plex collection here
+anyway, so it was captioned as such instead.
