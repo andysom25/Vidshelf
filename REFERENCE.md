@@ -3263,3 +3263,36 @@ before concluding an asset is empty.
    via a `data-` attribute).
 3. `python tests/test_routes.py` — `test_dashboard_renders_with_its_static_assets`
    covers exactly this.
+
+## KNOWN COSMETIC ODDITY: three commit subjects start with a stray `@`
+
+Three doc-only commits from 2026-07-27 read:
+
+```
+@ Document the commit-authorship rewrite to the andysom25 account
+@ Correct the authorship write-up: gmail address, refreshed SHA map
+@ Correct the identity-scoping note: work is the global default
+```
+
+**This is not corruption and nothing is missing.** The commit bodies are
+intact; there is just an extra line containing a single `@` before the real
+subject, which git folds into the subject when it renders. Some inner single
+quotes were also stripped from those three bodies (`open(path, 'w')` reads as
+`open(path, w)`).
+
+Cause: the messages were passed using PowerShell here-string syntax
+(`-m @'...'@`) to a tool running Git Bash. Bash parses that as three
+concatenated tokens — a literal `@`, a single-quoted string, and another `@` —
+rather than as a here-string, so the `@`s ended up inside the message and the
+quotes were consumed as shell quoting. Use `git commit -F <file>` for
+multi-line messages instead; it sidesteps shell quoting entirely.
+
+**Deliberately not fixed.** All three commits are ancestors of the v1.1.0,
+v1.2.0 and v1.2.1 tags, so correcting them would mean rewriting every commit
+since, deleting and recreating all three tags, force-pushing `main` and `dev`,
+re-pointing three published GitHub Releases, and breaking every existing
+clone — to fix a cosmetic prefix on three documentation commits. Not worth it.
+
+If history ever gets rewritten for some other reason, fold this in then:
+`git filter-branch --msg-filter 'sed "/^@$/d"' <range>` removes the stray
+lines.
