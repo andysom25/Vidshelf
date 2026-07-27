@@ -5,20 +5,20 @@ import threading
 import time
 import yt_dlp
 import transcode
+import state
 
-DOWNLOAD_TRACKER_FILE = 'active_downloads.json'
+DOWNLOAD_TRACKER_FILE = state.ACTIVE_DOWNLOADS_FILE
 _lock = threading.Lock()
 
 def _load_active():
-    try:
-        with open(DOWNLOAD_TRACKER_FILE, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    return state.read_json(DOWNLOAD_TRACKER_FILE)
 
 def _save_active(data):
-    with open(DOWNLOAD_TRACKER_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    # Atomic — this is the hottest write in the app (the yt-dlp progress hook
+    # fires several times a second per in-flight download), so it's the one
+    # most likely to be interrupted mid-write by a container stop. A truncated
+    # active_downloads.json used to mean the downloads UI came back empty.
+    state.write_json(DOWNLOAD_TRACKER_FILE, data, indent=2)
 
 def _init_download(download_id, video_id, title, channel_url, final_path=None):
     entry = {

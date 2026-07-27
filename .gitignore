@@ -23,10 +23,13 @@ env/
 # Env / secrets
 .env
 *.log
-config.json
 cookies.txt
 
-# Runtime state (regenerated automatically, not source)
+# Persistent state. Since v1.1.0 these live together in ./data (see state.py);
+# the bare filenames stay listed so an upgraded checkout doesn't accidentally
+# commit leftovers from the pre-v1.1.0 layout.
+data/
+config.json
 active_downloads.json
 downloaded_videos.json
 

@@ -10,11 +10,18 @@ services:
     volumes:
       # Mount a persistent downloads directory so files survive container rebuilds
       - ./downloads:/app/downloads
-      # Mount config.json so you can edit it from the host
-      - ./config.json:/app/config.json
-      # Mount json tracker files for persistence
-      - ./active_downloads.json:/app/active_downloads.json
-      - ./downloaded_videos.json:/app/downloaded_videos.json
+      # All persistent state (config.json + the two tracker files) lives in
+      # one mounted DIRECTORY. Do NOT go back to mounting the individual JSON
+      # files (as this did before v1.1.0) — two separate failures came from
+      # that, both explained in state.py:
+      #   1. Docker bind-mounts a single file by inode, and an atomic write
+      #      (write temp + os.replace) swaps the inode — so writes silently
+      #      stop reaching the host and a restart reads stale state.
+      #   2. These files are gitignored, so a fresh clone doesn't have them,
+      #      and Docker creates a missing bind-mount source as a *directory* —
+      #      which made the app crash-loop at import on every new install.
+      # A directory is what Docker auto-creates correctly, so both go away.
+      - ./data:/app/data
       # Native Linux CIFS mount of the NAS share (see volumes: below). Do NOT
       # bind-mount a Windows drive letter or UNC path here - Docker Desktop
       # silently substitutes a small local decoy volume instead of erroring,

@@ -2890,3 +2890,159 @@ anything about the history above. Then re-run the `gh api ...
 from the remote. A plain `git pull` on a stale clone will try to merge
 the two disjoint histories and produce a duplicated log. Re-clone, or
 `git fetch origin && git reset --hard origin/dev`.
+
+## FIXED (2026-07-27): state files could lose data three different ways — lost updates, torn writes, and a fresh-install crash loop
+
+Three bugs, one root cause: state was written with `open(path, 'w')` +
+`json.dump()` onto files that were bind-mounted individually. Shipped as
+v1.1.0 along with the first published Docker image.
+
+### Bug 1 — lost updates in the download tracker (the one users would notice)
+
+`mark_video_downloaded()` did an unlocked read-modify-write:
+
+```python
+tracker = load_downloaded_tracker()   # read
+tracker[channel_url].append(video_id) # modify
+save_downloaded_tracker(tracker)      # write
+```
+
+It runs on `_DOWNLOAD_EXECUTOR`, the bounded pool added for concurrent
+downloads. Two downloads finishing close together both load the same tracker,
+each appends only its own video, and the second write discards the first. The
+dropped video then looks new on the next channel check and **gets downloaded
+again** — which would have surfaced as "Vidshelf keeps re-downloading things I
+already have", with essentially no chance of reproducing it on demand.
+
+This is the same class of bug as the duplicate-collections race already
+documented above — that one was fixed with a lock; this instance was missed.
+
+Reproduced with the pre-fix code, 12 threads × 40 updates: **8 of 480 entries
+survived.** At the default `MAX_CONCURRENT_DOWNLOADS=2` the real-world rate is
+far lower, but it is not zero. `tests/test_state.py` is the regression guard.
+
+### Bug 2 — torn writes on any interruption
+
+`open(path, 'w')` truncates *immediately*, so a crash or `docker compose down`
+between truncate and final byte leaves a truncated or empty file. For
+`config.json` that's every channel, the Plex token, and the secret key that
+signs sessions.
+
+### Bug 3 — v1.0.0 could not be installed by following its own README
+
+The severe one. `app.secret_key = _get_or_create_secret_key()` runs at
+**import time** (app.py), and `_read_raw_config()` caught only
+`FileNotFoundError` and `json.JSONDecodeError`. Then:
+
+1. `config.json` is gitignored, so a fresh clone doesn't have it.
+2. `docker compose up` finds a missing bind-mount source and **creates it as a
+   directory** — that's just what Docker does.
+3. `open()` on a directory raises `IsADirectoryError`, an `OSError` that is
+   *not* a `FileNotFoundError` — uncaught, at import.
+4. Container crash-loops. Every new user, 100% of the time.
+
+It went unnoticed because every development machine already had the three JSON
+files from before they were gitignored.
+
+### The fix: `state.py`, and why state had to move to a directory
+
+New module owning where state lives and how it's written: atomic writes (temp
+file in the same directory → `flush` → `fsync` → `os.replace`), one reentrant
+lock per file, `update_json()` holding that lock across a whole
+read-modify-write, and readers that tolerate a missing/corrupt/directory path
+by returning `{}`.
+
+**The trap**: adding atomic writes *without* moving state would have made
+things worse. Docker bind-mounts a single file by **inode**, and `os.replace()`
+swaps the inode — so the container would write to a new inode the host mount
+doesn't follow, writes would silently stop reaching the host, and the next
+restart would read stale state. Exactly the "looked fixed on paper" shape as
+the CIFS bugs above. So the three file mounts collapsed into one directory
+mount:
+
+```yaml
+- ./data:/app/data      # was: ./config.json, ./active_downloads.json, ./downloaded_videos.json
+```
+
+which also fixes bug 3 for free, since a directory is what Docker
+auto-creates correctly.
+
+**Migration runs at `state` import, deliberately** — not from a startup hook.
+Both `app.py` (`app.secret_key`) and `artwork_sync.py` (`PLEX_CLIENT_ID`) read
+config at *module* level, so there is no hook early enough. Migrating one
+import too late would read an empty config, generate a fresh secret key, and
+log every existing session out. It's idempotent, and never overwrites a file
+already at the destination.
+
+`artwork_sync.py` needed fixing separately: it hardcoded a bare
+`'config.json'` relative path. Left alone, it would have created a *second*
+config file in the working directory, so the Plex client ID persisted for
+OAuth would never be the one `app.py` reads back and every restart would look
+like a new device to Plex. Its other two JSON writes are per-artist sidecars
+inside the media folders (on the NAS) — deliberately **not** converted, since
+`os.replace` semantics on CIFS aren't reliable.
+
+### Windows-only wrinkle found by the tests
+
+`os.replace()` fails with `PermissionError [WinError 5]` if the destination is
+open by *anyone*. POSIX doesn't care, so the container is unaffected, but
+README option 3 supports running directly on Windows. Two mitigations:
+`read_json()` takes the same per-file lock as `write_json()` (so the app's own
+readers can't collide), and `_replace_with_retry()` absorbs short-lived
+external holders — an editor, `tail`, an antivirus scanner.
+
+Worth noting how this was found: the first version of the atomicity test
+reported **PASS while the writer thread was dying on every iteration** — a
+dead writer produces zero torn reads. Any concurrency test needs to assert
+that the worker actually completed its work, not just that no corruption was
+observed. The committed test asserts `len(writes_done) == 150`.
+
+### How to verify
+
+```bash
+python tests/test_state.py          # 6/6, no dependencies needed
+docker compose down && docker compose up -d --build
+docker exec vidshelf ls -la /app/data    # config.json + both trackers
+docker exec vidshelf df -h               # still check the CIFS mount is real
+```
+
+### What to check first if state ever looks wrong again
+
+1. `docker exec vidshelf ls -la /app/data` — if it's empty but the app is
+   running, the compose file probably still has the old per-file mounts.
+2. Whether anything writes state without going through `state.py`. A bare
+   `open('config.json', 'w')` anywhere is the bug returning; `grep -rn
+   "open(.*config.json" *.py` should only match `state.py`.
+3. `VIDSHELF_DATA_DIR` — if someone pointed it at a CIFS/SMB mount, atomic
+   replace is unreliable there (see the CIFS sections above). It's documented
+   in `.env.example` as unsupported for exactly that reason.
+
+---
+
+## ADDED (2026-07-27): CI + published multi-arch Docker image
+
+`.github/workflows/ci.yml` — the repo's first CI. Two jobs:
+
+- **test** (every push/PR to `main`/`dev`): runs `tests/test_state.py` and
+  imports every module. The import check is deliberate: bug 3 above was an
+  import-time failure, which no route-level test would have caught.
+- **publish** (tags matching `v*` only, gated on `test` passing): builds
+  `linux/amd64` + `linux/arm64` via QEMU/buildx and pushes to
+  `ghcr.io/andysom25/vidshelf`, tagged `{version}`, `{major}.{minor}`,
+  `{major}`, and `latest`.
+
+arm64 is not optional for this audience — a large share of self-hosted Plex
+runs on Synology or a Raspberry Pi, where an amd64-only image simply won't
+start.
+
+**Gotcha baked into the workflow**: the image name is hardcoded lowercase
+rather than derived from `${{ github.repository }}`. The repo is
+`andysom25/Vidshelf` with a capital V, and GHCR rejects uppercase image names
+with an opaque `invalid reference format`.
+
+Publishing only on tags matches the branching rules in `CLAUDE.md` — `main` is
+releases-only, and an image built from an untagged commit has no meaningful
+version to carry.
+
+README's quick start now leads with `docker pull` instead of clone-and-build;
+building from source moved to option 2.

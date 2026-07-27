@@ -7,6 +7,7 @@ import math
 import datetime
 import secrets
 import requests
+import state
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from downloader import download_video, get_active_downloads, queue_download
@@ -91,9 +92,16 @@ _DOWNLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix='download'
 )
 
-CONFIG_FILE = 'config.json'
-TRACKER_FILE = 'downloaded_videos.json'
-ACTIVE_DOWNLOADS_FILE = 'active_downloads.json'
+# State now lives in a mounted directory (./data) and is written atomically —
+# see state.py for why single-file bind mounts made both of those impossible.
+# Re-exported under the original names so the rest of this module reads
+# unchanged.
+CONFIG_FILE = state.CONFIG_FILE
+TRACKER_FILE = state.TRACKER_FILE
+ACTIVE_DOWNLOADS_FILE = state.ACTIVE_DOWNLOADS_FILE
+
+for _migration in state.MIGRATIONS_PERFORMED:
+    print(f"[state] Migrated legacy state file: {_migration}")
 
 # Youtube-only allowlist for any endpoint that hands a caller-supplied URL to
 # yt-dlp — yt-dlp supports hundreds of sites via a "generic" extractor, so an
@@ -125,21 +133,27 @@ _CONVERSION_LOCK = threading.Lock()
 _CONVERSION_SCRATCH_DIR = os.path.join('.', 'downloads', '_conversion_scratch')
 
 def load_config():
-    with open(CONFIG_FILE, 'r') as f:
-        return json.load(f)
+    return state.read_json(CONFIG_FILE)
 
 def _read_raw_config():
     """Like load_config(), but never raises — used during startup, before
     the app (and thus any request context) exists."""
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    return state.read_json(CONFIG_FILE)
 
 def _write_raw_config(config):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
+    state.write_json(CONFIG_FILE, config, indent=4)
+
+def _update_config(mutate):
+    """Read-modify-write config.json under a lock, atomically.
+
+    Prefer this over load_config() + _write_raw_config() anywhere the new
+    value depends on the current one: Flask serves requests on threads, so
+    two settings saves (or a save racing the Plex OAuth callback, which
+    persists a token from a background poll) would otherwise each write a
+    full document built from a stale read, and the loser's field silently
+    disappears.
+    """
+    return state.update_json(CONFIG_FILE, mutate, indent=4)
 
 def _get_or_create_secret_key():
     """Flask's secret key signs session cookies — anyone who knows it can
@@ -248,23 +262,27 @@ def _set_security_headers(response):
     return response
 
 def load_downloaded_tracker():
-    try:
-        with open(TRACKER_FILE, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    return state.read_json(TRACKER_FILE)
 
 def save_downloaded_tracker(tracker):
-    with open(TRACKER_FILE, 'w') as f:
-        json.dump(tracker, f, indent=2)
+    state.write_json(TRACKER_FILE, tracker, indent=2)
 
 def mark_video_downloaded(video_id, channel_url):
-    tracker = load_downloaded_tracker()
-    if channel_url not in tracker:
-        tracker[channel_url] = []
-    if video_id not in tracker[channel_url]:
-        tracker[channel_url].append(video_id)
-    save_downloaded_tracker(tracker)
+    """Record a video as downloaded.
+
+    The read-modify-write has to happen under a single lock: this runs on the
+    bounded download pool (_DOWNLOAD_EXECUTOR), so with concurrency > 1 two
+    downloads finishing close together would both load the same tracker, each
+    append only its own video, and whichever wrote second would drop the
+    other's entry. The dropped video then looks new on the next channel check
+    and gets downloaded all over again.
+    """
+    def _add(tracker):
+        tracker.setdefault(channel_url, [])
+        if video_id not in tracker[channel_url]:
+            tracker[channel_url].append(video_id)
+
+    state.update_json(TRACKER_FILE, _add, indent=2)
 
 def is_video_downloaded(video_id, channel_url):
     tracker = load_downloaded_tracker()
@@ -797,8 +815,7 @@ def api_channels_add():
         'plex_media_path': plex_media_path,
         'download_mode': download_mode
     })
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
+    _write_raw_config(config)
     return jsonify({'success': True, 'message': 'Channel added successfully'}), 201
 
 @app.route('/api/channels/remove', methods=['POST'])
@@ -818,8 +835,7 @@ def api_channels_remove():
     if len(config['channels']) == original_len:
         return jsonify({'error': 'Channel not found'}), 404
 
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
+    _write_raw_config(config)
     return jsonify({'success': True, 'message': 'Channel removed successfully'})
 
 @app.route('/api/channels/mode', methods=['POST'])
@@ -839,8 +855,7 @@ def api_channels_mode():
     for ch in config.get('channels', []):
         if ch['url'] == url:
             ch['download_mode'] = mode
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(config, f, indent=4)
+            _write_raw_config(config)
             return jsonify({'success': True, 'message': f'Download mode set to {mode}'})
 
     return jsonify({'error': 'Channel not found'}), 404
@@ -943,8 +958,7 @@ def api_config():
         for internal_key in ('_secret_key', '_auth'):
             if internal_key in current:
                 new_config[internal_key] = current[internal_key]
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(new_config, f, indent=4)
+        _write_raw_config(new_config)
         return jsonify({'success': True, 'message': 'Configuration updated'})
 
 def _sanitize_folder_name(name):
@@ -1154,8 +1168,7 @@ def api_music_video_path():
         if not new_path:
             return jsonify({'error': 'Music video Plex path is required'}), 400
         config['music_video_plex_path'] = new_path
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=4)
+        _write_raw_config(config)
         return jsonify({'success': True, 'message': f'Music video Plex path set to {new_path}'})
 
 
@@ -1418,8 +1431,7 @@ def api_password():
     _ADMIN_PASSWORD_HASH = generate_password_hash(new_pass)
     config = load_config()
     config['_auth'] = {'username': _ADMIN_USERNAME, 'password_hash': _ADMIN_PASSWORD_HASH}
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
+    _write_raw_config(config)
     return jsonify({'success': True, 'message': 'Password updated successfully'})
 
 @app.route('/api/downloads/clear', methods=['POST'])
@@ -1429,12 +1441,10 @@ def api_downloads_clear():
         return jsonify({'error': 'Unauthorized'}), 401
     try:
         # Clear the download history tracker
-        with open(TRACKER_FILE, 'w') as f:
-            json.dump({}, f)
+        state.write_json(TRACKER_FILE, {}, indent=2)
         # Also clear the active downloads progress display
         try:
-            with open(ACTIVE_DOWNLOADS_FILE, 'w') as f:
-                json.dump({}, f)
+            state.write_json(ACTIVE_DOWNLOADS_FILE, {}, indent=2)
         except Exception:
             pass
         return jsonify({'success': True, 'message': 'Download history and progress cleared'})
@@ -1455,8 +1465,7 @@ def api_plex_base_path():
         if not new_base:
             return jsonify({'error': 'Plex base path is required'}), 400
         config['plex_base_path'] = new_base
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=4)
+        _write_raw_config(config)
         return jsonify({'success': True, 'message': f'Plex base path set to {new_base}'})
 
 @app.route('/api/system/info')
@@ -1888,8 +1897,7 @@ def api_plex_config():
         for key in ('server_url', 'token', 'music_video_library_key'):
             if key in data:
                 config['plex'][key] = data[key]
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=4)
+        _write_raw_config(config)
         return jsonify({'success': True, 'message': 'Plex configuration updated'})
 
 
@@ -1914,8 +1922,7 @@ def api_plex_discover_library():
         if 'plex' not in config:
             config['plex'] = {}
         config['plex']['music_video_library_key'] = library_key
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=4)
+        _write_raw_config(config)
         return jsonify({
             'success': True,
             'library_key': library_key,
@@ -1988,8 +1995,7 @@ def api_plex_oauth_check():
         if 'plex' not in config:
             config['plex'] = {}
         config['plex']['token'] = auth_token
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=4)
+        _write_raw_config(config)
         
         account_info = plex_get_account_info(config, auth_token)
         servers = plex_get_servers(config, auth_token)
@@ -2060,8 +2066,7 @@ if __name__ == '__main__':
                 cfg['plex_base_path'] = './downloads'
             if 'music_video_plex_path' not in cfg:
                 cfg['music_video_plex_path'] = './downloads/music_videos'
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(cfg, f, indent=4)
+            _write_raw_config(cfg)
         except Exception:
             pass
     

@@ -18,6 +18,7 @@ import threading
 import socket
 import ipaddress
 import uuid
+import state
 from datetime import datetime, timezone
 from urllib.parse import quote, urlencode, urlparse, urljoin
 
@@ -1059,22 +1060,28 @@ def _get_or_create_plex_client_id():
     env_value = os.environ.get('PLEX_CLIENT_ID')
     if env_value:
         return env_value
-    try:
-        with open('config.json', 'r') as f:
-            config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        config = {}
-    existing = config.get('_plex_client_id')
+    # Must go through state.CONFIG_FILE, not a bare 'config.json': since
+    # v1.1.0 config lives in the mounted data directory, and a relative path
+    # here would quietly create a *second* config file in the working
+    # directory — so the client ID persisted for Plex OAuth would never be the
+    # one app.py reads back, and every restart would look like a new device to
+    # Plex.
+    existing = state.read_json(state.CONFIG_FILE).get('_plex_client_id')
     if existing:
         return existing
     new_id = str(uuid.uuid4())
-    config['_plex_client_id'] = new_id
+
+    def _set(config):
+        # Re-check inside the lock: this runs at import, but a concurrent
+        # writer that already generated an ID should win over ours rather than
+        # get overwritten.
+        return config if config.get('_plex_client_id') else {**config, '_plex_client_id': new_id}
+
     try:
-        with open('config.json', 'w') as f:
-            json.dump(config, f, indent=4)
-    except Exception:
+        return state.update_json(state.CONFIG_FILE, _set, indent=4)['_plex_client_id']
+    except OSError:
         _log.warning("Could not persist generated Plex client ID to config.json")
-    return new_id
+        return new_id
 
 
 PLEX_CLIENT_ID = _get_or_create_plex_client_id()
