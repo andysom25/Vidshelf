@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+env:
+  # NOT ghcr.io/${{ github.repository }}: this repo is "andysom25/Vidshelf"
+  # with a capital V, and GHCR only accepts lowercase image names — the push
+  # fails with an opaque "invalid reference format" otherwise.
+  IMAGE_NAME: ghcr.io/andysom25/vidshelf
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'  # matches the Dockerfile base image
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # No pytest dependency on purpose — the suite is plain asserts so it
+      # runs identically here and on a developer's machine.
+      - name: Run tests
+        run: python tests/test_state.py
+
+      - name: Check every module imports
+        # Catches the class of breakage that only shows up at import time,
+        # which is exactly where the pre-v1.1.0 fresh-install crash lived.
+        run: python -c "import state, transcode, downloader, artwork_swap, artwork_sync, app"
+
+  publish:
+    name: Publish image
+    # Only publish from tags — main is releases-only, and an image built from
+    # an untagged commit has no meaningful version to carry.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 matters here: a large share of self-hosted Plex setups are
+      # Synology/Raspberry Pi, and an amd64-only image simply won't start.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

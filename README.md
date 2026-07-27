@@ -77,10 +77,49 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 
 ## Quick Start
 
-### Option 1: Docker (Recommended)
+### Option 1: Docker image (Recommended)
+
+No clone or build required. Create a `docker-compose.yml`:
+
+```yaml
+name: vidshelf
+
+services:
+  vidshelf:
+    image: ghcr.io/andysom25/vidshelf:latest
+    container_name: vidshelf
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data           # config + download history (keep this)
+      - ./downloads:/app/downloads # downloaded videos
+    environment:
+      - ADMIN_USERNAME=admin
+      # Leave unset to have one generated and printed to the logs on first run
+      - ADMIN_PASSWORD=
+```
 
 ```bash
-# Clone the repo
+docker compose up -d
+
+# Grab the generated admin password if you didn't set one
+docker compose logs | grep SECURITY
+
+# Open http://localhost:5000
+```
+
+Images are published for `linux/amd64` and `linux/arm64`, so this runs on a
+Synology or Raspberry Pi as-is. Pin a version (`:1.1.0`, `:1.1`, `:1`) instead
+of `latest` if you'd rather upgrade deliberately.
+
+Mounting a NAS share for music videos, or want the full set of options? See
+the repo's own [`docker-compose.yml`](docker-compose.yml) — it documents the
+`cifs` volume setup and every environment variable.
+
+### Option 2: Docker from source
+
+```bash
 git clone https://github.com/andysom25/Vidshelf.git
 cd Vidshelf
 
@@ -88,16 +127,11 @@ cd Vidshelf
 # for the music-video CIFS mount, Plex OAuth client identity, etc.)
 cp .env.example .env
 
-# Build and start
-docker compose up -d
-
-# Check the logs for your generated admin password if you didn't set one
+docker compose up -d --build
 docker compose logs | grep SECURITY
-
-# Open http://localhost:5000
 ```
 
-### Option 2: Local (Python)
+### Option 3: Local (Python)
 
 ```bash
 # Clone the repo
@@ -122,6 +156,38 @@ python app.py
 
 ---
 
+## Upgrading to v1.1.0
+
+**v1.1.0 moves all persistent state into a `data/` directory**, and replaces
+the three individual JSON bind mounts with a single directory mount. If
+you're upgrading an existing install, move your state files **before**
+starting the new version:
+
+```bash
+docker compose down
+
+mkdir -p data
+mv config.json downloaded_videos.json active_downloads.json data/ 2>/dev/null
+
+# Replace the three file mounts in docker-compose.yml with:
+#   - ./data:/app/data
+docker compose up -d --build   # --build, or switch to the published image
+```
+
+Nothing is deleted if you skip this — your files stay where they are and
+Vidshelf simply starts with empty config — but you'd have to reconnect Plex
+and re-add your channels, so it's worth the 30 seconds. A local (non-Docker)
+install migrates itself automatically on first start; only Docker needs the
+manual move, because the container can't see host files that are no longer
+mounted.
+
+Why the change: mounting single files meant Docker bind-mounted them by
+*inode*, which made crash-safe atomic writes impossible, and meant a fresh
+clone (where the gitignored files don't exist) got directories created in
+their place and crash-looped on startup. Details in `state.py`.
+
+---
+
 ## Configuration
 
 ### Environment variables
@@ -137,10 +203,14 @@ All optional — see `.env.example` for the full template.
 | `NAS_SMB_USER` / `NAS_SMB_PASS` / `NAS_SMB_DEVICE` | Only needed if you use the Docker Compose `cifs` volume for a network share — see the comments in `docker-compose.yml`. |
 | `FFMPEG_PATH` | Override the ffmpeg/ffprobe binary location if not on `PATH`. |
 | `MAX_CONCURRENT_DOWNLOADS` | Max downloads (and their format-conversion re-encodes) running at once, across all download types combined. Defaults to `2` — format conversion is CPU/memory-heavy, so raise this only if your hardware can handle more concurrent encodes. |
+| `VIDSHELF_DATA_DIR` | Where persistent state (`config.json`, download trackers) is kept. Defaults to `./data`. In Docker leave this alone and mount a volume at `/app/data` instead. |
 
 ### `config.json`
 
-Everything else lives in `config.json` (created automatically, gitignored — copy `config.json.example` if starting from scratch), and is fully editable from the Settings page:
+Everything else lives in `data/config.json` (created automatically,
+gitignored — copy `config.json.example` into `data/` if starting from
+scratch), and is fully editable from the Settings page. Set
+`VIDSHELF_DATA_DIR` to keep state somewhere other than `./data`:
 
 ```json
 {

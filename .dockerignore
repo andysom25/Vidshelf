@@ -22,8 +22,14 @@ downloads/
 # Env / secrets
 .env
 *.log
-config.json
 cookies.txt
+
+# Persistent state — never bake a developer's own config or trackers into the
+# image. /app/data is created by the Dockerfile and mounted at runtime.
+data/
+config.json
+active_downloads.json
+downloaded_videos.json
 
 # Aider
 .aider*

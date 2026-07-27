@@ -23,8 +23,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create download directories
-RUN mkdir -p downloads downloads/music_videos
+# Create download directories, plus the state directory. /app/data is
+# normally a mounted volume; creating it here means an unmounted run (plain
+# `docker run` with no -v) still starts cleanly instead of failing on the
+# first config write.
+RUN mkdir -p downloads downloads/music_videos data
 
 EXPOSE 5000
 
