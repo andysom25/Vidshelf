@@ -3145,3 +3145,121 @@ Expect `1.0.0` to report an update, the current version not to, and
 - Wrong "update available" after a manual build: expected if `VERSION` on a
   dev build is behind the latest release. Comparison is against the release
   tag, not the image.
+
+## CHANGED (2026-07-27): pinned dependencies, extracted the dashboard's CSS/JS, added route smoke tests
+
+Shipped as v1.2.1. Maintenance only — no user-visible behaviour changes,
+hence a patch rather than a minor.
+
+### Dependencies are pinned exactly
+
+`requirements.txt` was four `>=` ranges. That meant a user's
+`docker compose up --build` could pull a different Flask or yt-dlp than
+anything ever tested, and their bug report was unreproducible because there
+was no way to know what they actually had. Now pinned `==`, including
+transitives — Werkzeug especially, which has shipped breaking changes inside
+a Flask major, so leaving it floating would have defeated the point.
+
+The pins are the set verified running in the container, not whatever was
+newest on PyPI.
+
+**The tension this creates**: yt-dlp *needs* to stay fresh — YouTube changes
+break extraction every few weeks, so an old pin is its own bug. Resolved with
+`.github/workflows/bump-yt-dlp.yml`: weekly (and on demand via
+`workflow_dispatch`, for when YouTube breaks mid-week), it finds the latest
+yt-dlp on PyPI, applies the pin, installs it, runs all three test suites plus
+an import check, and **only then** opens a PR against `dev`.
+
+It opens a PR rather than pushing, deliberately: a yt-dlp release can itself
+be broken, and auto-merging into the branch releases are cut from is how a
+bad extractor reaches a published image. Note the tests do not exercise real
+extraction against YouTube, so a suspicious release still wants one manual
+download through the UI before merging.
+
+### dashboard.html: 3,425 lines -> 611
+
+The template was 161KB, but only ~600 lines of it were markup: 662 lines of
+CSS and 2,149 lines of JS were inlined. Extracted to
+`static/css/dashboard.css` and `static/js/dashboard.js`.
+
+Two things that had to be checked first, either of which would have made this
+a silent breakage:
+
+1. **Jinja syntax inside the blocks.** A `{{ ... }}` in inlined JS stops being
+   interpolated the moment it moves to a static file, and fails at runtime,
+   not at build. Verified none of the five blocks contained any before
+   moving.
+2. **Execution order.** There were *four* consecutive `<script>` blocks, not
+   one. Later blocks call into earlier ones, and some run `getElementById` at
+   top level, so they need the DOM already parsed. They were contiguous with
+   no markup between them and sat immediately before `</body>`, so
+   concatenating them in order and loading one file from the same position
+   preserves both the ordering and the DOM guarantee. The block boundaries are
+   marked with comments in the output file.
+
+On caching: Flask serves these with `Cache-Control: no-cache` plus an ETag, so
+repeat loads revalidate and get a 304 rather than being cached outright. Still
+a real saving over re-sending 160KB inside every page render, and it means an
+upgrade can never serve a stale asset — which is worth more here than
+aggressive caching, since there is no cache-busting in the asset URLs.
+
+`app.py` (2,076 lines) and `artwork_sync.py` (2,032) were deliberately **not**
+split in this release — see below.
+
+### tests/test_routes.py — 7 tests over all 53 routes
+
+Not functional tests; they assert what breaks silently during a refactor:
+
+- every expected route is still registered, and the count hasn't collapsed
+- no route 500s on a plain authenticated GET
+- **every non-public route rejects an unauthenticated caller** — a standing
+  security invariant, not just a refactor guard. Public by design:
+  `login`, `logout`, `static`, and `favicon` (an inline SVG that browsers
+  fetch on the login page before any session exists).
+- the dashboard still renders *and* its static assets resolve. This one
+  matters specifically because of the extraction above: a broken `url_for()`
+  produces a blank-looking page that still returns HTTP 200, which no
+  status-code check would catch.
+
+Writing them surfaced two wrong assumptions in the tests themselves (not
+bugs): `/api/downloads` doesn't exist — it's `/api/downloads/progress` — and
+`/favicon.ico` is intentionally public.
+
+### Why app.py wasn't split into blueprints
+
+It's the obvious next step and it was explicitly deferred. 50 routes share
+module-level state (`_DOWNLOAD_EXECUTOR`, `_CONVERSION_STATE`, the config
+helpers), and rehoming those is the risky part — a route quietly failing to
+register is invisible until someone clicks the button that needs it.
+
+`tests/test_routes.py` is the prerequisite that makes that refactor safe, and
+it now exists. The route-registration test is what would catch an endpoint
+going missing during the move. Natural split, by current route counts:
+plex (13), channels (5), artwork (5), system (4), downloads (4),
+conversion (3), artists (3), music-videos (2).
+
+### How to verify
+
+```bash
+python tests/test_state.py && python tests/test_updates.py && python tests/test_routes.py
+
+docker compose up -d --build
+docker exec vidshelf ls -la /app/static/css /app/static/js   # assets in the image
+docker exec vidshelf pip freeze | grep -E 'Flask|yt-dlp'     # pins actually applied
+curl -s localhost:5000/static/css/dashboard.css | wc -c      # ~14000, not 0
+```
+
+Note `curl -o /dev/null -w '%{size_download}'` reports 0 for these under Git
+Bash on Windows even when the transfer is fine — pipe to `wc -c` instead
+before concluding an asset is empty.
+
+### If the dashboard renders unstyled or dead
+
+1. `curl localhost:5000/static/css/dashboard.css` — a 404 means the `static/`
+   directory didn't make it into the image; check `.dockerignore`.
+2. Browser console for a JS error in `dashboard.js` — if it's a
+   `{{ something }}` appearing literally, a Jinja expression got moved into
+   the static file and needs to come back into the template (or be passed in
+   via a `data-` attribute).
+3. `python tests/test_routes.py` — `test_dashboard_renders_with_its_static_assets`
+   covers exactly this.
