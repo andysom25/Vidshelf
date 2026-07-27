@@ -2794,72 +2794,90 @@ right human name); the mismatch was only visible on GitHub's side.
 Diagnose this with:
 
 ```bash
-gh api repos/andysom25/Vidshelf/commits \
-  --jq '.[] | {sha: .sha[0:7], email: .commit.author.email, attributed_to: (.author.login // "UNATTRIBUTED")}'
+gh api 'repos/andysom25/Vidshelf/commits?sha=dev&per_page=100' \
+  --jq '.[] | "\(.sha[0:7])  \(.author.login // "*** UNATTRIBUTED ***")  \(.commit.author.email)"'
 ```
 
-`.author.login` is GitHub's *resolved* account (email → verified account
+`.author.login` is GitHub's *resolved* account (email → verified-account
 lookup), which is what the web UI shows — it is not the same thing as
 `.commit.author.email`. Comparing only the local `git log` identity will
-never surface this class of bug.
+never surface this class of bug. Note the `?sha=<branch>` parameter: the
+default lists the default branch only, so run it once per branch.
 
-**The fix**: switched to the account's noreply address,
-`7364828+andysom25@users.noreply.github.com` (the `7364828` prefix is the
-numeric user ID from `gh api users/andysom25 --jq .id`). A noreply
-address is guaranteed to resolve to that account and can't be
-un-verified out from under the history later, unlike a personal address.
+**The fix**: rewrote every commit as
+`andysom25 <andrew.someillan@gmail.com>` — the personal address, which is
+verified on the andysom25 account (confirmed empirically: all commits
+report `author.login: andysom25` after the push).
 
-1. Set the identity globally (`git config --global user.name andysom25`
-   / `user.email 7364828+...`). **Consequence**: this machine's *default*
-   identity is now the personal account — work repos under a ceretax
-   remote need a per-repo `git config --local user.email
-   andrew.someillan@ceretax.com` or their commits will land as
-   `andysom25`.
-2. Rewrote all 7 commits with `git filter-branch --env-filter` setting
-   all four of `GIT_AUTHOR_NAME/EMAIL` and `GIT_COMMITTER_NAME/EMAIL`,
-   scoped `-- --branches --tags` (deliberately *not* `-- --all`, which
-   also rewrites `refs/remotes/*` and desyncs the tracking refs from
-   what the remote actually has). `git-filter-repo` is not installed on
-   this machine; `filter-branch` is deprecated but fine at this scale.
-3. **Recreated the annotated `v1.0.0` tag by hand.** This is the step
-   that's easy to miss: `--tag-name-filter cat` re-points the tag at the
-   rewritten commit but **preserves the original tagger identity**, so
-   the tag object still read `andrew.someillan@ceretax.com` after
-   filter-branch reported success. Fixed with `GIT_COMMITTER_DATE=...
-   GIT_COMMITTER_NAME=... GIT_COMMITTER_EMAIL=... git tag -f -a v1.0.0
-   main -F <msgfile>`, passing the original tagger date
-   (`2026-07-25T20:38:38-04:00`) so the tag doesn't silently jump two
-   days forward. Verify with `git for-each-ref refs/tags/v1.0.0
-   --format='%(taggername) %(taggeremail)'` — `git log` will not show
-   you this.
-4. Force-pushed `main` and `dev` (`--force-with-lease`) and the tag
+The identity was set **globally** (`git config --global`), not per-repo.
+**Consequence**: this machine's default identity is now the personal
+account — work repos under a ceretax remote need an explicit
+`git config --local user.email andrew.someillan@ceretax.com` (and
+`user.name "Andrew Someillan"`) or their commits will land as
+`andysom25`.
+
+### Mechanics, and the two steps that are easy to get wrong
+
+1. Rewrote all commits with `git filter-branch --env-filter` setting all
+   four of `GIT_AUTHOR_NAME/EMAIL` and `GIT_COMMITTER_NAME/EMAIL`
+   (setting only the author pair leaves the committer wrong, and GitHub
+   surfaces both). Scoped `-- --branches --tags` — deliberately *not*
+   `-- --all`, which also rewrites `refs/remotes/*` and desyncs the
+   tracking refs from what the remote actually has. `git-filter-repo` is
+   not installed on this machine; `filter-branch` is deprecated but fine
+   at this scale.
+2. **Recreated the annotated `v1.0.0` tag by hand.** `--tag-name-filter
+   cat` re-points the tag at the rewritten commit but **preserves the
+   original tagger identity**, so the tag object still read
+   `andrew.someillan@ceretax.com` after filter-branch reported success.
+   Fixed with `GIT_COMMITTER_DATE=... GIT_COMMITTER_NAME=...
+   GIT_COMMITTER_EMAIL=... git tag -f -a v1.0.0 main -F <msgfile>`,
+   passing the original tagger date (`2026-07-25T20:38:38-04:00`) so the
+   tag doesn't silently jump forward to the rewrite date. Verify with
+   `git for-each-ref refs/tags/v1.0.0 --format='%(taggername) %(taggeremail)'`
+   — `git log` will not show you this.
+3. Force-pushed `main` and `dev` (`--force-with-lease`) and the tag
    (`--force`).
 
-**Verified**: all 7 commits report `attributed_to: andysom25`; `git diff
-<old-sha> <new-sha>` between the pre- and post-rewrite branch tips is
-empty (content byte-identical, only metadata changed); the v1.0.0 GitHub
-Release survived the tag force-update intact (it tracks the tag *name*,
-not the old object, so it re-pointed automatically — no need to delete
-and recreate it, which would have lost the release notes).
+**Verified**: all commits on both `dev` and `main` report
+`author.login: andysom25`, with zero `UNATTRIBUTED` entries; the tag's
+tagger field matches; `git diff <old-tip> <new-tip>` is empty (content
+byte-identical, only metadata changed); the v1.0.0 GitHub Release
+survived the tag force-update intact — it tracks the tag *name*, not the
+old object, so it re-pointed automatically. Do **not** delete and
+recreate the tag to "refresh" the release; that loses the release notes.
 
-**SHA mapping** (every SHA cited in the sections above this one refers to
-the old, now-unreachable history):
+**Note on the noreply alternative**: the first pass of this rewrite used
+`7364828+andysom25@users.noreply.github.com` (the `7364828` prefix is the
+numeric user ID from `gh api users/andysom25 --jq .id`). That form is
+guaranteed to resolve to the account and keeps a real address out of a
+public repo's history, so it's the safer default if the personal address
+is ever un-verified from the account. It was replaced with the plain
+gmail address by preference. Both were confirmed to attribute correctly.
+If you ever switch back, the whole procedure above applies unchanged —
+only the email string differs.
 
-| old | new | commit |
+### SHA mapping
+
+Every SHA cited in the sections *above* this one refers to the original,
+now-unreachable history:
+
+| original | current | commit |
 | --- | --- | --- |
-| `104dade` | `17fa4d0` | Initial commit |
-| `8c2421b` | `1538d9c` | first-run onboarding |
-| `b59d56d` | `0f313b0` | health check / bounded concurrency / Plex confirmation |
-| `f6c9a2c` | `2b617aa` | README screenshots |
-| `09c528c` | `3059f7c` | Bump version to 1.0.0 |
-| `557b6d3` | `40ec351` | Release v1.0.0 (merge, `main` tip, tagged) |
-| `63bf77b` | `bf68ce3` | Document the v1.0.0 release cut (`dev` tip) |
+| `104dade` | `e09138c` | Initial commit |
+| `8c2421b` | `8501ac4` | first-run onboarding |
+| `b59d56d` | `39045bb` | health check / bounded concurrency / Plex confirmation |
+| `f6c9a2c` | `685b606` | README screenshots |
+| `09c528c` | `e3747be` | Bump version to 1.0.0 |
+| `557b6d3` | `6f9d8d0` | Release v1.0.0 (merge, `main` tip, tagged) |
+| `63bf77b` | `305883e` | Document the v1.0.0 release cut |
+| — | `938dea9` | Document this rewrite (`dev` tip, created post-rewrite) |
 
 **If this ever regresses** (new commits showing the wrong author): check
 `git config user.email` *in that repo* first — a stale `--local` value
 silently overrides the global default, and that's far more likely than
-anything about the history above. Re-run the `gh api ... .author.login`
-one-liner to confirm what GitHub actually resolved.
+anything about the history above. Then re-run the `gh api ...
+.author.login` one-liner to confirm what GitHub actually resolved.
 
 **Note for anyone with an older clone**: the pre-rewrite history is gone
 from the remote. A plain `git pull` on a stale clone will try to merge
