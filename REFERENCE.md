@@ -3046,3 +3046,96 @@ version to carry.
 
 README's quick start now leads with `docker pull` instead of clone-and-build;
 building from source moved to option 2.
+
+## ADDED (2026-07-27): visible version badge + opt-out update check
+
+Shipped as v1.1.1. (Strictly this is a feature and the repo's own semver rule
+in `CLAUDE.md` would make it 1.2.0 — released as a patch by explicit choice.)
+
+### What already existed
+
+`APP_VERSION` was already read from the `VERSION` file (app.py) and already
+returned by the stats endpoint, and the Settings page's System Health panel
+already rendered it. The problem was purely placement: it only appeared in a
+panel nobody opens unless something is already broken, so "what version are
+you on?" was still the first question on any bug report.
+
+### The badge
+
+Sidebar footer, under Sign Out — always visible on every page. Shows
+`Vidshelf v1.1.1`, plus a red `v1.2.0 available` pill linking to the release
+notes when behind. The pill is `display:none` unless an update actually
+exists, so the normal state is one quiet grey line.
+
+Populated by `loadVersionBadge()` from `/api/system/version` on page load.
+Fire-and-forget: a failed fetch leaves the badge as-is rather than showing an
+error, because a cosmetic version label is never worth an error banner.
+
+### The update check (`updates.py`)
+
+Queries `https://api.github.com/repos/andysom25/Vidshelf/releases/latest`.
+Design constraints, all of which are load-bearing:
+
+- **Server-side, not from the browser.** A `fetch()` from the dashboard would
+  leak every user's IP to GitHub and break on networks that can't reach it.
+- **Never blocks a page load.** `get_status()` always returns the cached
+  answer immediately; if the cache is stale it starts a background thread and
+  serves the old value meanwhile. Tested explicitly — the stale-cache test
+  asserts `get_status()` returns in under 200ms against a fetch that sleeps
+  300ms.
+- **Cached 24h, persisted to `data/update_check.json`.** GitHub allows 60
+  unauthenticated requests/hour/IP; one per day per install makes that
+  irrelevant. Persisting matters because a container restart loop would
+  otherwise become a request loop.
+- **Failures are cached too**, including HTTP 403 rate-limiting, so a failing
+  check backs off instead of retrying into the limit.
+- **Notifies, never updates.** Deciding when to pull an image is the
+  operator's call.
+- **Opt-out toggle** in Settings → System Health, `update_check_enabled` in
+  config, default on. Off means the app makes no outbound request of its own.
+
+`/releases/latest` is used rather than `/releases` because GitHub already
+excludes drafts and prereleases from it — a tagged beta can't be advertised
+as an upgrade.
+
+### Two bugs avoided, both covered by tests
+
+**Lexicographic version comparison.** `'1.10.0' < '1.9.0'` as strings, so a
+string compare silently stops advertising updates exactly when the minor
+version goes double-digit. `parse_version()` returns an int tuple;
+`test_numeric_not_lexicographic_comparison` pins it.
+
+**A leaked in-flight flag.** `_refresh()` clears `_refreshing` in a `finally`.
+Without that, one unexpected exception in the background thread would leave
+the flag set and **no update check would ever run again for the life of the
+process** — a permanently silent failure with no symptom.
+`test_refresh_flag_is_released_even_if_fetch_raises` guards it.
+
+Also handled: `APP_VERSION == 'unknown'` (VERSION file missing from the
+image) never reports an update, since it's noise the user can't act on.
+
+### How to verify
+
+```bash
+python tests/test_updates.py    # 9/9, no network touched (fetch is stubbed)
+
+# against real GitHub, inside the container:
+docker exec vidshelf python -c "
+import updates
+for cur in ['1.0.0', '1.1.1', 'unknown']:
+    print(cur, updates.get_status(cur, enabled=True))"
+```
+
+Expect `1.0.0` to report an update, the current version not to, and
+`unknown` not to. The cache lands at `data/update_check.json`.
+
+### If it misbehaves
+
+- Badge stuck / no update shown after a release: delete
+  `data/update_check.json` to force a refetch — the 24h TTL is the usual
+  explanation, not a bug.
+- Never updates at all: check `update_check_enabled` in `data/config.json`,
+  then that the container has outbound HTTPS.
+- Wrong "update available" after a manual build: expected if `VERSION` on a
+  dev build is behind the latest release. Comparison is against the release
+  tag, not the image.
