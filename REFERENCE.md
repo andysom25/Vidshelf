@@ -3049,8 +3049,14 @@ building from source moved to option 2.
 
 ## ADDED (2026-07-27): visible version badge + opt-out update check
 
-Shipped as v1.1.1. (Strictly this is a feature and the repo's own semver rule
-in `CLAUDE.md` would make it 1.2.0 — released as a patch by explicit choice.)
+Shipped as v1.2.0. Briefly tagged v1.1.1 first, then retagged: this is a
+feature, and `CLAUDE.md`'s semver rule makes that a minor bump, not a patch.
+The v1.1.1 tag and its GitHub release were deleted; its release *merge commit*
+is still in `main`'s history (untagged), because rewriting a pushed `main`
+to erase it would be far more disruptive than an orphaned merge commit.
+The `1.1.1` container image tag also still exists in GHCR — deleting package
+versions needs a token scope the local `gh` doesn't have. Neither is
+referenced by anything.
 
 ### What already existed
 
@@ -3063,7 +3069,7 @@ you on?" was still the first question on any bug report.
 ### The badge
 
 Sidebar footer, under Sign Out — always visible on every page. Shows
-`Vidshelf v1.1.1`, plus a red `v1.2.0 available` pill linking to the release
+`Vidshelf v1.2.0`, plus a red `v1.3.0 available` pill linking to the release
 notes when behind. The pill is `display:none` unless an update actually
 exists, so the normal state is one quiet grey line.
 
@@ -3122,7 +3128,7 @@ python tests/test_updates.py    # 9/9, no network touched (fetch is stubbed)
 # against real GitHub, inside the container:
 docker exec vidshelf python -c "
 import updates
-for cur in ['1.0.0', '1.1.1', 'unknown']:
+for cur in ['1.0.0', '1.2.0', 'unknown']:
     print(cur, updates.get_status(cur, enabled=True))"
 ```
 
