@@ -1,0 +1,84 @@
+name: Bump yt-dlp
+
+# Pinning yt-dlp exactly (see requirements.txt) makes builds reproducible, but
+# a stale yt-dlp is its own bug: YouTube changes break extraction every few
+# weeks. This proposes a new pin weekly and runs the test suite against it, so
+# the pin moves by reviewed PR instead of by silent drift or manual chasing.
+#
+# Deliberately opens a PR rather than pushing to dev: a yt-dlp release can
+# itself be broken, and auto-merging one straight into the branch releases are
+# cut from is how a bad extractor ends up in a published image.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+  workflow_dispatch:      # so it can be run on demand when YouTube breaks
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Find the latest yt-dlp
+        id: latest
+        run: |
+          latest=$(curl -fsSL https://pypi.org/pypi/yt-dlp/json | python -c "import json,sys; print(json.load(sys.stdin)['info']['version'])")
+          current=$(grep -oP '^yt-dlp==\K.*' requirements.txt)
+          echo "latest=$latest"   >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$current" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already on $current"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "$current -> $latest"
+          fi
+
+      - name: Apply the new pin
+        if: steps.latest.outputs.changed == 'true'
+        run: |
+          sed -i "s/^yt-dlp==.*/yt-dlp==${{ steps.latest.outputs.latest }}/" requirements.txt
+          grep '^yt-dlp==' requirements.txt
+
+      # The whole point of a PR rather than a blind bump: if the new yt-dlp
+      # breaks imports or the suite, the PR lands red and gets looked at
+      # instead of quietly shipping.
+      - name: Install and test against the new pin
+        if: steps.latest.outputs.changed == 'true'
+        run: |
+          pip install -r requirements.txt
+          python tests/test_state.py
+          python tests/test_updates.py
+          python tests/test_routes.py
+          python -c "import state, transcode, downloader, artwork_swap, artwork_sync, updates, app"
+
+      - name: Open a PR
+        if: steps.latest.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          base: dev
+          branch: chore/bump-yt-dlp
+          commit-message: "Bump yt-dlp to ${{ steps.latest.outputs.latest }}"
+          title: "Bump yt-dlp to ${{ steps.latest.outputs.latest }}"
+          body: |
+            Weekly automated yt-dlp pin bump.
+
+            `${{ steps.latest.outputs.current }}` → `${{ steps.latest.outputs.latest }}`
+
+            The test suite and an import check ran against the new pin before
+            this PR was opened — if that step failed, this PR would not exist.
+            That does **not** cover actual extraction against YouTube, so if a
+            release is suspected of breaking downloads, try one through the UI
+            before merging.
+          labels: dependencies

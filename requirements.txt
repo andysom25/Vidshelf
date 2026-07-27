@@ -1,4 +1,33 @@
-flask>=3.0
-yt-dlp>=2024.1
-requests>=2.31.0
-Pillow>=10.0
+# Pinned exactly, not >=, so a build today produces the same image as a build
+# last month. Unpinned ranges meant a user's `docker compose up --build` could
+# silently pull a different Flask or yt-dlp than the one this was tested
+# against, and a bug report became impossible to reproduce because there was
+# no way to know what they actually had.
+#
+# These versions are the set verified running in the container as of v1.2.1.
+#
+# yt-dlp is the one that genuinely needs to stay fresh -- YouTube changes
+# break extraction regularly, so an old pin is its own kind of bug. That is
+# what .github/workflows/bump-yt-dlp.yml is for: it proposes a new pin weekly
+# and runs the tests against it, so bumping is a reviewed PR rather than
+# either silent drift or manual chasing.
+
+# Direct dependencies
+Flask==3.1.3
+yt-dlp==2026.7.4
+requests==2.34.2
+pillow==12.3.0
+
+# Transitive dependencies, pinned too. Flask and requests pull these in, and
+# leaving them floating would defeat the point -- Werkzeug in particular has
+# shipped breaking changes within a Flask major.
+blinker==1.9.0
+certifi==2026.6.17
+charset-normalizer==3.4.9
+click==8.4.2
+idna==3.18
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+urllib3==2.7.0
+Werkzeug==3.1.8

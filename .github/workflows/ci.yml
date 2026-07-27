@@ -34,6 +34,7 @@ jobs:
         run: |
           python tests/test_state.py
           python tests/test_updates.py
+          python tests/test_routes.py
 
       - name: Check every module imports
         # Catches the class of breakage that only shows up at import time,
