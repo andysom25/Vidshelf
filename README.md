@@ -67,6 +67,7 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 - Real-time download and conversion progress (polling-based, no WebSockets needed)
 - Artists page — browse tracked artists and their downloaded videos
 - Settings page — raw config view, path editors, Plex connection management, password change, video-format-compatibility scan/convert tools
+- Version always visible in the sidebar, with an optional once-a-day check for new releases (notifies only — never downloads or installs anything, and can be switched off in Settings)
 
 ### Security
 - No hardcoded credentials — a random admin password is generated on first run (or set your own via env vars) and printed once to the logs

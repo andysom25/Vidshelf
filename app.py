@@ -8,6 +8,7 @@ import datetime
 import secrets
 import requests
 import state
+import updates
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from downloader import download_video, get_active_downloads, queue_download
@@ -1515,6 +1516,41 @@ def api_system_health():
         'pillow': title_card_deps['pillow'],
         'fonts': title_card_deps['fonts'],
     })
+
+
+@app.route('/api/system/version')
+def api_system_version():
+    """Current version plus, if enabled, whether a newer release exists.
+
+    Always returns immediately — updates.get_status() serves the cached
+    answer and refreshes in the background, so a slow or unreachable GitHub
+    can't stall the sidebar this feeds.
+    """
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    config = load_config()
+    # Opt-out, defaulting to on: the check is a single request per day, but
+    # it is an outbound call that reveals an install exists, so it has to be
+    # switchable for anyone who'd rather it didn't happen.
+    enabled = config.get('update_check_enabled', True)
+    return jsonify(updates.get_status(APP_VERSION, enabled=enabled))
+
+
+@app.route('/api/system/update-check', methods=['POST'])
+def api_system_update_check_toggle():
+    """Turn the update check on or off."""
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    if 'enabled' not in data:
+        return jsonify({'error': 'enabled is required'}), 400
+    enabled = bool(data['enabled'])
+
+    def _set(config):
+        config['update_check_enabled'] = enabled
+
+    _update_config(_set)
+    return jsonify({'success': True, 'enabled': enabled})
 
 # ---------- Download Verification ----------
 

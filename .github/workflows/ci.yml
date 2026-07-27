@@ -31,7 +31,9 @@ jobs:
       # No pytest dependency on purpose — the suite is plain asserts so it
       # runs identically here and on a developer's machine.
       - name: Run tests
-        run: python tests/test_state.py
+        run: |
+          python tests/test_state.py
+          python tests/test_updates.py
 
       - name: Check every module imports
         # Catches the class of breakage that only shows up at import time,
