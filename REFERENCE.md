@@ -2809,12 +2809,19 @@ default lists the default branch only, so run it once per branch.
 verified on the andysom25 account (confirmed empirically: all commits
 report `author.login: andysom25` after the push).
 
-The identity was set **globally** (`git config --global`), not per-repo.
-**Consequence**: this machine's default identity is now the personal
-account — work repos under a ceretax remote need an explicit
-`git config --local user.email andrew.someillan@ceretax.com` (and
-`user.name "Andrew Someillan"`) or their commits will land as
-`andysom25`.
+**Where the identity lives**: this repo carries a `--local` override; the
+machine's `--global` default is the *work* identity
+(`Andrew Someillan <andrew.someillan@ceretax.com>`, which GitHub resolves
+to `fpasomeillan`). That direction is deliberate and was corrected once
+after an initial pass got it backwards: **work inherits by default,
+personal is opt-in per repo.** A work commit accidentally landing under
+the personal account is the worse of the two failure modes, so the
+default is the conservative one. Do not globalize the personal identity.
+
+Confirm which one a given repo will actually use with
+`git var GIT_AUTHOR_IDENT` — it reports the *resolved* identity after
+local/global precedence, unlike `git config --global user.email`, which
+tells you nothing about what an individual repo overrides.
 
 ### Mechanics, and the two steps that are easy to get wrong
 
