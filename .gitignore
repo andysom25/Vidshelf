@@ -44,3 +44,9 @@ Thumbs.db
 
 # Claude Code — settings.local.json is per-developer, not shared config
 .claude/settings.local.json
+
+# Per-deployment compose overrides (e.g. running the published GHCR image
+# instead of building from source). Which image a machine runs is a local
+# choice; the tracked docker-compose.yml stays the build-from-source path.
+docker-compose.override.yml
+docker-compose.override.yaml

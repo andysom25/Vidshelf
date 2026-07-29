@@ -49,18 +49,92 @@ jobs:
         # which is exactly where the pre-v1.1.0 fresh-install crash lived.
         run: python -c "import state, transcode, downloader, artwork_swap, artwork_sync, app"
 
+  # Decides whether this run should publish, and what version it is publishing.
+  #
+  # The version always comes from the VERSION file rather than the git ref.
+  # docker/metadata-action's type=semver patterns read the *ref*, so they
+  # produce nothing on a branch push — and this workflow needs to publish from
+  # a main push, not only from a tag.
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      major: ${{ steps.resolve.outputs.major }}
+      major_minor: ${{ steps.resolve.outputs.major_minor }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      tag_needed: ${{ steps.resolve.outputs.tag_needed }}
+      is_newest: ${{ steps.resolve.outputs.is_newest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need the full tag list to compare against
+
+      - name: Resolve
+        id: resolve
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::VERSION is not semver: '$version'"; exit 1 ;;
+          esac
+
+          major="${version%%.*}"
+          rest="${version#*.}"
+          minor="${rest%%.*}"
+
+          publish=false
+          tag_needed=false
+
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            # A tag was pushed by hand. Publish it; the tag already exists.
+            # Guard against the tag and VERSION disagreeing, which would
+            # publish an image whose reported version differs from its tag.
+            if [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match VERSION ($version)"
+              exit 1
+            fi
+            publish=true
+          elif [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            # Auto-release: main carries a VERSION that isn't tagged yet.
+            if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+              echo "v$version is already tagged — nothing to release."
+            else
+              echo "v$version is not tagged yet — will release."
+              publish=true
+              tag_needed=true
+            fi
+          fi
+
+          # Only move :latest when this really is the newest release, so
+          # re-publishing an older tag can't drag latest backwards.
+          newest="$(printf '%s\n' "v$version" $(git tag -l 'v*') | sort -V | tail -1)"
+          if [ "$newest" = "v$version" ]; then is_newest=true; else is_newest=false; fi
+
+          {
+            echo "version=$version"
+            echo "major=$major"
+            echo "major_minor=$major.$minor"
+            echo "publish=$publish"
+            echo "tag_needed=$tag_needed"
+            echo "is_newest=$is_newest"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "version=$version publish=$publish tag_needed=$tag_needed is_newest=$is_newest"
+
   publish:
     name: Publish image
-    # Only publish from tags — main is releases-only, and an image built from
-    # an untagged commit has no meaningful version to carry.
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    needs: [test, version]
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # creating the tag and the release needs write
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # arm64 matters here: a large share of self-hosted Plex setups are
       # Synology/Raspberry Pi, and an amd64-only image simply won't start.
@@ -79,11 +153,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
+          # type=raw from the VERSION output, not type=semver from the ref —
+          # see the version job's comment.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest
+            type=raw,value=${{ needs.version.outputs.version }}
+            type=raw,value=${{ needs.version.outputs.major_minor }}
+            type=raw,value=${{ needs.version.outputs.major }}
+            type=raw,value=latest,enable=${{ needs.version.outputs.is_newest }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -95,3 +171,36 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Deliberately after the image push: if the build fails there is no tag
+      # and no release announcing an artifact that doesn't exist. Re-running
+      # after a fix still works, because the version job's check is based on
+      # whether the tag exists, not on this run.
+      - name: Tag the release
+        if: needs.version.outputs.tag_needed == 'true'
+        env:
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Attributed to the bot on purpose: this tag is created by CI, not by
+          # a person. Change these two lines if you'd rather releases carry
+          # your own identity.
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$V" -m "v$V"
+          # This push uses GITHUB_TOKEN, so it does NOT trigger another CI run.
+          # That is load-bearing, not incidental: it's what stops the new tag
+          # from starting a second build of the same commit.
+          git push origin "refs/tags/v$V"
+
+      - name: Create the GitHub release
+        if: needs.version.outputs.tag_needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "v$V" \
+            --title "v$V" \
+            --generate-notes \
+            $([ "${{ needs.version.outputs.is_newest }}" = "true" ] || echo "--latest=false")
