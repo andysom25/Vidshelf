@@ -241,10 +241,40 @@
         }
 
         // ---------- Channels ----------
+        // A fetch that cannot hang forever.
+        //
+        // Several endpoints depend on things outside this app's control: a
+        // YouTube lookup per channel, or a directory walk across a network
+        // mount. Without a deadline a stall renders as a spinner that never
+        // resolves, which is indistinguishable from a broken page — and that
+        // was reported as a bug more than once before this existed.
+        const FETCH_TIMEOUT_MS = 25000;
+
+        async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+            } finally {
+                // Always clear it, or a fast response leaves a pending timer
+                // that fires an abort on an already-settled request.
+                clearTimeout(timer);
+            }
+        }
+
+        // AbortError is what a timeout surfaces as; say so rather than showing
+        // the user a bare "aborted".
+        function describeFetchError(e, timeoutMs = FETCH_TIMEOUT_MS) {
+            if (e && e.name === 'AbortError') {
+                return `Timed out after ${Math.round(timeoutMs / 1000)}s`;
+            }
+            return (e && e.message) ? e.message : 'Request failed';
+        }
+
         async function loadChannels() {
             const container = document.getElementById('channels-list');
             try {
-                const resp = await fetch('/api/channels');
+                const resp = await fetchWithTimeout('/api/channels');
                 const data = await resp.json();
                 if (data.error) {
                     container.innerHTML = '<div class="empty-state"><p>Error loading channels: ' + data.error + '</p></div>';
@@ -290,7 +320,13 @@
                 });
                 container.innerHTML = html;
             } catch (e) {
-                container.innerHTML = '<div class="empty-state"><p>Failed to load channels: ' + e.message + '</p></div>';
+                // Offer a way out rather than leaving a dead panel. Channel
+                // names come from a per-channel YouTube lookup, so a slow or
+                // rate-limited response is the common cause here.
+                container.innerHTML =
+                    '<div class="empty-state"><div class="empty-icon">⚠️</div>'
+                    + '<p>Couldn\'t load channels — ' + escapeHtml(describeFetchError(e)) + '.</p>'
+                    + '<button class="btn btn-secondary" onclick="loadChannels()">Retry</button></div>';
             }
         }
 
@@ -2093,11 +2129,16 @@ async function loadArtistsPage() {
     container.className = 'loading';
     container.innerHTML = '<div class="spinner"></div><p>Loading artists...</p>';
     try {
-        const resp = await fetch('/api/artists/summary');
+        // Timed out rather than plain fetch: /api/artists/summary walks every
+        // artist directory and counts files in each, which is I/O against what
+        // is usually a network mount. A stalled mount used to leave this
+        // spinner up indefinitely with no way to tell slow from broken.
+        const resp = await fetchWithTimeout('/api/artists/summary');
         const data = await resp.json();
         if (data.error) {
             container.className = 'empty-state';
-            container.innerHTML = `<p>Error loading artists: ${escapeHtml(data.error)}</p>`;
+            container.innerHTML = `<div class="empty-icon">⚠️</div><p>Error loading artists: ${escapeHtml(data.error)}</p>`
+                + '<button class="btn btn-secondary" onclick="loadArtistsPage()">Retry</button>';
             _artistsAll = [];
             updateArtistFilterSummary(0, 0);
             return;
@@ -2106,7 +2147,8 @@ async function loadArtistsPage() {
         renderArtistList();
     } catch (e) {
         container.className = 'empty-state';
-        container.innerHTML = `<p>Failed to load artists: ${escapeHtml(e.message)}</p>`;
+        container.innerHTML = `<div class="empty-icon">⚠️</div><p>Couldn't load artists — ${escapeHtml(describeFetchError(e))}.</p>`
+            + '<button class="btn btn-secondary" onclick="loadArtistsPage()">Retry</button>';
         _artistsAll = [];
         updateArtistFilterSummary(0, 0);
     }

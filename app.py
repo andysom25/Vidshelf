@@ -948,18 +948,38 @@ def api_config():
         config = {k: v for k, v in load_config().items() if k not in ('_secret_key', '_auth')}
         return jsonify(config)
     elif request.method == 'POST':
-        # This endpoint replaces the whole file, and the Settings page's
-        # editor only ever round-trips the keys the GET above returned — so
-        # a save here would otherwise silently drop _secret_key/_auth,
-        # invalidating every session and regenerating (and reprinting) a
-        # brand new random admin password on the next restart. Preserve
-        # whatever's currently on disk for both.
+        # This endpoint replaces the whole document, and the Settings page's
+        # editor only round-trips the keys the GET above returned — so a save
+        # would otherwise drop anything it didn't know about.
+        #
+        # Every leading-underscore key is preserved, not a hardcoded list of
+        # two. The original code named _secret_key and _auth explicitly, which
+        # was correct when those were the only internal keys and silently wrong
+        # the moment _plex_client_id and update_check_enabled appeared: losing
+        # _plex_client_id makes every restart look like a new device to Plex,
+        # and it fails without an error anyone would notice. Treating the
+        # underscore prefix as the rule means the next internal key added is
+        # protected by default rather than by remembering to edit this line.
         new_config = request.get_json()
-        current = load_config()
-        for internal_key in ('_secret_key', '_auth'):
-            if internal_key in current:
-                new_config[internal_key] = current[internal_key]
-        _write_raw_config(new_config)
+        if not isinstance(new_config, dict):
+            return jsonify({'error': 'Expected a JSON object'}), 400
+
+        def _merge(current):
+            preserved = {k: v for k, v in current.items() if k.startswith('_')}
+            merged = dict(new_config)
+            # A caller may legitimately set an internal key (the GET response
+            # exposes _plex_client_id, so the editor can round-trip it) — only
+            # fill in the ones it left out.
+            for key, value in preserved.items():
+                merged.setdefault(key, value)
+            # Non-underscore settings that aren't user-facing config but are
+            # written by other endpoints would otherwise be dropped too.
+            for key in ('update_check_enabled',):
+                if key in current:
+                    merged.setdefault(key, current[key])
+            return merged
+
+        _update_config(_merge)
         return jsonify({'success': True, 'message': 'Configuration updated'})
 
 def _sanitize_folder_name(name):
@@ -2114,4 +2134,26 @@ if __name__ == '__main__':
     # browser — never want that reachable by default. Opt in explicitly for
     # local development with FLASK_DEBUG=true.
     debug_mode = os.environ.get('FLASK_DEBUG', '').lower() == 'true'
-    app.run(host='0.0.0.0', port=5000, debug=debug_mode)
+    port = int(os.environ.get('PORT', '5000'))
+
+    if debug_mode:
+        # Only path that uses Werkzeug's development server, and only because
+        # the reloader and interactive debugger are the point of asking for it.
+        print('[server] FLASK_DEBUG=true — using the Werkzeug development '
+              'server with the interactive debugger. Do not expose this.')
+        app.run(host='0.0.0.0', port=port, debug=True)
+    else:
+        # waitress rather than Werkzeug: this app ships as a container image
+        # people run unattended, and Werkzeug's server is explicitly not for
+        # that. waitress over gunicorn because it's pure-Python and works on
+        # Windows, which the local-install path in the README depends on.
+        #
+        # Threads matter here: the dashboard polls several endpoints on a timer
+        # while downloads and the artwork watcher run in their own background
+        # threads. waitress defaults to 4 request threads, which is thin once a
+        # slow directory walk is in flight and the UI is still polling.
+        from waitress import serve
+        threads = int(os.environ.get('SERVER_THREADS', '8'))
+        print(f'[server] Vidshelf {APP_VERSION} listening on http://0.0.0.0:{port} '
+              f'(waitress, {threads} threads)')
+        serve(app, host='0.0.0.0', port=port, threads=threads, ident='Vidshelf')

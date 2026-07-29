@@ -1,0 +1,87 @@
+name: Bug report
+description: Something isn't working
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        **Please don't report security problems here** — use
+        [private vulnerability reporting](https://github.com/andysom25/Vidshelf/security/advisories/new)
+        so a fix can ship before the details are public.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Shown at the bottom of the sidebar, e.g. `Vidshelf v1.4.0`.
+      placeholder: v1.4.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How are you running it?
+      options:
+        - Docker — published image (ghcr.io/andysom25/vidshelf)
+        - Docker — built from source
+        - Local Python (no Docker)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        `docker compose logs --tail 100` (or the console output for a local run).
+        Please redact your Plex token, admin password and any NAS credentials.
+      render: shell
+
+  # This block exists because of a specific, expensive bug. A network-mounted
+  # media path can silently be a small local decoy volume rather than the NAS,
+  # which presents as ENOSPC / "no space left on device" with terabytes free.
+  # `df -h` distinguishes the two instantly (real mount: type cifs,
+  # multi-terabyte; decoy: ext4, a few hundred MB) and it took two separate
+  # debugging sessions to establish that the first time. See REFERENCE.md.
+  - type: textarea
+    id: mounts
+    attributes:
+      label: "Mount info — required for anything involving paths, storage or downloads failing"
+      description: |
+        Output of `docker exec vidshelf df -h` (Docker), or `df -h` (local).
+
+        If your media path is on a NAS, this is the single most useful thing
+        you can include: a real network mount shows as `cifs`/`nfs` with
+        multi-terabyte capacity, while a mis-configured one shows a small local
+        filesystem — which looks identical from inside the app but isn't.
+      render: shell
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: |
+        Your `docker-compose.yml` volumes section, and/or `data/config.json`
+        with `_secret_key`, `_auth` and `plex.token` removed.
+      render: yaml
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I'm on the latest release, or have said which version I'm on
+          required: true
+        - label: I've removed tokens, passwords and credentials from everything pasted above
+          required: true

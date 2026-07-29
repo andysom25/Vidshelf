@@ -19,9 +19,9 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'  # matches the Dockerfile base image
 
@@ -47,7 +47,7 @@ jobs:
       - name: Check every module imports
         # Catches the class of breakage that only shows up at import time,
         # which is exactly where the pre-v1.1.0 fresh-install crash lived.
-        run: python -c "import state, transcode, downloader, artwork_swap, artwork_sync, app"
+        run: python -c "import state, transcode, downloader, artwork_swap, artwork_sync, updates, app"
 
   # Decides whether this run should publish, and what version it is publishing.
   #
@@ -66,7 +66,7 @@ jobs:
       tag_needed: ${{ steps.resolve.outputs.tag_needed }}
       is_newest: ${{ steps.resolve.outputs.is_newest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0   # need the full tag list to compare against
 
@@ -132,17 +132,17 @@ jobs:
       contents: write   # creating the tag and the release needs write
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       # arm64 matters here: a large share of self-hosted Plex setups are
       # Synology/Raspberry Pi, and an amd64-only image simply won't start.
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -150,7 +150,7 @@ jobs:
 
       - name: Derive image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE_NAME }}
           # type=raw from the VERSION output, not type=semver from the ref —
@@ -162,7 +162,7 @@ jobs:
             type=raw,value=latest,enable=${{ needs.version.outputs.is_newest }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64

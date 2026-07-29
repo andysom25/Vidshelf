@@ -31,4 +31,11 @@ RUN mkdir -p downloads downloads/music_videos data
 
 EXPOSE 5000
 
+# Without this, `restart: unless-stopped` can't tell a wedged app from a healthy
+# one — the container stays "up" while serving nothing. Hits /login because it's
+# the only route that answers without a session. Uses urllib rather than curl so
+# the slim image doesn't need an extra package.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/login', timeout=4).status == 200 else 1)" || exit 1
+
 CMD ["python", "app.py"]

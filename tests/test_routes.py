@@ -34,6 +34,7 @@ os.environ['VIDSHELF_DATA_DIR'] = os.path.join(_WORK, 'data')
 os.environ.setdefault('ADMIN_PASSWORD', 'routes-test-password')
 
 import app as app_module  # noqa: E402
+import state  # noqa: E402
 
 app_module.app.config['TESTING'] = True
 
@@ -179,6 +180,65 @@ def test_static_assets_are_served_and_non_empty():
         body = resp.get_data(as_text=True)
         assert len(body) > 1000, f'{path} is suspiciously small ({len(body)} bytes)'
         assert needle in body, f'{path} does not contain expected content ({needle!r})'
+
+
+def test_config_post_preserves_internal_keys():
+    """POST /api/config replaces the whole document — it must not drop keys.
+
+    The original code preserved a hardcoded pair (`_secret_key`, `_auth`),
+    which was correct until `_plex_client_id` and `update_check_enabled`
+    existed. Losing `_plex_client_id` makes every restart look like a new
+    device to Plex, and nothing surfaces an error — so this is a regression
+    guard for silent data loss, not for a crash.
+    """
+    client = _client(authenticated=True)
+
+    seeded = {
+        '_secret_key': 'KEEP-SECRET',
+        '_auth': {'username': 'admin', 'password_hash': 'KEEP-HASH'},
+        '_plex_client_id': 'KEEP-CLIENT-ID',
+        '_future_internal_key': 'KEEP-ME-TOO',
+        'update_check_enabled': False,
+        'channels': [{'url': 'https://www.youtube.com/@example'}],
+        'plex_base_path': './downloads',
+    }
+    state.write_json(app_module.CONFIG_FILE, seeded, indent=4)
+
+    # A client that only round-trips the user-facing settings, as the Settings
+    # page editor does.
+    resp = client.post('/api/config', json={
+        'channels': [],
+        'plex_base_path': './elsewhere',
+    })
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    after = state.read_json(app_module.CONFIG_FILE)
+    assert after['_secret_key'] == 'KEEP-SECRET', 'session secret dropped'
+    assert after['_auth']['password_hash'] == 'KEEP-HASH', 'admin credentials dropped'
+    assert after['_plex_client_id'] == 'KEEP-CLIENT-ID', 'Plex client ID dropped'
+    # Any future underscore key must survive without editing the endpoint.
+    assert after['_future_internal_key'] == 'KEEP-ME-TOO', 'unknown internal key dropped'
+    assert after['update_check_enabled'] is False, 'update-check preference dropped'
+    # The values the caller *did* send must still be applied.
+    assert after['channels'] == []
+    assert after['plex_base_path'] == './elsewhere'
+
+
+def test_config_post_allows_overriding_an_internal_key():
+    """Preserving omitted keys must not mean ignoring supplied ones."""
+    client = _client(authenticated=True)
+    state.write_json(app_module.CONFIG_FILE,
+                     {'_plex_client_id': 'OLD', '_secret_key': 'S'}, indent=4)
+    resp = client.post('/api/config', json={'_plex_client_id': 'NEW'})
+    assert resp.status_code == 200
+    after = state.read_json(app_module.CONFIG_FILE)
+    assert after['_plex_client_id'] == 'NEW', 'explicit value was ignored'
+    assert after['_secret_key'] == 'S', 'omitted internal key was dropped'
+
+
+def test_config_post_rejects_a_non_object_body():
+    client = _client(authenticated=True)
+    assert client.post('/api/config', json=['not', 'an', 'object']).status_code == 400
 
 
 def test_unknown_route_404s_rather_than_500s():

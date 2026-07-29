@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an idea
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a personal project maintained in spare time. Ideas are welcome,
+        but please read it as "this might happen" rather than a roadmap.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: >
+        What are you trying to do that's awkward or impossible today? The
+        underlying problem is more useful than a proposed solution — it often
+        has a simpler answer than the feature you had in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you had in mind
+      description: Optional. How you imagine it working.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you've tried
+      description: >
+        Including "none" is fine. If something already gets you most of the way
+        there, that's useful to know.
