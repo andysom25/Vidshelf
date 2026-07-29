@@ -2079,6 +2079,15 @@ function swapArtwork() {
 // ---------- Artists Page ----------
 const _artistVideosCache = {};
 
+// The full artist list as fetched, kept so search/filter/sort work locally.
+// /api/artists/summary walks every artist directory and counts video files in
+// each, which is real I/O against what is usually a network mount — so it is
+// fetched once per page visit and filtered in memory, rather than re-querying
+// the server on every keystroke.
+let _artistsAll = [];
+// Which rows the user had expanded, so a re-render doesn't collapse them.
+let _expandedArtists = new Set();
+
 async function loadArtistsPage() {
     const container = document.getElementById('artists-list');
     container.className = 'loading';
@@ -2089,30 +2098,149 @@ async function loadArtistsPage() {
         if (data.error) {
             container.className = 'empty-state';
             container.innerHTML = `<p>Error loading artists: ${escapeHtml(data.error)}</p>`;
+            _artistsAll = [];
+            updateArtistFilterSummary(0, 0);
             return;
         }
-        const artists = data.artists || [];
-        if (artists.length === 0) {
-            container.className = 'empty-state';
-            container.innerHTML = '<div class="empty-icon">🎤</div><p>No artists yet. Download some music videos to see them here.</p>';
-            return;
-        }
-        container.className = '';
-        container.innerHTML = artists.map(a => `
-            <div class="artist-row" data-artist="${escapeHtml(a.artist)}">
-                <div class="artist-row-header" onclick="toggleArtistRow(this)">
-                    <img class="artist-thumb" src="/api/artwork/current_image?artist=${encodeURIComponent(a.artist)}" onerror="this.style.visibility='hidden'">
-                    <div class="artist-row-name">${escapeHtml(a.artist)}${a.has_artwork ? '' : ' <span class=\"artist-row-count\">(no artwork)</span>'}</div>
-                    <div class="artist-row-count">${a.video_count} video${a.video_count === 1 ? '' : 's'}</div>
-                    <span class="artist-row-chevron">▶</span>
-                </div>
-                <div class="artist-row-videos"></div>
-            </div>
-        `).join('');
+        _artistsAll = data.artists || [];
+        renderArtistList();
     } catch (e) {
         container.className = 'empty-state';
         container.innerHTML = `<p>Failed to load artists: ${escapeHtml(e.message)}</p>`;
+        _artistsAll = [];
+        updateArtistFilterSummary(0, 0);
     }
+}
+
+function getArtistFilters() {
+    const val = (id, fallback) => {
+        const el = document.getElementById(id);
+        return el ? el.value : fallback;
+    };
+    return {
+        query: val('artist-search', '').trim().toLowerCase(),
+        artwork: val('artist-filter-artwork', 'all'),
+        videos: val('artist-filter-videos', 'all'),
+        sort: val('artist-sort', 'name-asc'),
+    };
+}
+
+function filterAndSortArtists(artists, f) {
+    let out = artists.filter(a => {
+        if (f.artwork === 'has' && !a.has_artwork) return false;
+        if (f.artwork === 'missing' && a.has_artwork) return false;
+        if (f.videos === 'has' && !(a.video_count > 0)) return false;
+        if (f.videos === 'empty' && a.video_count > 0) return false;
+        if (f.query) {
+            // Match the folder name too: it can differ from the display name
+            // (folder_to_artist() rewrites it), and someone looking at the
+            // filesystem will search for what they saw there.
+            const name = (a.artist || '').toLowerCase();
+            const folder = (a.folder || '').toLowerCase();
+            if (!name.includes(f.query) && !folder.includes(f.query)) return false;
+        }
+        return true;
+    });
+
+    // localeCompare so accented names sort where a reader expects, rather than
+    // after Z by code point — this library is full of them. Leading articles
+    // are ignored so "The Beatles" files under B, matching how Plex sorts the
+    // same library; sorting it under T puts every "The ..." band in one useless
+    // clump. The \s+ in the pattern is what keeps "a-ha" intact.
+    const sortKey = a => (a.artist || '').replace(/^(the|an|a)\s+/i, '');
+    const byName = (x, y) => sortKey(x).localeCompare(sortKey(y), undefined, { sensitivity: 'base' });
+    if (f.sort === 'name-desc') out.sort((x, y) => byName(y, x));
+    else if (f.sort === 'videos-desc') out.sort((x, y) => (y.video_count - x.video_count) || byName(x, y));
+    else if (f.sort === 'videos-asc') out.sort((x, y) => (x.video_count - y.video_count) || byName(x, y));
+    else out.sort(byName);
+
+    return out;
+}
+
+function updateArtistFilterSummary(shown, total) {
+    const el = document.getElementById('artist-filter-summary');
+    if (!el) return;
+    if (total === 0) { el.textContent = ''; return; }
+    el.innerHTML = shown === total
+        ? `<strong>${total}</strong> artist${total === 1 ? '' : 's'}`
+        : `<strong>${shown}</strong> of <strong>${total}</strong> artists`;
+}
+
+function renderArtistList() {
+    const container = document.getElementById('artists-list');
+    if (!container) return;
+
+    const total = _artistsAll.length;
+    const clearBtn = document.getElementById('artist-search-clear');
+    const f = getArtistFilters();
+    if (clearBtn) clearBtn.style.display = f.query ? 'block' : 'none';
+
+    if (total === 0) {
+        container.className = 'empty-state';
+        container.innerHTML = '<div class="empty-icon">🎤</div><p>No artists yet. Download some music videos to see them here.</p>';
+        updateArtistFilterSummary(0, 0);
+        return;
+    }
+
+    const visible = filterAndSortArtists(_artistsAll, f);
+    updateArtistFilterSummary(visible.length, total);
+
+    if (visible.length === 0) {
+        // Distinct from the "no artists at all" state above: here the library
+        // isn't empty, the filters just exclude everything, so offer the way out.
+        container.className = 'empty-state';
+        container.innerHTML = '<div class="empty-icon">🔍</div><p>No artists match these filters.</p>'
+            + '<button class="btn btn-secondary" onclick="resetArtistFilters()">Reset filters</button>';
+        return;
+    }
+
+    container.className = '';
+    container.innerHTML = visible.map(a => `
+        <div class="artist-row" data-artist="${escapeHtml(a.artist)}">
+            <div class="artist-row-header" onclick="toggleArtistRow(this)">
+                <img class="artist-thumb" src="/api/artwork/current_image?artist=${encodeURIComponent(a.artist)}" onerror="this.style.visibility='hidden'">
+                <div class="artist-row-name">${escapeHtml(a.artist)}${a.has_artwork ? '' : ' <span class=\"artist-row-count\">(no artwork)</span>'}</div>
+                <div class="artist-row-count">${a.video_count} video${a.video_count === 1 ? '' : 's'}</div>
+                <span class="artist-row-chevron">▶</span>
+            </div>
+            <div class="artist-row-videos"></div>
+        </div>
+    `).join('');
+
+    // Re-apply expansion after the re-render. Only for rows whose video list is
+    // already cached — re-fetching every previously-open row on each keystroke
+    // would fire a burst of requests at the same slow directory walk this
+    // design exists to avoid.
+    container.querySelectorAll('.artist-row').forEach(row => {
+        const artist = row.dataset.artist;
+        if (_expandedArtists.has(artist) && _artistVideosCache[artist]) {
+            row.classList.add('expanded');
+            row.querySelector('.artist-row-videos').innerHTML = _artistVideosCache[artist];
+        }
+    });
+}
+
+// Debounced so typing doesn't re-render the whole list per character. Filtering
+// is in-memory and fast, but the DOM rebuild is not free with a large library.
+let _artistFilterTimer = null;
+function onArtistFilterInput() {
+    clearTimeout(_artistFilterTimer);
+    _artistFilterTimer = setTimeout(renderArtistList, 120);
+}
+
+function clearArtistSearch() {
+    const input = document.getElementById('artist-search');
+    if (input) { input.value = ''; input.focus(); }
+    renderArtistList();
+}
+
+function resetArtistFilters() {
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    set('artist-search', '');
+    set('artist-filter-artwork', 'all');
+    set('artist-filter-videos', 'all');
+    set('artist-sort', 'name-asc');
+    renderArtistList();
 }
 
 async function toggleArtistRow(headerEl) {
@@ -2123,9 +2251,12 @@ async function toggleArtistRow(headerEl) {
 
     if (wasExpanded) {
         row.classList.remove('expanded');
+        _expandedArtists.delete(artist);
         return;
     }
     row.classList.add('expanded');
+    // Tracked so filtering/sorting can restore this row's open state afterwards.
+    _expandedArtists.add(artist);
 
     if (_artistVideosCache[artist]) {
         videosEl.innerHTML = _artistVideosCache[artist];

@@ -65,7 +65,7 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 ### Dashboard
 - Single-page web dashboard with a dark theme, responsive down to mobile
 - Real-time download and conversion progress (polling-based, no WebSockets needed)
-- Artists page — browse tracked artists and their downloaded videos
+- Artists page — browse tracked artists and their downloaded videos, with search, filtering (missing artwork, empty folders) and sorting by name or video count
 - Settings page — raw config view, path editors, Plex connection management, password change, video-format-compatibility scan/convert tools
 - Version always visible in the sidebar, with an optional once-a-day check for new releases (notifies only — never downloads or installs anything, and can be switched off in Settings)
 

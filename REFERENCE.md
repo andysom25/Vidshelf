@@ -3263,3 +3263,136 @@ before concluding an asset is empty.
    via a `data-` attribute).
 3. `python tests/test_routes.py` — `test_dashboard_renders_with_its_static_assets`
    covers exactly this.
+
+## KNOWN COSMETIC ODDITY: three commit subjects start with a stray `@`
+
+Three doc-only commits from 2026-07-27 read:
+
+```
+@ Document the commit-authorship rewrite to the andysom25 account
+@ Correct the authorship write-up: gmail address, refreshed SHA map
+@ Correct the identity-scoping note: work is the global default
+```
+
+**This is not corruption and nothing is missing.** The commit bodies are
+intact; there is just an extra line containing a single `@` before the real
+subject, which git folds into the subject when it renders. Some inner single
+quotes were also stripped from those three bodies (`open(path, 'w')` reads as
+`open(path, w)`).
+
+Cause: the messages were passed using PowerShell here-string syntax
+(`-m @'...'@`) to a tool running Git Bash. Bash parses that as three
+concatenated tokens — a literal `@`, a single-quoted string, and another `@` —
+rather than as a here-string, so the `@`s ended up inside the message and the
+quotes were consumed as shell quoting. Use `git commit -F <file>` for
+multi-line messages instead; it sidesteps shell quoting entirely.
+
+**Deliberately not fixed.** All three commits are ancestors of the v1.1.0,
+v1.2.0 and v1.2.1 tags, so correcting them would mean rewriting every commit
+since, deleting and recreating all three tags, force-pushing `main` and `dev`,
+re-pointing three published GitHub Releases, and breaking every existing
+clone — to fix a cosmetic prefix on three documentation commits. Not worth it.
+
+If history ever gets rewritten for some other reason, fold this in then:
+`git filter-branch --msg-filter 'sed "/^@$/d"' <range>` removes the stray
+lines.
+
+## ADDED (2026-07-29): Artists page search, filters and sorting
+
+Shipped as v1.3.0 (new feature -> minor, per `CLAUDE.md`'s semver rule).
+
+The Artists page rendered every artist as one flat, always-alphabetical list.
+With 23 artists locally that's already awkward; the list only grows.
+
+### What was added
+
+A filter bar above the list: a search box (with a clear button), three
+selects, a Reset button, and a live "N of M artists" summary.
+
+- **Search** — case-insensitive substring, matched against the display name
+  *and* the folder name. Both, deliberately: `folder_to_artist()` rewrites
+  folder names into display names, so someone who has been looking at the
+  filesystem searches for what they saw there ("Bjork") and someone looking at
+  the UI searches for what it shows ("Björk").
+- **Artwork** — any / has artwork / missing artwork. The useful one for
+  spotting gaps to fix with the artwork tools.
+- **Videos** — any / has videos / empty folders. Empty folders are usually
+  leftovers from a failed download.
+- **Sort** — name A-Z, name Z-A, most videos, fewest videos.
+
+### Client-side, on purpose
+
+`/api/artists/summary` walks every artist directory and counts video files in
+each — real I/O against what is usually a CIFS mount. So the list is fetched
+once per page visit into `_artistsAll` and filtered in memory. Filtering
+server-side would have meant re-walking the mount on every keystroke.
+
+Consequences worth knowing:
+
+- The search input is debounced 120ms. Not for the filtering, which is
+  trivial, but for the DOM rebuild.
+- Expanded rows survive re-rendering, via `_expandedArtists`. Only rows whose
+  video list is already in `_artistVideosCache` are restored — re-fetching
+  every open row on each keystroke would fire exactly the burst of directory
+  walks this design avoids.
+- `filterAndSortArtists()` must not sort its input in place. `_artistsAll` is
+  the cached source of truth, and mutating it would make the unsorted order
+  depend on whichever sort ran last. There is a test for this.
+
+### Sorting ignores leading articles, matching Plex
+
+"The Beatles" sorts under **B**, not T. This came out of a test expectation
+rather than the original implementation: the first version sorted on the raw
+name, and the disagreement turned out to be a real design question, not a bad
+test. Plex files the same library that way, and this tool exists to feed Plex.
+Verified against the real library: `The Dead Weather` now sorts between
+`Bjork` and `Death Cab for cutie`; without it, that plus `The Killers` and
+`The Raconteurs` clump uselessly at the end.
+
+`/^(the|an|a)\s+/i` — the `\s+` is load-bearing. Without it "a-ha" would be
+read as the article "a" and sort under "-ha". There's a test for that too.
+
+Sorting is also `localeCompare` with `sensitivity: 'base'`, so accented names
+sort where a reader expects instead of after Z by code point — a music library
+is full of them.
+
+Video-count sorts break ties by name so the order is stable between renders
+rather than depending on the engine's sort.
+
+### Two distinct empty states
+
+"No artists yet" (library genuinely empty) and "No artists match these
+filters" (library has content, filters exclude it all). The second offers a
+Reset button, because the alternative is a user who thinks their library
+vanished.
+
+### Tests
+
+`tests/test_artists_filter.js` — 23 assertions run under node against the
+**real** `static/js/dashboard.js`, not a copy, so they can't drift from what
+the browser loads. dashboard.js is a browser script with top-level DOM access,
+so the test stubs a minimal `document`/`fetch` and ignores the expected throw
+from the init code: JS hoists all function declarations before executing any
+of the script, so every function is defined even though execution aborts. That
+is what makes the pure helpers testable without restructuring working UI code.
+
+Wired into CI as a separate "Run front-end tests" step (plus
+`node --check`). No `setup-node` needed — `ubuntu-latest` already has node.
+
+`tests/test_routes.py` gained
+`test_artists_page_has_its_search_and_filter_controls`, which checks the
+wiring specifically: the controls live in the template, their styling in
+dashboard.css and their handlers in dashboard.js, so a rename in one and not
+the others yields a filter bar that renders and silently does nothing. No
+error, no bad status code, just a dead control.
+
+### If the filters stop working
+
+1. Browser console. A `renderArtistList is not defined` means the template
+   references a handler the JS no longer has — `python tests/test_routes.py`
+   catches that case.
+2. Filtering the list but rows won't expand: check `_expandedArtists` and
+   `_artistVideosCache` are still in sync in `toggleArtistRow()`.
+3. Sort order looks wrong for a specific name: it's probably the article
+   stripping doing its job. `node tests/test_artists_filter.js` documents the
+   intended order.

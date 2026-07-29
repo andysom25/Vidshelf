@@ -36,6 +36,14 @@ jobs:
           python tests/test_updates.py
           python tests/test_routes.py
 
+      # The Artists page's filter/sort logic is client-side, so it's tested by
+      # running the real static/js/dashboard.js under node (already present on
+      # ubuntu-latest — no setup-node step needed).
+      - name: Run front-end tests
+        run: |
+          node --check static/js/dashboard.js
+          node tests/test_artists_filter.js
+
       - name: Check every module imports
         # Catches the class of breakage that only shows up at import time,
         # which is exactly where the pre-v1.1.0 fresh-install crash lived.
