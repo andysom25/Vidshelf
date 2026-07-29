@@ -9,6 +9,9 @@ import secrets
 import requests
 import state
 import updates
+import notify
+import retention
+import scheduler
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from downloader import download_video, get_active_downloads, queue_download
@@ -261,6 +264,26 @@ def _set_security_headers(response):
     response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'same-origin')
     return response
+
+def _notify_download(kind, title, channel_url, error=None):
+    """Fire a download notification. Never raises — callers are worker threads.
+
+    Reads config per call rather than caching it, so toggling notifications in
+    Settings takes effect on the next download instead of the next restart.
+    """
+    try:
+        config = load_config()
+        if kind == 'failed':
+            notify.send(config, notify.EVENT_DOWNLOAD_FAILED,
+                        f'Vidshelf: download failed — {title}',
+                        f'Channel: {channel_url}\nError: {error}')
+        else:
+            notify.send(config, notify.EVENT_DOWNLOAD_COMPLETE,
+                        f'Vidshelf: downloaded — {title}',
+                        f'Channel: {channel_url}')
+    except Exception as exc:  # noqa: BLE001
+        print(f'[notify] could not dispatch {kind} notification: {exc}')
+
 
 def load_downloaded_tracker():
     return state.read_json(TRACKER_FILE)
@@ -773,8 +796,14 @@ def api_download():
             download_video(video_id, download_path, plex_media_path,
                           title=title, channel_url=channel_url, download_id=download_id)
             mark_video_downloaded(video_id, channel_url)
-        except Exception:
-            pass
+            _notify_download('complete', title, channel_url)
+        except Exception as exc:  # noqa: BLE001
+            # Still swallowed — a failed download must not take down the worker
+            # thread — but no longer silently. Before notifications existed the
+            # only trace of a failure was a line in `docker logs`, which nobody
+            # reads until they notice something missing.
+            print(f'[download] FAILED {video_id} ({title}): {exc}')
+            _notify_download('failed', title, channel_url, error=exc)
 
     _DOWNLOAD_EXECUTOR.submit(_do_download)
     return jsonify({'success': True, 'message': f'Download started for {video_id}', 'video_id': video_id})
@@ -893,8 +922,10 @@ def api_channels_download_all():
         try:
             download_video(vid, path, plex, title=title, channel_url=url, download_id=download_id)
             mark_video_downloaded(vid, url)
-        except Exception:
-            pass
+            _notify_download('complete', title, url)
+        except Exception as exc:  # noqa: BLE001
+            print(f'[download] FAILED {vid} ({title}): {exc}')
+            _notify_download('failed', title, url, error=exc)
 
     started = []
     for video in videos[:20]:
@@ -1556,6 +1587,228 @@ def api_system_version():
     return jsonify(updates.get_status(APP_VERSION, enabled=enabled))
 
 
+# --------------------------------------------------------------------------
+# Channel monitor (scheduler.py) — the module is deliberately ignorant of Flask,
+# so the collaborators it needs are wired up here.
+# --------------------------------------------------------------------------
+
+def _monitor_start_download(video, channel):
+    """Queue one video on behalf of the scheduler.
+
+    Mirrors what /api/channels/download-all does per video, including the
+    notification hooks, so a scheduled download is indistinguishable from a
+    manual one on the Downloads page.
+    """
+    url = channel.get('url')
+    download_path = channel.get('download_path', './downloads')
+    plex_media_path = _resolve_plex_path(channel.get('plex_media_path', './downloads'))
+    vid = video['id']
+    title = video.get('title', 'Unknown')
+    download_id = queue_download(vid, title, url, final_path=plex_media_path)
+
+    def _run():
+        try:
+            os.makedirs(plex_media_path, exist_ok=True)
+            download_video(vid, download_path, plex_media_path,
+                           title=title, channel_url=url, download_id=download_id)
+            mark_video_downloaded(vid, url)
+            _notify_download('complete', title, url)
+        except Exception as exc:  # noqa: BLE001
+            print(f'[monitor] FAILED {vid} ({title}): {exc}')
+            _notify_download('failed', title, url, error=exc)
+
+    _DOWNLOAD_EXECUTOR.submit(_run)
+    return download_id
+
+
+_CHANNEL_MONITOR = scheduler.ChannelMonitor(
+    load_config=load_config,
+    list_videos=get_channel_videos,
+    is_downloaded=is_video_downloaded,
+    start_download=_monitor_start_download,
+)
+
+
+@app.route('/api/monitor/status')
+def api_monitor_status():
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    return jsonify(_CHANNEL_MONITOR.status())
+
+
+@app.route('/api/monitor/config', methods=['POST'])
+def api_monitor_config():
+    """Enable/disable monitoring and set its interval."""
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+
+    def _set(config):
+        cfg = dict(config.get('channel_monitor') or {})
+        if 'enabled' in data:
+            cfg['enabled'] = bool(data['enabled'])
+        if 'interval_minutes' in data:
+            try:
+                cfg['interval_minutes'] = max(scheduler.MIN_INTERVAL_MINUTES,
+                                              int(data['interval_minutes']))
+            except (TypeError, ValueError):
+                return jsonify({'error': 'interval_minutes must be a number'}), 400
+        if 'max_per_channel' in data:
+            try:
+                cfg['max_per_channel'] = max(1, int(data['max_per_channel']))
+            except (TypeError, ValueError):
+                pass
+        config['channel_monitor'] = cfg
+
+    _update_config(_set)
+    # Wake the loop so a changed interval or a freshly-enabled monitor applies
+    # now, instead of after the remainder of the current sleep.
+    _CHANNEL_MONITOR.trigger()
+    return jsonify({'success': True, 'status': _CHANNEL_MONITOR.status()})
+
+
+@app.route('/api/monitor/run', methods=['POST'])
+def api_monitor_run():
+    """Run one monitoring pass immediately, regardless of the enabled flag.
+
+    Synchronous on purpose: it's the "Check now" button, and the user is waiting
+    to see what it found. Downloads themselves still go to the worker pool.
+    """
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        results = _CHANNEL_MONITOR.run_once()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({'error': f'{type(exc).__name__}: {exc}'}), 500
+    return jsonify({'success': True, 'results': results,
+                    'status': _CHANNEL_MONITOR.status()})
+
+
+# --------------------------------------------------------------------------
+# Retention (retention.py)
+# --------------------------------------------------------------------------
+
+@app.route('/api/retention/config', methods=['POST'])
+def api_retention_config():
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+
+    def _set(config):
+        cfg = dict(config.get('retention') or {})
+        if 'enabled' in data:
+            cfg['enabled'] = bool(data['enabled'])
+        if 'keep_last_per_artist' in data:
+            try:
+                cfg['keep_last_per_artist'] = max(1, int(data['keep_last_per_artist']))
+            except (TypeError, ValueError):
+                pass
+        config['retention'] = cfg
+
+    _update_config(_set)
+    return jsonify({'success': True, 'retention': load_config().get('retention', {})})
+
+
+@app.route('/api/retention/plan')
+def api_retention_plan():
+    """Dry run — what a sweep would delete. Never deletes anything."""
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    result = retention.sweep(load_config(), dry_run=True)
+    plan = result['plan']
+    # Trim the payload: a large library could plan hundreds of deletions and the
+    # UI only shows a sample alongside the totals.
+    sample = plan['candidates'][:50]
+    return jsonify({
+        'root': plan['root'],
+        'keep_last_per_artist': plan['keep_last_per_artist'],
+        'enabled': plan.get('enabled'),
+        'artists_scanned': plan['artists_scanned'],
+        'total_files': plan['total_files'],
+        'candidate_count': plan.get('candidate_count', 0),
+        'total_bytes': plan['total_bytes'],
+        'error': plan['error'],
+        'sample': [{'artist': c['artist'], 'name': c['name'],
+                    'size_bytes': c['size_bytes'], 'modified_at': c['modified_at']}
+                   for c in sample],
+        'sample_truncated': plan.get('candidate_count', 0) > len(sample),
+    })
+
+
+@app.route('/api/retention/apply', methods=['POST'])
+def api_retention_apply():
+    """Actually delete. Requires an explicit confirm, and honours the enabled flag.
+
+    The confirm token is not security — the session already authenticates the
+    admin — it's there so this can never be triggered by a stray request or a
+    mis-wired button, which for the one destructive endpoint in the app is worth
+    the friction.
+    """
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    if data.get('confirm') != 'DELETE':
+        return jsonify({'error': "Refusing to delete without {\"confirm\": \"DELETE\"}"}), 400
+
+    result = retention.sweep(load_config(), dry_run=False)
+    applied = result['applied'] or {}
+    return jsonify({
+        'success': not applied.get('error'),
+        'error': applied.get('error'),
+        'deleted_count': len(applied.get('deleted', [])),
+        'failed': applied.get('failed', []),
+        'freed_bytes': applied.get('freed_bytes', 0),
+        'plan_error': result['plan'].get('error'),
+    })
+
+
+# --------------------------------------------------------------------------
+# Notifications (notify.py)
+# --------------------------------------------------------------------------
+
+@app.route('/api/notifications/config', methods=['POST'])
+def api_notifications_config():
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+
+    def _set(config):
+        cfg = dict(config.get('notifications') or {})
+        if 'enabled' in data:
+            cfg['enabled'] = bool(data['enabled'])
+        if 'url' in data:
+            cfg['url'] = str(data['url']).strip()
+        if 'kind' in data:
+            kind = str(data['kind']).strip() or 'auto'
+            cfg['kind'] = kind
+        if 'events' in data and isinstance(data['events'], list):
+            cfg['events'] = [e for e in data['events'] if e in notify.ALL_EVENTS]
+        cfg.setdefault('events', list(notify.DEFAULT_EVENTS))
+        config['notifications'] = cfg
+
+    _update_config(_set)
+    cfg = load_config().get('notifications', {})
+    # Never echo the URL back in full — it usually embeds a webhook secret, and
+    # this response goes into browser history and any request log in between.
+    url = cfg.get('url') or ''
+    return jsonify({'success': True, 'notifications': {
+        'enabled': cfg.get('enabled', False),
+        'kind': cfg.get('kind', 'auto'),
+        'events': cfg.get('events', list(notify.DEFAULT_EVENTS)),
+        'url_set': bool(url),
+        'url_hint': (url[:28] + '…') if len(url) > 28 else url,
+        'detected_kind': notify.detect_kind(url) if url else None,
+    }})
+
+
+@app.route('/api/notifications/test', methods=['POST'])
+def api_notifications_test():
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    ok, detail = notify.send_test(load_config())
+    return jsonify({'success': ok, 'detail': detail})
+
+
 @app.route('/api/system/update-check', methods=['POST'])
 def api_system_update_check_toggle():
     """Turn the update check on or off."""
@@ -2128,6 +2381,15 @@ if __name__ == '__main__':
     
     # Start the artwork background watcher
     start_artwork_watcher()
+
+    # Start the channel monitor. The thread always runs; whether a tick does
+    # anything is decided per-tick from config, so toggling it in Settings takes
+    # effect without a restart. Started here rather than at import so it never
+    # runs under the test client or a `python -c "import app"` check.
+    _CHANNEL_MONITOR.start()
+    _mon_enabled, _mon_interval, _ = _CHANNEL_MONITOR._settings()
+    print(f'[monitor] channel monitor thread started '
+          f'(enabled={_mon_enabled}, interval={_mon_interval}m)')
 
     # debug=True enables Werkzeug's interactive debugger, which lets anyone
     # who can trigger an unhandled exception execute arbitrary Python in the

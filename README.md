@@ -45,6 +45,11 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 
 ## Features
 
+### Automation
+- **Automatic channel monitoring** — checks your channels on a timer and downloads anything new. Channels set to *Manual* are never touched, and videos you already have are always skipped, so "All Videos" won't re-fetch a back catalogue every hour
+- **Notifications** — Discord, Slack, ntfy, Gotify or any JSON webhook, on failed downloads, check results and retention sweeps. Detected from the URL; off by default
+- **Storage retention** — keeps the newest N videos per artist and prunes the rest. Off by default, always previews first, and refuses to run if your media volume looks unmounted
+
 ### YouTube Channel Management
 - **Add channels** by URL — automatically fetches the display name
 - **Browse videos** — view the latest 50 videos from any channel
@@ -293,6 +298,18 @@ scratch), and is fully editable from the Settings page. Set
 2. Authorize in the Plex tab that opens, then select your server and confirm the discovered music-video library
 3. From then on, artwork, collections, title cleanup, and title-card posters stay in sync automatically as you download — the Settings page also has manual "Sync Collections", "Clean Up Titles", "Generate Title Cards", and "Remove Duplicate Collections" actions if you want to trigger something immediately
 
+### Automatic downloads, notifications and cleanup
+1. Set a channel's mode to **New Only** (or **All Videos**) on the Channels page
+2. Go to **Settings** → **Automatic Channel Monitoring**, tick *Enable*, and pick an interval
+3. Optionally set up **Notifications** so you hear about failures without reading logs — paste an ntfy/Discord/Slack/Gotify URL and hit *Send test notification*
+4. If downloads will run unattended for a long time, set up **Storage Retention** — choose how many videos to keep per artist, hit *Preview*, and only then delete
+
+Three things worth knowing:
+
+- Videos you already have are **always** skipped by automatic checks, so a channel on *All Videos* won't re-download its back catalogue on every pass.
+- **Pruned videos are not re-downloaded.** Retention deletes files but keeps the download history on purpose — otherwise monitoring would re-fetch what retention just removed, forever. Clearing download history is what makes them eligible again.
+- Retention **refuses to run** if your media root contains no artist folders, on the assumption that the volume isn't mounted. Check `docker exec vidshelf df -h` if you see that.
+
 ### Fixing an existing library's video format
 1. Go to **Settings** → Video Format Compatibility → **Scan Library** to see what's not yet Plex-direct-play-compatible
 2. Click **Convert All Non-Compatible Videos** to fix it — this can take a while for a large library (re-encoding is CPU-intensive), so it runs in the background with a progress indicator
@@ -368,6 +385,14 @@ scratch), and is fully editable from the Settings page. Set
 | `/api/system/health` | GET | Dependency check (ffmpeg, ffprobe, Pillow, fonts) |
 | `/api/system/version` | GET | Running version, and whether a newer release exists |
 | `/api/system/update-check` | POST | `{enabled}` — turn the release check on or off |
+| `/api/monitor/status` | GET | Monitoring state, last run, per-channel results |
+| `/api/monitor/config` | POST | `{enabled, interval_minutes, max_per_channel}` |
+| `/api/monitor/run` | POST | Run one check immediately |
+| `/api/notifications/config` | POST | `{enabled, url, kind, events}` — the URL is never echoed back |
+| `/api/notifications/test` | POST | Send a test notification |
+| `/api/retention/config` | POST | `{enabled, keep_last_per_artist}` |
+| `/api/retention/plan` | GET | Dry run — what a sweep would delete. Deletes nothing |
+| `/api/retention/apply` | POST | `{"confirm": "DELETE"}` — actually deletes |
 | `/api/config` | GET/POST | Raw config access (internal keys stripped) |
 | `/api/password` | POST | Change admin password |
 | `/api/plex-base-path` | GET/POST | Get/set Plex base path |
@@ -518,7 +543,6 @@ data/config.json, data/downloaded_videos.json, data/active_downloads.json
 
 ## Known Limitations
 
-- No download scheduling
 - Served by [waitress](https://github.com/Pylons/waitress), which is fine for
   a single-admin app on a trusted network — but it terminates plain HTTP with no
   TLS, so put it behind a reverse proxy if you expose it beyond your LAN
@@ -536,8 +560,18 @@ data/config.json, data/downloaded_videos.json, data/active_downloads.json
 python tests/test_state.py          # atomic writes, locking, migration
 python tests/test_updates.py        # version comparison, update-check caching
 python tests/test_routes.py         # every route: registered, no 500s, auth enforced
+python tests/test_scheduler.py      # monitoring logic + retention safety guards
+python tests/test_notify.py         # notification targets, payloads, gating
+python tests/test_invariants.py     # source-level rules for bugs CI can't reproduce
 node tests/test_artists_filter.js   # Artists page search/filter/sort logic
 ```
+
+`test_invariants.py` is unusual: it asserts on the *source text*. Some bugs in
+this project only manifest against a real CIFS mount or a real container restart
+— `shutil.copy` onto a network share, state files bind-mounted individually,
+missing `PYTHONUNBUFFERED` — so no functional test can reach them. Those checks
+fail loudly in CI instead of relying on someone reading a comment at the moment
+they change the line.
 
 They're plain assertions on purpose, so they run identically here and in CI
 with no dev dependencies to install.

@@ -33,6 +33,9 @@
                     loadMusicVideoPath();
                     resumeConversionPollingIfRunning();
                     loadSystemHealth();
+                    loadMonitorStatus();
+                    loadNotifyConfig();
+                    loadRetentionConfig();
                 }
                 if (page === 'dashboard') loadDashboardStats();
                 if (page === 'swap-art') loadSwapArtArtists();
@@ -1678,6 +1681,279 @@ async function findPlexLibraries() {
                 loadVersionBadge();
             } catch (e) {
                 showToast('Could not save the update-check setting', 'error');
+            }
+        }
+
+        // ---------- Automatic channel monitoring ----------
+        function fmtWhen(ts) {
+            if (!ts) return 'never';
+            const d = new Date(ts * 1000);
+            return d.toLocaleString();
+        }
+
+        async function loadMonitorStatus() {
+            const box = document.getElementById('monitor-status');
+            if (!box) return;
+            try {
+                const resp = await fetchWithTimeout('/api/monitor/status');
+                const s = await resp.json();
+                if (s.error) { box.textContent = ''; return; }
+
+                const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+                const en = document.getElementById('monitor-enabled');
+                if (en) en.checked = !!s.enabled;
+                setVal('monitor-interval', s.interval_minutes);
+                setVal('monitor-max', s.max_per_channel);
+
+                const parts = [];
+                parts.push(s.enabled
+                    ? `<strong>On</strong> — every ${s.interval_minutes} min`
+                    : '<strong>Off</strong> — nothing is checked automatically');
+                parts.push(`last check: ${escapeHtml(fmtWhen(s.last_run))}`);
+                if (s.last_run) {
+                    parts.push(`${s.checked_channels} channel(s) checked, ${s.started_downloads} queued`);
+                }
+                if (s.last_error) {
+                    parts.push(`<span style="color:#f8a5b0;">last error: ${escapeHtml(s.last_error)}</span>`);
+                }
+                let html = parts.join(' · ');
+
+                // Per-channel detail from the most recent pass, so a channel that
+                // errors is visible here rather than only in the logs.
+                const results = s.last_results || [];
+                const problems = results.filter(r => r.error);
+                if (problems.length) {
+                    html += '<div style="margin-top:8px;">' + problems.map(r =>
+                        `<div style="color:#f8a5b0;">${escapeHtml(r.channel)}: ${escapeHtml(r.error)}</div>`
+                    ).join('') + '</div>';
+                }
+                box.innerHTML = html;
+            } catch (e) {
+                box.textContent = 'Could not load monitor status.';
+            }
+        }
+
+        async function saveMonitorConfig() {
+            const body = {
+                enabled: document.getElementById('monitor-enabled').checked,
+                interval_minutes: parseInt(document.getElementById('monitor-interval').value, 10) || 60,
+                max_per_channel: parseInt(document.getElementById('monitor-max').value, 10) || 5,
+            };
+            try {
+                const resp = await fetch('/api/monitor/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await resp.json();
+                if (data.error) { showToast('❌ ' + data.error, 'error'); return; }
+                showToast('✅ Monitoring settings saved', 'success');
+                loadMonitorStatus();
+            } catch (e) {
+                showToast('❌ Could not save monitoring settings', 'error');
+            }
+        }
+
+        async function runMonitorNow() {
+            const btn = document.getElementById('monitor-run-btn');
+            const original = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '⏳ Checking…';
+            try {
+                // Generous timeout: this fetches every monitored channel's video
+                // list from YouTube, which is slow and outside our control.
+                const resp = await fetchWithTimeout('/api/monitor/run', { method: 'POST' }, 120000);
+                const data = await resp.json();
+                if (data.error) { showToast('❌ ' + data.error, 'error'); return; }
+                const started = (data.results || []).reduce((n, r) => n + (r.started || 0), 0);
+                showToast(started
+                    ? `✅ Queued ${started} new video(s)`
+                    : '✅ Checked — nothing new', 'success');
+                loadMonitorStatus();
+            } catch (e) {
+                showToast('❌ Check failed: ' + describeFetchError(e), 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = original;
+            }
+        }
+
+        // ---------- Notifications ----------
+        async function loadNotifyConfig() {
+            try {
+                const resp = await fetchWithTimeout('/api/config');
+                const cfg = await resp.json();
+                const n = cfg.notifications || {};
+                const en = document.getElementById('notify-enabled');
+                if (en) en.checked = !!n.enabled;
+                // The URL usually embeds a secret, so it is never rendered back.
+                // An empty field with a hint means "already set, leave blank to keep".
+                const hint = document.getElementById('notify-url-hint');
+                if (hint) {
+                    hint.textContent = n.url
+                        ? 'A URL is saved. Leave blank to keep it, or paste a new one to replace it.'
+                        : 'No URL saved yet.';
+                }
+                const selected = n.events || ['download_failed', 'scheduler_summary', 'retention'];
+                document.querySelectorAll('.notify-event').forEach(cb => {
+                    cb.checked = selected.includes(cb.value);
+                });
+            } catch (e) { /* settings page still usable without this */ }
+        }
+
+        async function saveNotifyConfig() {
+            const urlEl = document.getElementById('notify-url');
+            const body = {
+                enabled: document.getElementById('notify-enabled').checked,
+                events: Array.from(document.querySelectorAll('.notify-event'))
+                    .filter(cb => cb.checked).map(cb => cb.value),
+            };
+            // Only send the URL when the user actually typed one, so saving other
+            // settings can't blank out a stored webhook.
+            if (urlEl && urlEl.value.trim()) body.url = urlEl.value.trim();
+            try {
+                const resp = await fetch('/api/notifications/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await resp.json();
+                if (data.error) { showToast('❌ ' + data.error, 'error'); return; }
+                if (urlEl) urlEl.value = '';
+                const n = data.notifications || {};
+                const hint = document.getElementById('notify-url-hint');
+                if (hint) {
+                    hint.textContent = n.url_set
+                        ? `Saved${n.detected_kind ? ' — detected as ' + n.detected_kind : ''}. Leave blank to keep it.`
+                        : 'No URL saved yet.';
+                }
+                showToast('✅ Notification settings saved', 'success');
+            } catch (e) {
+                showToast('❌ Could not save notification settings', 'error');
+            }
+        }
+
+        async function testNotify() {
+            const btn = document.getElementById('notify-test-btn');
+            const out = document.getElementById('notify-test-result');
+            btn.disabled = true;
+            out.textContent = 'Sending…';
+            try {
+                const resp = await fetchWithTimeout('/api/notifications/test', { method: 'POST' }, 20000);
+                const data = await resp.json();
+                out.innerHTML = data.success
+                    ? `<span style="color:#7ddf90;">✅ ${escapeHtml(data.detail)}</span>`
+                    : `<span style="color:#f8a5b0;">❌ ${escapeHtml(data.detail || data.error || 'failed')}</span>`;
+            } catch (e) {
+                out.innerHTML = `<span style="color:#f8a5b0;">❌ ${escapeHtml(describeFetchError(e))}</span>`;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        // ---------- Retention ----------
+        async function loadRetentionConfig() {
+            try {
+                const resp = await fetchWithTimeout('/api/config');
+                const cfg = await resp.json();
+                const r = cfg.retention || {};
+                const en = document.getElementById('retention-enabled');
+                if (en) en.checked = !!r.enabled;
+                const keep = document.getElementById('retention-keep');
+                if (keep) keep.value = r.keep_last_per_artist || 10;
+            } catch (e) { /* non-fatal */ }
+        }
+
+        async function saveRetentionConfig() {
+            const body = {
+                enabled: document.getElementById('retention-enabled').checked,
+                keep_last_per_artist: parseInt(document.getElementById('retention-keep').value, 10) || 10,
+            };
+            try {
+                const resp = await fetch('/api/retention/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await resp.json();
+                if (data.error) { showToast('❌ ' + data.error, 'error'); return; }
+                showToast('✅ Retention settings saved', 'success');
+            } catch (e) {
+                showToast('❌ Could not save retention settings', 'error');
+            }
+        }
+
+        async function previewRetention() {
+            const btn = document.getElementById('retention-preview-btn');
+            const out = document.getElementById('retention-result');
+            btn.disabled = true;
+            out.innerHTML = '<div class="loading" style="padding:12px;"><div class="spinner" style="width:20px;height:20px;"></div></div>';
+            try {
+                const resp = await fetchWithTimeout('/api/retention/plan', {}, 60000);
+                const p = await resp.json();
+                if (p.error) {
+                    out.innerHTML = `<div style="color:#f8a5b0;">⚠️ ${escapeHtml(p.error)}</div>`;
+                    return;
+                }
+                if (!p.candidate_count) {
+                    out.innerHTML = `<div style="color:#7ddf90;">✅ Nothing to delete — `
+                        + `${p.artists_scanned} artist(s), ${p.total_files} video(s), `
+                        + `keeping newest ${p.keep_last_per_artist} each.</div>`;
+                    return;
+                }
+                const gb = (p.total_bytes / (1024 ** 3)).toFixed(2);
+                let html = `<div style="margin-bottom:10px;">`
+                    + `Would delete <strong>${p.candidate_count}</strong> video(s), freeing <strong>${gb} GB</strong>`
+                    + ` — keeping the newest ${p.keep_last_per_artist} per artist.</div>`;
+                html += '<div style="max-height:220px;overflow:auto;border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:8px;">';
+                html += p.sample.map(c =>
+                    `<div style="font-size:0.85em;color:#9090a0;">${escapeHtml(c.artist)} — ${escapeHtml(c.name)}`
+                    + ` <span style="color:#606070;">(${formatBytes(c.size_bytes)}, ${new Date(c.modified_at * 1000).toLocaleDateString()})</span></div>`
+                ).join('');
+                if (p.sample_truncated) {
+                    html += `<div style="font-size:0.85em;color:#606070;margin-top:6px;">…and ${p.candidate_count - p.sample.length} more</div>`;
+                }
+                html += '</div>';
+                html += `<button class="btn" style="margin-top:12px;background:rgba(220,53,69,0.15);color:#f8a5b0;border:1px solid rgba(220,53,69,0.35);"`
+                    + ` onclick="applyRetention(${p.candidate_count})">🗑 Delete these ${p.candidate_count} file(s)</button>`;
+                if (!p.enabled) {
+                    html += '<div class="help-text" style="margin-top:8px;">Retention is disabled — enable it above before deleting.</div>';
+                }
+                out.innerHTML = html;
+            } catch (e) {
+                out.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(describeFetchError(e))}</div>`;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function applyRetention(count) {
+            // Deliberate double-confirm: this is the only irreversible action in
+            // the app, and a mis-click deletes media.
+            if (!confirm(`Permanently delete ${count} video file(s)?\n\nThis cannot be undone. `
+                + `Pruned videos will NOT be re-downloaded automatically.`)) return;
+            const out = document.getElementById('retention-result');
+            out.innerHTML = '<div class="loading" style="padding:12px;"><div class="spinner" style="width:20px;height:20px;"></div></div>';
+            try {
+                const resp = await fetchWithTimeout('/api/retention/apply', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: 'DELETE' })
+                }, 120000);
+                const data = await resp.json();
+                if (!data.success) {
+                    out.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error || data.plan_error || 'failed')}</div>`;
+                    return;
+                }
+                const gb = (data.freed_bytes / (1024 ** 3)).toFixed(2);
+                let html = `<div style="color:#7ddf90;">✅ Deleted ${data.deleted_count} file(s), freed ${gb} GB.</div>`;
+                if ((data.failed || []).length) {
+                    html += `<div style="color:#f8a5b0;margin-top:6px;">${data.failed.length} deletion(s) failed.</div>`;
+                }
+                out.innerHTML = html;
+                showToast(`✅ Freed ${gb} GB`, 'success');
+            } catch (e) {
+                out.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(describeFetchError(e))}</div>`;
             }
         }
 

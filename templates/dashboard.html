@@ -464,6 +464,125 @@
                 </div>
             </div>
 
+            <!-- Automatic Channel Monitoring -->
+            <div class="section">
+                <div class="section-header">
+                    <h3>🕒 Automatic Channel Monitoring</h3>
+                </div>
+                <p class="text-muted mb-12">
+                    Checks your monitored channels on a timer and downloads anything new.
+                    Only channels set to <strong>New Only</strong> or <strong>All Videos</strong>
+                    are checked — <strong>Manual</strong> channels are never touched.
+                    Videos you already have are always skipped, so a channel on
+                    "All Videos" won't re-download its back catalogue every hour.
+                </p>
+                <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;">
+                    <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
+                        <input type="checkbox" id="monitor-enabled" onchange="saveMonitorConfig()">
+                        <span style="font-weight:500;">Enable automatic checks</span>
+                    </label>
+                    <div class="form-group" style="margin:0;">
+                        <label for="monitor-interval">Check every (minutes)</label>
+                        <input type="number" id="monitor-interval" min="5" step="5"
+                               style="width:120px;" onchange="saveMonitorConfig()">
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label for="monitor-max">Max new per channel, per check</label>
+                        <input type="number" id="monitor-max" min="1" step="1"
+                               style="width:120px;" onchange="saveMonitorConfig()">
+                    </div>
+                    <button class="btn btn-secondary" id="monitor-run-btn" onclick="runMonitorNow()">
+                        🔄 Check now
+                    </button>
+                </div>
+                <div id="monitor-status" class="help-text" style="margin-top:12px;"></div>
+            </div>
+
+            <!-- Notifications -->
+            <div class="section">
+                <div class="section-header">
+                    <h3>🔔 Notifications</h3>
+                </div>
+                <p class="text-muted mb-12">
+                    Sends a message when something happens while you're not watching.
+                    Paste a Discord or Slack webhook, an ntfy or Gotify URL, or any
+                    endpoint that accepts a JSON POST — the type is detected from the
+                    URL. Nothing is sent unless you enable it.
+                </p>
+                <div style="max-width:640px;">
+                    <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px;">
+                        <input type="checkbox" id="notify-enabled" onchange="saveNotifyConfig()">
+                        <span style="font-weight:500;">Enable notifications</span>
+                    </label>
+                    <div class="form-group">
+                        <label for="notify-url">Webhook / notification URL</label>
+                        <input type="password" id="notify-url" autocomplete="off"
+                               placeholder="https://ntfy.sh/my-topic  ·  https://discord.com/api/webhooks/…">
+                        <div class="help-text" id="notify-url-hint"></div>
+                    </div>
+                    <div class="form-group">
+                        <label>Notify me about</label>
+                        <div style="display:flex;flex-direction:column;gap:6px;">
+                            <label style="display:flex;gap:8px;align-items:center;cursor:pointer;">
+                                <input type="checkbox" class="notify-event" value="download_failed"
+                                       onchange="saveNotifyConfig()">
+                                <span>Failed downloads</span>
+                            </label>
+                            <label style="display:flex;gap:8px;align-items:center;cursor:pointer;">
+                                <input type="checkbox" class="notify-event" value="scheduler_summary"
+                                       onchange="saveNotifyConfig()">
+                                <span>Automatic check results</span>
+                            </label>
+                            <label style="display:flex;gap:8px;align-items:center;cursor:pointer;">
+                                <input type="checkbox" class="notify-event" value="retention"
+                                       onchange="saveNotifyConfig()">
+                                <span>Retention sweeps</span>
+                            </label>
+                            <label style="display:flex;gap:8px;align-items:center;cursor:pointer;">
+                                <input type="checkbox" class="notify-event" value="download_complete"
+                                       onchange="saveNotifyConfig()">
+                                <span>Every completed download
+                                    <span class="text-muted">— noisy during bulk downloads</span>
+                                </span>
+                            </label>
+                        </div>
+                    </div>
+                    <button class="btn btn-secondary" onclick="testNotify()" id="notify-test-btn">
+                        📨 Send test notification
+                    </button>
+                    <div id="notify-test-result" class="help-text" style="margin-top:8px;"></div>
+                </div>
+            </div>
+
+            <!-- Storage Retention -->
+            <div class="section">
+                <div class="section-header">
+                    <h3>🧹 Storage Retention</h3>
+                </div>
+                <p class="text-muted mb-12">
+                    Deletes the oldest videos once an artist folder holds more than you
+                    want to keep. <strong>This is the only feature that deletes media</strong>,
+                    so it's off by default and always previews first.
+                    Pruned videos are <em>not</em> re-downloaded — their download history is
+                    kept on purpose, so automatic checks won't fetch them again.
+                </p>
+                <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;">
+                    <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
+                        <input type="checkbox" id="retention-enabled" onchange="saveRetentionConfig()">
+                        <span style="font-weight:500;">Enable retention</span>
+                    </label>
+                    <div class="form-group" style="margin:0;">
+                        <label for="retention-keep">Keep newest N per artist</label>
+                        <input type="number" id="retention-keep" min="1" step="1"
+                               style="width:120px;" onchange="saveRetentionConfig()">
+                    </div>
+                    <button class="btn btn-secondary" onclick="previewRetention()" id="retention-preview-btn">
+                        🔍 Preview what would be deleted
+                    </button>
+                </div>
+                <div id="retention-result" style="margin-top:14px;"></div>
+            </div>
+
             <!-- Download History -->
             <div class="section">
                 <div class="section-header">

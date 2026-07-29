@@ -3695,3 +3695,124 @@ re-run after a fix works.
 Note for future bumps: `dependabot.yml` excludes yt-dlp on purpose, because
 `bump-yt-dlp.yml` already proposes those with a full test run first. Two bots
 on the same line would only conflict.
+
+## ADDED (2026-07-29): unattended monitoring, notifications and retention (v1.5.0)
+
+Closes the gap that made the README's "Sonarr/Radarr for YouTube" framing
+inaccurate: **nothing ran on a schedule.** `download_mode` was read from exactly
+one place — `/api/channels/download-all` — so a channel set to "New Only"
+downloaded nothing until a human clicked a button. The only background thread in
+the app was the artwork watcher.
+
+Three features, shipped together because each one is unsafe without the others:
+monitoring without notifications is automation you can't observe, and monitoring
+without retention fills the disk.
+
+### scheduler.py — ChannelMonitor
+
+A daemon thread on an interval (default 60m, floored at 5m). Collaborators are
+**injected as callables** rather than imported from app.py: app.py imports this
+module, so importing back would be circular, and injection is what lets the
+tests drive it with no Flask, no network and no yt-dlp.
+
+Two behaviours that are deliberate and easy to get wrong:
+
+**Already-downloaded videos are always skipped, regardless of mode.** The manual
+endpoint honours `all` as "fetch up to 20 whether or not we have them" — a
+reasonable thing to ask for by hand and a catastrophic thing to do hourly, since
+it would re-download the same videos forever. On a timer, `all` and `new` behave
+identically. `tests/test_scheduler.py::test_mode_all_still_skips_downloaded_on_a_timer`
+is the guard.
+
+**`manual` channels are never touched.** That mode means "I decide".
+
+The thread always runs; whether a tick *does* anything is decided per-tick from
+config, so toggling it in Settings takes effect without a restart. The wait is
+interruptible (`threading.Event`) so a changed interval or "Check now" applies
+immediately instead of up to an hour later. A per-channel failure is captured
+into that channel's result rather than raised, so one dead channel can't stop
+the others or kill the loop.
+
+Started from `__main__` only, never at import — otherwise `python -c "import app"`
+and the test client would spawn it.
+
+### notify.py
+
+Hand-rolled on `requests` rather than pulling in Apprise. Apprise gives ~80
+targets for one line of config but adds five transitive pins
+(requests-oauthlib, oauthlib, markdown, PyYAML, tzdata) to a project that keeps
+its dependency surface small on purpose and runs its tests with none. Supports
+Discord, Slack, ntfy, Gotify and a generic JSON webhook, with the shape detected
+from the URL. If five targets stops being enough, Apprise is the right upgrade
+and notify.py is the thing to delete.
+
+**No SSRF guard here, deliberately.** artwork_sync.py guards its fetches because
+those hosts arrive from a public search API. This URL is typed in by the admin
+and usually points *into* their own LAN — an ntfy or Gotify container on the same
+host. Refusing private addresses would break the primary use case. Different
+threat model, different answer; recorded here so it doesn't look like an
+oversight.
+
+Two things the tests caught:
+
+- **ntfy puts the title in an HTTP header**, which must be latin-1 encodable.
+  `Björk — Jóga` raised `UnicodeEncodeError` inside requests. Titles are now
+  ASCII-sanitised for that transport only.
+- **Completion notifications are off by default.** A bulk download would emit
+  dozens of messages, which is the fastest route to the user muting the channel
+  and missing the failures that matter.
+
+Every failure is swallowed and logged — a broken webhook must never stop a
+download or wedge the scheduler. The config endpoint **never echoes the URL
+back**, because it usually embeds a secret and the response would land in
+browser history and any intermediate log.
+
+### retention.py
+
+The only code in Vidshelf that deletes media, so it's built to be boring:
+
+- Off by default; `plan()` computes, `apply()` only ever acts on a plan.
+- `keep_last` floored at 1 — no configuration empties a folder.
+- Video extensions only, so artwork, `artist-metadata.json` and
+  `title-cards.json` are never candidates and pruning can't break the Plex
+  integration.
+- A sweep over `SAFETY_MAX_DELETIONS` (200) refuses and asks.
+- `apply()` refuses a plan carrying an error, so a caller can't execute a
+  refused sweep by ignoring the field.
+- The API requires `{"confirm": "DELETE"}`. Not a security control — the session
+  already authenticates the admin — but friction on the one irreversible
+  endpoint is worth it.
+
+**It refuses to sweep a media root with no artist folders.** That guard exists
+because of the decoy-volume incident in CLAUDE.md: a network path that silently
+resolved to a small local directory instead of the NAS. Deleting based on what a
+*wrong* mount contains is the one failure here that isn't recoverable. Verified
+live — in a container with no NAS mounted, the plan endpoint refuses with a
+pointer to `df -h` rather than reporting a clean sweep.
+
+**Tracker entries are never removed.** `downloaded_videos.json` records "we
+downloaded this", not "the file is present". Clearing entries would make the
+scheduler re-download every pruned video on the next tick, prune it again, and
+loop forever. Files go; history stays. `tests/test_invariants.py` asserts
+retention.py contains no executable reference to the tracker at all.
+
+The visible consequence is intended: a pruned video does not come back on its
+own. Clearing download history is what makes it eligible again.
+
+### Verified live in a container
+
+| check | result |
+| --- | --- |
+| monitor thread starts, stays inert while disabled | `enabled=False, thread_alive=True, ticks=0` |
+| interval clamped, not rejected | requested 1m -> 5m |
+| retention refuses an unmounted-looking root | refused, with a `df -h` pointer |
+| `POST /api/retention/apply` without confirm | HTTP 400 |
+| webhook secret in the config response | not present; kind detected as `discord` |
+| "Check now" with no channels | 200, empty results |
+
+### Tests
+
+`tests/test_scheduler.py` (16) and `tests/test_notify.py` (19), both
+dependency-free and network-free. Route tests gained three: retention refusing
+un-confirmed deletion, the notification URL not being echoed, and the monitor
+interval being clamped.
