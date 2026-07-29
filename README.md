@@ -1,10 +1,18 @@
 # Vidshelf
 
+[![Release](https://img.shields.io/github/v/release/andysom25/Vidshelf?sort=semver)](https://github.com/andysom25/Vidshelf/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/andysom25/Vidshelf/ci.yml?branch=main&label=CI)](https://github.com/andysom25/Vidshelf/actions/workflows/ci.yml)
+[![Image](https://img.shields.io/badge/ghcr.io-andysom25%2Fvidshelf-blue?logo=docker)](https://github.com/andysom25/Vidshelf/pkgs/container/vidshelf)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 A self-hosted YouTube channel downloader and music-video finder that organizes everything into a Plex-ready library — think Sonarr/Radarr for YouTube content, with deep Plex integration built in.
 
 **Vidshelf** lets you monitor YouTube channels, browse and download their videos, and search for official music videos by artist. Downloads are automatically converted to a format virtually every Plex client can play without server-side transcoding, and — if you connect a Plex server — the app keeps artist artwork, smart collections, clean titles, and designed poster art in sync for you automatically.
 
-> **Note:** this project is a work in progress, still under active development, and does not yet have a stable release. Expect rough edges.
+> **Note:** actively developed, and still rough in places. It has tagged
+> releases and multi-arch container images published on every release, so
+> upgrades are predictable — but it's a personal project, not a product with
+> support behind it.
 
 ---
 
@@ -24,8 +32,10 @@ This project is not affiliated with, endorsed by, or sponsored by YouTube, Googl
 | ![Dashboard](screenshots/dashboard.png) | ![Channels](screenshots/channels.png) |
 | **Downloads** | **Music Video Finder** |
 | ![Downloads](screenshots/downloads.png) | ![Music Videos](screenshots/music-videos.png) |
-| **Artists** (one entry per Plex collection) | **Swap Artwork** |
-| ![Artists](screenshots/artists.png) | ![Swap Artwork](screenshots/swap-artwork.png) |
+| **Artists** — searchable and filterable | **Settings** |
+| ![Artists](screenshots/artists.png) | ![Settings](screenshots/settings.png) |
+| **Swap Artwork** | |
+| ![Swap Artwork](screenshots/swap-artwork.png) | |
 
 The Artists page mirrors what shows up in Plex: each tracked artist here becomes its own smart collection there, with the same artwork and video count. "Create Plex Collection" lets you back-fill a collection for an artist on demand:
 
@@ -157,12 +167,29 @@ python app.py
 
 ---
 
-## Upgrading to v1.1.0
+## Upgrading
 
-**v1.1.0 moves all persistent state into a `data/` directory**, and replaces
-the three individual JSON bind mounts with a single directory mount. If
-you're upgrading an existing install, move your state files **before**
-starting the new version:
+Normally there's nothing to do beyond pulling the new image:
+
+```bash
+docker compose pull && docker compose up -d      # published image
+docker compose up -d --build                     # building from source
+```
+
+Your `data/` directory carries config and history across upgrades, so nothing
+needs migrating.
+
+### Coming from v1.0.0 (one-time)
+
+v1.0.0 kept state as three individual bind-mounted JSON files. **v1.1.0 moved
+all of it into a `data/` directory** — a change that was required, not
+cosmetic: Docker bind-mounts a single file by inode, which makes crash-safe
+atomic writes impossible, and a fresh clone (where those gitignored files
+don't exist) got *directories* created in their place and crash-looped on
+startup.
+
+If you're upgrading from v1.0.0, move your state files **before** starting the
+new version:
 
 ```bash
 docker compose down
@@ -180,12 +207,7 @@ Vidshelf simply starts with empty config — but you'd have to reconnect Plex
 and re-add your channels, so it's worth the 30 seconds. A local (non-Docker)
 install migrates itself automatically on first start; only Docker needs the
 manual move, because the container can't see host files that are no longer
-mounted.
-
-Why the change: mounting single files meant Docker bind-mounted them by
-*inode*, which made crash-safe atomic writes impossible, and meant a fresh
-clone (where the gitignored files don't exist) got directories created in
-their place and crash-looped on startup. Details in `state.py`.
+mounted. Full detail in `state.py`.
 
 ---
 
@@ -340,6 +362,9 @@ scratch), and is fully editable from the Settings page. Set
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/stats` / `/api/system/info` | GET | Dashboard statistics and system info |
+| `/api/system/health` | GET | Dependency check (ffmpeg, ffprobe, Pillow, fonts) |
+| `/api/system/version` | GET | Running version, and whether a newer release exists |
+| `/api/system/update-check` | POST | `{enabled}` — turn the release check on or off |
 | `/api/config` | GET/POST | Raw config access (internal keys stripped) |
 | `/api/password` | POST | Change admin password |
 | `/api/plex-base-path` | GET/POST | Get/set Plex base path |
@@ -355,11 +380,15 @@ scratch), and is fully editable from the Settings page. Set
 
 | Host Path | Container Path | Purpose |
 |-----------|---------------|---------|
+| `./data/` | `/app/data` | All persistent state — `config.json`, download history, runtime progress |
 | `./downloads/` | `/app/downloads` | Persistent downloads (survives rebuilds) |
-| `./config.json` | `/app/config.json` | App configuration |
-| `./downloaded_videos.json` | `/app/downloaded_videos.json` | Download history |
-| `./active_downloads.json` | `/app/active_downloads.json` | Runtime progress |
 | `music_videos_final` (named volume) | `/app/music_videos_final` | Music-video library — a native `cifs` mount if you're pointing at a network share (see `docker-compose.yml`); swap for a plain bind mount if you're storing locally instead |
+
+> **Mount the `data` *directory*, never the individual JSON files inside it.**
+> Docker bind-mounts a single file by inode, and Vidshelf writes state
+> atomically (temp file + rename), which replaces the inode — so per-file
+> mounts silently stop propagating writes to the host. `state.py` explains it
+> in full.
 
 ### Simple local-storage setup
 
@@ -378,10 +407,8 @@ services:
     ports:
       - "5000:5000"
     volumes:
+      - ./data:/app/data
       - ./downloads:/app/downloads
-      - ./config.json:/app/config.json
-      - ./active_downloads.json:/app/active_downloads.json
-      - ./downloaded_videos.json:/app/downloaded_videos.json
       - ./music_videos:/app/music_videos_final   # local folder instead of a NAS share
     environment:
       - ADMIN_USERNAME=${ADMIN_USERNAME:-}
@@ -412,8 +439,14 @@ docker compose down
 
 ## Dependencies
 
-- **Python 3.12** (see `Dockerfile`) — Flask, yt-dlp, Pillow
+- **Python 3.12** (see `Dockerfile`) — Flask, yt-dlp, requests, Pillow
 - **ffmpeg** — required for merging downloaded streams and for format conversion (installed automatically in Docker)
+
+Versions in `requirements.txt` are pinned exactly, so a build today produces
+the same image as a build last month. yt-dlp is the exception that still needs
+to move — YouTube changes break extraction regularly — so a scheduled workflow
+proposes a new pin weekly as a pull request with the test suite already run
+against it.
 
 ---
 
@@ -443,22 +476,64 @@ User Browser ──► Flask Server (app.py) ──► yt-dlp ──► YouTube
                      ▼
               Plex Media Server
 
-config.json / downloaded_videos.json / active_downloads.json
-  — file-based JSON storage, no database required
+data/config.json, data/downloaded_videos.json, data/active_downloads.json
+  — file-based JSON storage via state.py, no database required
 ```
 
-- **File-based JSON storage** — no database required
-- **Threaded downloads** — background daemon threads, no Redis/Celery needed
+| Module | Responsibility |
+|--------|----------------|
+| `app.py` | Flask routes, session auth, download orchestration |
+| `downloader.py` | yt-dlp download queue and progress tracking |
+| `transcode.py` | Plex-direct-play format conversion |
+| `artwork_sync.py` | Plex OAuth, artist artwork, collections, title cards |
+| `artwork_swap.py` | Manual artist-artwork replacement |
+| `state.py` | Crash-safe, lock-protected JSON persistence |
+| `updates.py` | Cached GitHub release check |
+| `static/`, `templates/` | Dashboard CSS/JS and Jinja templates |
+| `tests/` | Dependency-free test suites (Python + node) |
+
+- **File-based JSON storage** — no database required. Writes are atomic
+  (temp file + rename) and lock-protected, so an interrupted write can't
+  truncate your config and concurrent downloads can't clobber each other's
+  history.
+- **Threaded downloads** — a bounded worker pool, no Redis/Celery needed
 - **Progress polling** — no WebSockets
+- **Client-side filtering** on the Artists page, so searching doesn't re-scan
+  the media directory on every keystroke
 
 ---
 
 ## Known Limitations
 
 - No download scheduling
+- The bundled server is Flask's development server — fine for a single-admin
+  app on a trusted network, but put it behind a reverse proxy if you expose it
 - Music Video search relies on YouTube search (no dedicated data API)
 - Plex library titles/collections assume an "Artist - Song" convention in the source video's title; a handful of stylistic variants are normalized automatically, but an artist whose uploads never include the artist name in a recognizable form won't be matched
-- This is a personal project under active development, not a polished, versioned release
+- This is a personal project — it has tagged releases, CI and published
+  images, but no support commitment behind it
+
+---
+
+## Development
+
+```bash
+# Tests — no pytest or npm install required
+python tests/test_state.py          # atomic writes, locking, migration
+python tests/test_updates.py        # version comparison, update-check caching
+python tests/test_routes.py         # every route: registered, no 500s, auth enforced
+node tests/test_artists_filter.js   # Artists page search/filter/sort logic
+```
+
+They're plain assertions on purpose, so they run identically here and in CI
+with no dev dependencies to install.
+
+**Branching** — `dev` is where work happens; `main` is releases only.
+
+**Releasing** — bump `VERSION` on `dev` and merge to `main`. CI does the rest:
+it tags the release, builds and pushes multi-arch images to
+`ghcr.io/andysom25/vidshelf`, and creates the GitHub release. A merge that
+doesn't change `VERSION` releases nothing.
 
 ---
 
