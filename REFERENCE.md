@@ -3396,3 +3396,88 @@ error, no bad status code, just a dead control.
 3. Sort order looks wrong for a specific name: it's probably the article
    stripping doing its job. `node tests/test_artists_filter.js` documents the
    intended order.
+
+## ADDED (2026-07-29): releases cut automatically when VERSION changes on main
+
+Merging PR #1 exposed the gap this closes: the merge landed on `main` with
+`VERSION` already at 1.3.0, CI passed — and nothing was released. No tag, no
+GitHub release, no image. `main` sat with an untagged commit, breaking
+`CLAUDE.md`'s own "every commit on main corresponds to a tagged release" rule,
+and `:latest` still pointed at v1.2.1. Silent, because every check was green.
+
+### The trap that dictates the design
+
+**A tag pushed with `GITHUB_TOKEN` does not trigger other workflows.** GitHub
+suppresses that to prevent recursive runs. So the obvious implementation — a
+workflow that tags `main` and lets the existing tag-triggered publish job pick
+it up — creates tags and releases while **never publishing an image again**.
+Green ticks, no artifact. Exactly the failure shape the rest of this document
+is full of.
+
+So tagging *and* publishing happen in **one workflow run**. Nothing depends on
+a cross-workflow trigger. The suppression then works in our favour: the tag
+this run pushes doesn't start a second build of the same commit.
+
+Second constraint: `docker/metadata-action`'s `type=semver` patterns read the
+git **ref**, so they produce nothing on a branch push. Image tags are now
+derived from the `VERSION` file via `type=raw` instead, which also makes
+`VERSION` the single source of truth for both paths.
+
+### How it works
+
+`ci.yml` gained a `version` job that resolves three things:
+
+| Situation | `publish` | `tag_needed` |
+| --- | --- | --- |
+| push to `main`, `v$VERSION` not tagged | true | true |
+| push to `main`, `v$VERSION` already tagged | false | false |
+| a `v*` tag pushed by hand | true | false |
+| push to `dev`, or any PR | false | false |
+
+Then `publish` (gated on `needs.version.outputs.publish`) builds and pushes the
+multi-arch image, and only afterwards creates the tag and release.
+
+**Ordering is deliberate**: image first, then tag. A failed build leaves no tag
+and no release announcing an artifact that doesn't exist. Re-running after a
+fix still works, because the `version` job decides from whether the tag exists,
+not from anything about the previous run.
+
+**Idempotent.** A docs-only merge that doesn't touch `VERSION` releases
+nothing. Bumping `VERSION` twice in one PR still produces one release.
+
+### Guards worth knowing about
+
+- **VERSION must be semver.** A malformed value fails the job rather than
+  producing a nonsense tag.
+- **A hand-pushed tag must match VERSION.** `git tag v1.9.9` on a commit whose
+  VERSION says 1.3.0 fails loudly, instead of publishing an image whose
+  self-reported version disagrees with its tag.
+- **`:latest` only moves for the newest release** (`is_newest`, computed with
+  `sort -V` over all tags including the pending one). Re-publishing an older
+  version can no longer drag `latest` backwards — which the previous
+  unconditional `type=raw,value=latest` would have done.
+
+The resolution logic was exercised against seven scenarios before committing
+(already-tagged main push, untagged main push, an older untagged version, a dev
+push, a matching tag push, a mismatched tag push, and a malformed VERSION).
+
+### Release tags are attributed to github-actions[bot]
+
+Deliberate: CI created them, not a person. Two `git config` lines in the "Tag
+the release" step change that if releases should carry the andysom25 identity
+instead — worth knowing given how much of this document is about commit
+attribution.
+
+### Related: bump-yt-dlp PRs show no CI checks
+
+Same `GITHUB_TOKEN` rule. That workflow runs the full suite *before* opening
+its PR, so the verification does happen — it just isn't displayed on the PR,
+which reads as unverified. The PR body now explains this. Fixing it properly
+needs a PAT stored as a secret; not worth a long-lived credential for a
+cosmetic gap.
+
+### Releasing from now on
+
+Bump `VERSION` on `dev`, merge to `main`. That's it — the tag, the release and
+the image follow. Hand-tagging still works and is still the way to publish a
+commit whose VERSION is already tagged.

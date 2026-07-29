@@ -81,4 +81,11 @@ jobs:
             That does **not** cover actual extraction against YouTube, so if a
             release is suspected of breaking downloads, try one through the UI
             before merging.
+
+            > **No CI checks will appear on this PR.** It was opened using
+            > `GITHUB_TOKEN`, and GitHub deliberately does not trigger
+            > workflows for events raised by that token, to prevent recursive
+            > runs. The verification above still happened — it ran in the job
+            > that created this PR, not on the PR itself. Merging it into `dev`
+            > runs CI normally.
           labels: dependencies
