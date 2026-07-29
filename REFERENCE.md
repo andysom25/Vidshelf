@@ -1,5 +1,12 @@
 # Vidshelf - Code Reference & Debugging Log
 
+> **This is an engineering log, not user documentation** — see
+> [README.md](README.md) for installation and usage. Below is a chronological
+> record of what broke, why, how it was fixed, and how to verify it, kept
+> because several bugs here were expensive to diagnose and easy to reintroduce.
+> If you're changing code in this repo, skim it first; if you're troubleshooting,
+> search it before opening an issue. Newest entries are at the bottom.
+
 ## Architecture Overview
 
 ```
@@ -3493,3 +3500,149 @@ Activated by bumping `VERSION` to 1.3.1 and merging, so the new workflow's
 first real run cut its own release — which also exercised the full auto-release
 path (untagged VERSION on main -> tag + image + release) rather than only the
 "already tagged, do nothing" branch a bump-free merge would have tested.
+
+## CHANGED (2026-07-29): public-repo hardening, a production server, and two real fixes (v1.4.0)
+
+Batch of work prompted by the repo being public. Grouped because most of it is
+one-line-each; the parts with reasoning worth keeping are below.
+
+### `POST /api/config` silently dropped internal keys
+
+The endpoint replaces the whole config document and preserved a **hardcoded
+pair** — `_secret_key` and `_auth`. That was correct when those were the only
+internal keys, and silently wrong the moment `_plex_client_id` (v1.2.0) and
+`update_check_enabled` (v1.2.0) appeared.
+
+Reproducing the old merge against a realistic document loses three keys:
+`_plex_client_id`, `update_check_enabled`, and any future underscore key.
+Losing `_plex_client_id` is the damaging one — it's the identity Vidshelf
+presents to Plex's OAuth flow, so every restart after a settings save would
+look like a brand new device. Nothing raises an error; you'd notice as a
+growing list of authorised devices in your Plex account, if ever.
+
+Now **every** leading-underscore key is preserved, plus a small explicit list
+for non-underscore internal settings (`update_check_enabled`). The underscore
+prefix being the rule rather than an enumeration is the point: the next
+internal key added is protected by default instead of by remembering to edit
+this function. Callers can still *set* an internal key explicitly — the GET
+response exposes `_plex_client_id`, so the editor has to be able to round-trip
+it — only omitted keys are filled back in.
+
+`tests/test_routes.py` has three guards for this, including one asserting an
+explicitly-supplied internal value still wins.
+
+### Fetches had no deadline, so a stall looked identical to a break
+
+Reported as "the artists page just spins". It wasn't reproducible — the page
+worked correctly in a real browser against the published image, and
+`/api/artists/summary` returned in 0.6s. But the same symptom *was* reproduced
+on the **Channels** page while capturing screenshots: `Loading channels…` sat
+there indefinitely while a per-channel YouTube name lookup was slow.
+
+The class of bug is real regardless of which page triggered it. Both endpoints
+depend on something outside this app's control — a YouTube lookup, or a
+directory walk across a network mount — and neither fetch had a timeout, so a
+stall renders as a spinner that never resolves with no way to distinguish slow
+from broken. The most likely trigger for the original report was a request left
+hanging across one of several container restarts.
+
+Added `fetchWithTimeout()` (25s, `AbortController`) plus `describeFetchError()`
+so an abort reads as "Timed out after 25s" rather than a bare "aborted", and
+both pages now render a **Retry** button instead of a dead panel. The
+`clearTimeout` in a `finally` matters: without it a fast response leaves a
+pending timer that fires an abort against an already-settled request.
+
+### waitress instead of Werkzeug's development server
+
+`app.run()` was serving the published image. Werkzeug's server is explicitly
+not intended for unattended use, and this now ships as a container people run
+for weeks.
+
+waitress rather than gunicorn because it's pure-Python and runs on Windows,
+which README option 3 depends on — gunicorn would have made the documented
+local-install path Linux/macOS-only.
+
+`threads=8`, not waitress's default of 4: the dashboard polls several endpoints
+on a timer while downloads and the artwork watcher occupy their own background
+threads, so 4 request threads is thin once a slow directory scan is in flight.
+Configurable via `SERVER_THREADS`.
+
+`FLASK_DEBUG=true` still routes to Werkzeug, because the reloader and
+interactive debugger are the entire reason to ask for it. It now prints a
+warning when it does.
+
+Side benefit: `ident='Vidshelf'` replaces the `Server: Werkzeug/3.1.8
+Python/3.12.13` header, which was advertising exact versions to anyone probing.
+
+### HEALTHCHECK
+
+Without one, `restart: unless-stopped` can't tell a wedged app from a working
+one — the container stays "up" while serving nothing. Hits `/login` because
+it's the only route that answers without a session, via `urllib` rather than
+curl so the slim image doesn't need an extra package. Verified: the container
+reports `(healthy)`.
+
+### Supply chain: actions pinned to SHAs
+
+All 12 `uses:` references across both workflows now pin a commit SHA with the
+tag as a trailing comment. A moved tag on any of them would have executed
+arbitrary code inside a job holding `contents: write` **and** `packages: write`
+— i.e. it could publish a container image under this repo's name. A SHA can't
+be moved.
+
+That trades one risk for another: a pinned SHA can't receive security fixes on
+its own. `.github/dependabot.yml` covers that, targeting `dev` (main is
+releases-only) and **excluding yt-dlp**, which `bump-yt-dlp.yml` already
+handles with a full test run before opening its PR. Two bots on the same line
+would just conflict.
+
+Dependabot's PRs *do* trigger CI, unlike PRs opened with `GITHUB_TOKEN` — so
+they arrive with the suite already reported.
+
+### Repository settings applied (not in git)
+
+- Description and 10 topics set; the repo previously had neither, which made it
+  effectively unlisted in GitHub search and topic pages.
+- **Private vulnerability reporting enabled** — it was off, so the only way to
+  report a hole in an app holding Plex tokens and NAS credentials was a public
+  issue that discloses it. `SECURITY.md` documents scope, including what's
+  deliberately out of scope (it's a single-admin LAN app; "exposed if you
+  port-forward it without a proxy" isn't a vulnerability).
+- Fork-PR workflow approval raised from first-time contributors to **all
+  external contributors**.
+- Dependabot alerts and security updates enabled.
+- Empty wiki disabled.
+- **`main` branch protection**: required check `Tests` (only — `Publish image`
+  deliberately never runs on a PR, so requiring it would wait forever), 0
+  required approvals (a solo maintainer can't approve their own PR), no
+  force-push, no deletion, `enforce_admins: true`. Linear history and signed
+  commits are deliberately **not** required: the first would block the `--no-ff`
+  release merges, the second blocks every merge since commits aren't signed.
+
+  Enforcement was verified empirically on a throwaway branch with identical
+  rules rather than by trusting the config: force-push, deletion and a valid
+  fast-forward push were all rejected server-side. Note `git push --dry-run` is
+  **not** a valid test — it never sends a pack, so server-side rules never
+  evaluate, and it happily reports success.
+
+  `dev` is deliberately left unprotected. If that changes, do **not** add
+  required status checks there: `bump-yt-dlp` opens its PRs with
+  `GITHUB_TOKEN`, those never trigger workflows, and the PRs would become
+  permanently unmergeable.
+
+### Still outstanding
+
+A `v*` tag ruleset. Restrict deletion and updates but **not creation** — the
+release workflow creates tags, and restricting creation would break it.
+
+### How to verify
+
+```bash
+python tests/test_state.py && python tests/test_updates.py && python tests/test_routes.py
+node tests/test_artists_filter.js
+
+docker compose up -d --build
+docker inspect --format '{{.State.Health.Status}}' vidshelf   # healthy
+docker logs vidshelf | grep waitress                          # confirms the server
+curl -sD - -o /dev/null localhost:5000/login | grep -i server  # Server: Vidshelf
+```

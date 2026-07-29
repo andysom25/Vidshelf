@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/andysom25/Vidshelf/security/advisories/new
+    about: Please report security problems privately, not as a public issue.
+  - name: Troubleshooting notes
+    url: https://github.com/andysom25/Vidshelf/blob/main/REFERENCE.md
+    about: >
+      The engineering log. Several problems that look like bugs are documented
+      there with their cause and fix — network-mount misconfiguration, ENOSPC
+      with free space, out-of-order logs, state that appears to reset. Worth a
+      search before opening an issue.

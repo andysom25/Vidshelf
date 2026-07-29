@@ -1,0 +1,42 @@
+version: 2
+
+# Targets `dev`, not `main` — main is releases-only, so a dependency bump has
+# to land on dev and go out with the next release like any other change.
+#
+# Dependabot's PRs do trigger CI (unlike PRs opened with GITHUB_TOKEN, which
+# GitHub deliberately doesn't run workflows for), so these arrive with the test
+# suite already reported on them.
+
+updates:
+  # GitHub Actions are pinned to commit SHAs for supply-chain reasons — a moved
+  # tag would run arbitrary code in a job holding packages:write. A SHA can't
+  # move, but it also can't receive security fixes on its own, which is exactly
+  # why this needs to be automated rather than remembered.
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore"
+    labels:
+      - dependencies
+      - github-actions
+
+  # yt-dlp is deliberately excluded: .github/workflows/bump-yt-dlp.yml already
+  # proposes those bumps, and it runs the full test suite against the new pin
+  # before opening a PR. Two bots racing on the same line would just conflict.
+  - package-ecosystem: pip
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore"
+    labels:
+      - dependencies
+      - python
+    ignore:
+      - dependency-name: yt-dlp

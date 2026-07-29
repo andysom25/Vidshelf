@@ -227,6 +227,9 @@ All optional — see `.env.example` for the full template.
 | `FFMPEG_PATH` | Override the ffmpeg/ffprobe binary location if not on `PATH`. |
 | `MAX_CONCURRENT_DOWNLOADS` | Max downloads (and their format-conversion re-encodes) running at once, across all download types combined. Defaults to `2` — format conversion is CPU/memory-heavy, so raise this only if your hardware can handle more concurrent encodes. |
 | `VIDSHELF_DATA_DIR` | Where persistent state (`config.json`, download trackers) is kept. Defaults to `./data`. In Docker leave this alone and mount a volume at `/app/data` instead. |
+| `PORT` | Port to listen on. Defaults to `5000`. In Docker, remap on the host side instead (`-p 8080:5000`). |
+| `SERVER_THREADS` | waitress request threads. Defaults to `8`. Raise it if the UI feels unresponsive while a slow directory scan is running. |
+| `FLASK_DEBUG` | `true` swaps waitress for Werkzeug's development server with the interactive debugger. **Local development only** — that debugger executes arbitrary code. |
 
 ### `config.json`
 
@@ -419,6 +422,16 @@ No `cap_add`/`driver_opts`/`NAS_SMB_*` variables needed for this version —
 those only matter for the `cifs` network-share setup. See `.env.example`
 for every environment variable this app recognizes.
 
+### Health check
+
+The image declares a `HEALTHCHECK`, so `docker ps` reports `healthy` /
+`unhealthy` rather than only `up`. That matters with `restart: unless-stopped`,
+which otherwise can't distinguish a wedged app from a working one:
+
+```bash
+docker inspect --format '{{.State.Health.Status}}' vidshelf
+```
+
 ### Commands
 
 ```bash
@@ -439,7 +452,7 @@ docker compose down
 
 ## Dependencies
 
-- **Python 3.12** (see `Dockerfile`) — Flask, yt-dlp, requests, Pillow
+- **Python 3.12** (see `Dockerfile`) — Flask, waitress, yt-dlp, requests, Pillow
 - **ffmpeg** — required for merging downloaded streams and for format conversion (installed automatically in Docker)
 
 Versions in `requirements.txt` are pinned exactly, so a build today produces
@@ -506,8 +519,9 @@ data/config.json, data/downloaded_videos.json, data/active_downloads.json
 ## Known Limitations
 
 - No download scheduling
-- The bundled server is Flask's development server — fine for a single-admin
-  app on a trusted network, but put it behind a reverse proxy if you expose it
+- Served by [waitress](https://github.com/Pylons/waitress), which is fine for
+  a single-admin app on a trusted network — but it terminates plain HTTP with no
+  TLS, so put it behind a reverse proxy if you expose it beyond your LAN
 - Music Video search relies on YouTube search (no dedicated data API)
 - Plex library titles/collections assume an "Artist - Song" convention in the source video's title; a handful of stylistic variants are normalized automatically, but an artist whose uploads never include the artist name in a recognizable form won't be matched
 - This is a personal project — it has tagged releases, CI and published
