@@ -3646,3 +3646,52 @@ docker inspect --format '{{.State.Health.Status}}' vidshelf   # healthy
 docker logs vidshelf | grep waitress                          # confirms the server
 curl -sD - -o /dev/null localhost:5000/login | grep -i server  # Server: Vidshelf
 ```
+
+### Dependency bumps and why v1.4.1 exists (2026-07-29)
+
+Dependabot opened six PRs within minutes of `dependabot.yml` landing. Five were
+major action bumps, which looked alarming and turned out not to be:
+
+| Action | Bump |
+| --- | --- |
+| `actions/setup-python` | 5.6.0 -> 7.0.0 |
+| `docker/login-action` | 3.7.0 -> 4.6.0 |
+| `docker/metadata-action` | 5.10.0 -> 6.2.0 |
+| `docker/build-push-action` | 6.19.2 -> 7.3.0 |
+| `peter-evans/create-pull-request` | 7.0.11 -> 8.1.1 |
+| `certifi` | 2026.6.17 -> 2026.7.22 |
+
+**Every one of those majors is the same change**: Node 24 as the default
+runtime, requiring Actions Runner >= v2.327.1, plus an internal ESM refactor.
+No input renames, no semantic changes. All jobs here are `ubuntu-latest`
+(GitHub-hosted), so the runner requirement is satisfied automatically — it
+would only matter on self-hosted runners.
+
+Two specific fears were checked against real usage and dismissed:
+
+- `metadata-action` v6 changed `#` handling in list inputs. Our `tags:` list
+  contains no `#`; the explanatory comments sit *above* `tags:`, outside the
+  list. `type=raw` and the `enable=` flag are untouched, so `:latest` still
+  moves only when `is_newest` says so.
+- `build-push-action` v7 removed `DOCKER_BUILD_NO_SUMMARY` and
+  `DOCKER_BUILD_EXPORT_RETENTION_DAYS`, and dropped legacy export-build summary
+  support. We set none of those. `cache-from`/`cache-to: type=gha` is not
+  mentioned as changed.
+
+**Merge order, and why it mattered.** Three of these live in the `publish` job,
+which never runs on a pull request — so CI going green on those PRs proves
+almost nothing. They were merged in ascending order of risk (certifi, then
+setup-python which CI *does* exercise, then login/metadata/build-push, then
+create-pull-request which only affects the weekly yt-dlp bumper), one at a time
+because Dependabot rebases the remainder after each merge.
+
+**v1.4.1 exists purely to exercise the publish job.** It carries no product
+change. Without a release, three unreviewed majors would sit in the release
+pipeline untested until the next release someone actually cared about. The
+blast radius is bounded by the existing ordering — the image is pushed before
+the tag is created, so a broken publish leaves no tag, no release, and a
+re-run after a fix works.
+
+Note for future bumps: `dependabot.yml` excludes yt-dlp on purpose, because
+`bump-yt-dlp.yml` already proposes those with a full test run first. Two bots
+on the same line would only conflict.
