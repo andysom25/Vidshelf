@@ -27,7 +27,7 @@ waitress==3.0.2
 # leaving them floating would defeat the point -- Werkzeug in particular has
 # shipped breaking changes within a Flask major.
 blinker==1.9.0
-certifi==2026.6.17
+certifi==2026.7.22
 charset-normalizer==3.4.9
 click==8.4.2
 idna==3.18
