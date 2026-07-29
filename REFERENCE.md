@@ -3816,3 +3816,96 @@ own. Clearing download history is what makes it eligible again.
 dependency-free and network-free. Route tests gained three: retention refusing
 un-confirmed deletion, the notification URL not being echoed, and the monitor
 interval being clamped.
+
+### Test coverage: measured, then targeted (2026-07-29)
+
+Measured with `coverage` (installed locally, deliberately **not** added to
+requirements.txt — that stays runtime-only and the suites stay dependency-free).
+
+Starting point was **28%**, which is a misleading number on its own. The useful
+question isn't "what percentage is covered" but "can the failures this project
+has actually suffered recur without CI noticing". For the worst of them the
+answer was yes:
+
+| Module | Before | After |
+| --- | --- | --- |
+| `notify.py` | 25% | **95%** |
+| `transcode.py` | 30% | **50%** |
+| `artwork_sync.py` | 11% | 15% |
+| `app.py` | 30% | 33% |
+| `state.py` / `updates.py` / `retention.py` / `scheduler.py` | 71-80% | unchanged |
+| `downloader.py` | 23% | 23% |
+| **Total** | **28%** | **33%** |
+
+`downloader.py` staying at 23% is deliberate — see below.
+
+#### The gap that mattered: an invariant, not coverage
+
+`downloader.py`'s uncovered lines include the `copyfileobj` copy. All three copy
+sites were **correct**, but nothing enforced it: someone "simplifying" one back
+to `shutil.copy2` would break nothing in CI, because that bug only manifests
+against a real CIFS mount. It cost two debugging sessions and appeared fixed
+twice (CLAUDE.md gotcha #2).
+
+Raising `downloader.py`'s line coverage would not have caught that. What catches
+it is `tests/test_invariants.py`, which asserts on the **source text**:
+
+- no `shutil.copy/copy2/copyfile` in executable code, and each copy site still
+  contains a `copyfileobj`
+- state files opened only by `state.py`
+- `PYTHONUNBUFFERED=1` still in the Dockerfile
+- compose mounts `./data`, not individual JSON files
+- `app.run()` reachable only under the `debug_mode` branch
+- GHCR image name lowercase and not derived from `${{ github.repository }}`
+- `retention.py` contains no executable reference to the download tracker
+
+Asserting on source text is unusual and the justification is narrow: these
+failures only appear against a real CIFS mount, a real container restart, or a
+real GHCR push, so no functional test reaches them. An invariant that fails in
+CI beats a comment nobody reads at the moment they change the line. Each check
+was verified to actually fire by feeding the checker a synthetic violation —
+`shutil.copy2(a, b)` and a bare `open('config.json', 'w')` were both caught.
+
+#### tests/test_media.py — the four measured gaps
+
+`transcode.needs_conversion` (ffprobe replaced with canned JSON): AV1 and VP9
+need conversion, `.webm`/`.mkv` do too even with compatible codecs, `.MP4`
+uppercase does **not**, a silent video is left alone, and an unprobeable file is
+left alone rather than fed into a re-encode on a guess.
+
+`artwork_sync._is_safe_download_url` — a security control that had **zero
+tests** at 11% coverage. Now covers non-http schemes, loopback (v4 and v6),
+all three RFC1918 ranges, the `169.254.169.254` cloud-metadata address, a host
+resolving to *both* a public and a private address (must reject), unresolvable
+hosts, and a URL with no host. DNS is stubbed, so no network.
+
+`_clean_video_title` / `folder_to_artist` — pure string functions whose edge
+cases have already caused bugs (the stylized-quote incident). Covers YouTube-ID
+stripping, "(Official … Video)" boilerplate, preserving meaningful
+parentheticals like "(US Version)", en/em dash normalisation, and never
+returning empty.
+
+`app._sanitize_folder_name` — invalid-character stripping, separator collapsing,
+and trailing dot/space removal (Windows and SMB reject those).
+
+#### Two expectations that were wrong, and one thing deliberately not fixed
+
+`_clean_video_title('---')` returns `'--'`. The contract guards *empty or
+identical*, and `'--'` is neither, so that's correct behaviour and the test was
+over-specified. It now asserts non-emptiness, which is the invariant that
+matters.
+
+`_sanitize_folder_name('///???')` returns `'_'`. Two different all-punctuation
+names would therefore collide on one folder. **Left as-is on purpose**: real
+artist names contain letters, and changing this function's output would orphan
+every folder created by an earlier version — the app would create duplicates
+alongside the originals. Folder-name stability is worth more than tidying a
+degenerate case. The test documents that rather than asserting a fix.
+
+#### Where to stop
+
+`artwork_sync.py`'s remaining ~1,000 uncovered statements are mostly Plex and
+artwork-provider HTTP calls, where mocking costs more than it protects. The pure
+functions inside it are now covered; the I/O is better verified by an actual
+sync against a real Plex server, which is what the manual Settings actions are
+for.
