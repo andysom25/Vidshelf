@@ -3481,3 +3481,15 @@ cosmetic gap.
 Bump `VERSION` on `dev`, merge to `main`. That's it — the tag, the release and
 the image follow. Hand-tagging still works and is still the way to publish a
 commit whose VERSION is already tagged.
+
+### Activating it (v1.3.1)
+
+A workflow only takes effect once it is on the branch being pushed: GitHub runs
+`ci.yml` as it exists on the ref receiving the push. So while this sat on `dev`
+it did nothing, and a merge to `main` would still have used main's older
+tag-only `ci.yml`. Easy to miss, because everything looks committed and green.
+
+Activated by bumping `VERSION` to 1.3.1 and merging, so the new workflow's
+first real run cut its own release — which also exercised the full auto-release
+path (untagged VERSION on main -> tag + image + release) rather than only the
+"already tagged, do nothing" branch a bump-free merge would have tested.
