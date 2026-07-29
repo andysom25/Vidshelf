@@ -359,6 +359,67 @@ body {
     gap: 8px;
 }
 
+/* Artists page — search & filter bar */
+.artist-filters {
+    display: flex;
+    flex-wrap: wrap;          /* stacks on narrow screens instead of overflowing */
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 14px;
+}
+.artist-filters .artist-search-wrap {
+    position: relative;
+    flex: 1 1 240px;          /* takes the slack, but never collapses below 240px */
+    min-width: 200px;
+}
+.artist-filters input[type="text"] {
+    width: 100%;
+    padding: 10px 34px 10px 12px;   /* right padding leaves room for the clear button */
+    background: #0f0f1a;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    color: #e0e0e0;
+    font-size: 0.95em;
+    transition: border-color 0.2s;
+}
+.artist-filters input[type="text"]:focus,
+.artist-filters select:focus {
+    outline: none;
+    border-color: #e94560;
+}
+.artist-filters select {
+    padding: 10px 12px;
+    background: #0f0f1a;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    color: #e0e0e0;
+    font-size: 0.9em;
+    transition: border-color 0.2s;
+    cursor: pointer;
+}
+.artist-search-clear {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: #6c6c80;
+    font-size: 1em;
+    cursor: pointer;
+    padding: 2px 4px;
+    line-height: 1;
+    display: none;            /* only shown while there is a query to clear */
+}
+.artist-search-clear:hover { color: #e0e0e0; }
+.artist-filter-summary {
+    font-size: 0.85em;
+    color: #6c6c80;
+    margin-bottom: 12px;
+    min-height: 1.2em;        /* reserve the line so the list doesn't jump */
+}
+.artist-filter-summary strong { color: #9090a0; font-weight: 600; }
+
 /* Artists page */
 .artist-row {
     border: 1px solid rgba(255, 255, 255, 0.06);

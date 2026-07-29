@@ -187,6 +187,33 @@
                 <p>Artists you're tracking and the videos downloaded for each</p>
             </div>
             <div class="section">
+                <div class="artist-filters">
+                    <div class="artist-search-wrap">
+                        <input type="text" id="artist-search" placeholder="Search artists..." oninput="onArtistFilterInput()"
+                               aria-label="Search artists by name" autocomplete="off">
+                        <button type="button" class="artist-search-clear" id="artist-search-clear"
+                                onclick="clearArtistSearch()" aria-label="Clear search" title="Clear search">✕</button>
+                    </div>
+                    <select id="artist-filter-artwork" aria-label="Filter by artwork status" onchange="renderArtistList()">
+                        <option value="all">Artwork: any</option>
+                        <option value="has">Has artwork</option>
+                        <option value="missing">Missing artwork</option>
+                    </select>
+                    <select id="artist-filter-videos" aria-label="Filter by video count" onchange="renderArtistList()">
+                        <option value="all">Videos: any</option>
+                        <option value="has">Has videos</option>
+                        <option value="empty">Empty folders</option>
+                    </select>
+                    <select id="artist-sort" aria-label="Sort artists" onchange="renderArtistList()">
+                        <option value="name-asc">Name A–Z</option>
+                        <option value="name-desc">Name Z–A</option>
+                        <option value="videos-desc">Most videos</option>
+                        <option value="videos-asc">Fewest videos</option>
+                    </select>
+                    <button type="button" class="btn btn-secondary" id="artist-filter-reset"
+                            onclick="resetArtistFilters()">Reset</button>
+                </div>
+                <div class="artist-filter-summary" id="artist-filter-summary"></div>
                 <div id="artists-list" class="loading">
                     <div class="spinner"></div>
                     <p>Loading artists...</p>
