@@ -495,6 +495,26 @@
                         🔄 Check now
                     </button>
                 </div>
+                <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.06);">
+                    <div class="form-group" style="margin:0;">
+                        <label for="monitor-listing">Consider newest N per channel</label>
+                        <input type="number" id="monitor-listing" min="1" step="10"
+                               style="width:120px;" onchange="saveMonitorConfig()">
+                        <div class="help-text">How far back a check looks. Lower is faster.</div>
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label for="monitor-queue">Skip check if queue exceeds</label>
+                        <input type="number" id="monitor-queue" min="1" step="5"
+                               style="width:120px;" onchange="saveMonitorConfig()">
+                        <div class="help-text">Stops piling onto a backlog that isn't draining.</div>
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label for="monitor-freegb">Stop below N GB free</label>
+                        <input type="number" id="monitor-freegb" min="0" step="10"
+                               style="width:120px;" onchange="saveMonitorConfig()">
+                        <div class="help-text">0 disables the free-space check.</div>
+                    </div>
+                </div>
                 <div id="monitor-status" class="help-text" style="margin-top:12px;"></div>
             </div>
 
@@ -580,6 +600,20 @@
                         🔍 Preview what would be deleted
                     </button>
                 </div>
+                <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.06);">
+                    <input type="checkbox" id="retention-auto" onchange="saveRetentionConfig()"
+                           style="margin-top:3px;flex-shrink:0;">
+                    <span>
+                        <span style="font-weight:500;">Automatically prune after each check</span>
+                        <span class="text-muted" style="display:block;font-size:0.85em;margin-top:2px;">
+                            Runs a sweep after every automatic channel check, with no
+                            preview and no confirmation. This is a second opt-in on top of
+                            <em>Enable retention</em> — deliberately separate, so upgrading
+                            never starts deleting media by surprise. Preview the plan above
+                            at least once before turning this on.
+                        </span>
+                    </span>
+                </label>
                 <div id="retention-result" style="margin-top:14px;"></div>
             </div>
 

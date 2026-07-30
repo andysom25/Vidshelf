@@ -3909,3 +3909,116 @@ artwork-provider HTTP calls, where mocking costs more than it protects. The pure
 functions inside it are now covered; the I/O is better verified by an actual
 sync against a real Plex server, which is what the manual Settings actions are
 for.
+
+## FIXED (2026-07-30): six gaps in the v1.5.0 automation, found by auditing it (v1.5.1)
+
+Audited the three v1.5.0 features rather than waiting to hit their edges. Six
+real gaps, three of them in code written the same day.
+
+### Retention never ran automatically
+
+`retention.sweep()` was called from exactly two places: the dry-run endpoint and
+the apply endpoint. **Nothing in the scheduler called it.** So the justification
+for shipping the three features together — "monitoring without retention fills
+the disk" — was not actually delivered: monitoring ran unattended, pruning needed
+a human to click Preview then Delete.
+
+Now runs after a tick when `retention.auto_sweep` is set. Kept as a **second**
+opt-in on top of `retention.enabled`, because an upgrade must never start
+deleting media because a flag happened to already be true.
+
+A failing sweep is caught and recorded rather than propagating — a retention
+error must not lose the downloads a tick just queued. There's a test for that.
+
+### Retention swept the wrong directory for channel downloads
+
+`_media_root()` returned `artwork_sync.root_path` only. Channel videos land under
+`plex_base_path` or a per-channel `plex_media_path`. So the feature that exists to
+bound unattended *channel* monitoring never pruned what channel monitoring
+downloads — it pruned music videos instead.
+
+Now sweeps every root, via the pre-existing `_gather_media_roots()` (in app.py
+since the initial commit, used by the conversion scan). Reused rather than
+reimplemented, and it already filters to directories that exist, so roots the
+container can't see — a UNC path on the host — never reach retention.
+
+Per-root failures are now **skips, not aborts**: one unmounted share shouldn't
+disable pruning everywhere. `plan()` only reports an overall error when *no* root
+could be scanned. Roots are deduplicated, so overlapping config can't plan the
+same file twice.
+
+### A tick re-read the entire download history once per video
+
+The worst of the three, and invisible from outside. `is_video_downloaded()` was
+passed into the loop as a predicate, and each call re-read *and re-parsed* the
+whole tracker file under a lock. Measured: **500 file reads for one 500-video
+channel, per channel, per tick.**
+
+The manual endpoint capped its listing at `videos[:20]`, so this never mattered
+before something iterated a full listing.
+
+Two fixes: the injected contract is now `list_downloaded(url) -> set`, read once
+per channel; and `get_channel_videos()` output is bounded by `max_listing`
+(default 50) instead of a channel's entire history.
+
+### No brakes on unattended growth
+
+The executor has 2 workers and an **unbounded queue**, so an hourly tick could
+enqueue faster than it drained, forever. And nothing checked capacity — on a NAS
+already at 97%, monitoring plus manual-only retention had no stopping condition
+at all.
+
+Three brakes, all conservative by default:
+
+- `max_queue_depth` (20) — a deep queue skips the tick entirely, and doesn't even
+  list channels, since each listing is a yt-dlp call.
+- `min_free_gb` (0 = off) — per-channel destination check. Deliberately fails
+  *open*: a destination that can't be stat'd (a UNC path invisible to the
+  container) must not silently stop all downloading.
+- `max_listing` (50) — above.
+
+### Failing channels retried and notified every tick
+
+A deleted or region-blocked channel errored on every pass, and every pass sent a
+notification. Now exponential backoff — 1, 2, 4, then 8 ticks — cleared on the
+first success.
+
+### A crash-loop bug that only a real container run caught
+
+Worth recording as a process point, not just a fix. `_settings()` changed from
+returning a 3-tuple to a dict. Everything passed: all 118 tests, the import
+check, `ast.parse`. The container then **crash-looped on startup**, because the
+`__main__` block still unpacked three values.
+
+Nothing in the suite executes `__main__` — the CI import check imports the module,
+which by design does not run it. Building and starting the image is what found
+it, which is exactly what CLAUDE.md's "Verifying fixes" section says to do and
+why that instruction exists. The startup line now reads from the public
+`status()`.
+
+### A CSS bug that only looking at a screenshot caught
+
+`.form-group input { width: 100% }` also matched checkboxes, stretching them to
+the panel width and marooning each label on the far side of the row. The
+notification event list had shipped in v1.5.0 looking broken.
+
+Every automated check passed — the controls existed, were wired, and the route
+tests confirmed all of it. It took *rendering the page and looking at it* to see
+it. Fixed globally with `.form-group input[type="checkbox"] { width: auto }`.
+
+### Release notes are now authored, not generated
+
+Since automation took over in v1.4.0, `gh release create --generate-notes`
+produced a single "Release vX.Y.Z … in #N" line. **v1.4.1 and v1.5.0 both shipped
+with notes that said nothing.**
+
+CI now prefers `release-notes/vX.Y.Z.md` via `--notes-file`, falling back to
+generated notes with a workflow warning. `tests/test_invariants.py` asserts the
+file exists for the current `VERSION`, is longer than a stub, and has section
+headings — so the omission fails on `dev` instead of being discovered on a
+published release. Both older releases were backfilled.
+
+CLAUDE.md now records both standing rules: hand-written notes on every release,
+and README updates on any release that changes user-facing behaviour — including
+recapturing screenshots, which go stale silently with no test to catch them.
+`settings.png` was recaptured here for exactly that reason.

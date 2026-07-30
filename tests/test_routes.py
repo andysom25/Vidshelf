@@ -186,6 +186,66 @@ def test_static_assets_are_served_and_non_empty():
         assert needle in body, f'{path} does not contain expected content ({needle!r})'
 
 
+def test_automation_settings_controls_are_present_and_wired():
+    """The monitoring/retention panels span template, CSS and JS.
+
+    A rename in one and not the others yields a control that renders and does
+    nothing — no error, no bad status code. Covers the v1.5.1 brakes
+    (listing cap, queue depth, free-space floor) and the automatic-prune opt-in.
+    """
+    client = _client(authenticated=True)
+    html = client.get('/dashboard').get_data(as_text=True)
+    for element_id in ['monitor-enabled', 'monitor-interval', 'monitor-max',
+                       'monitor-listing', 'monitor-queue', 'monitor-freegb',
+                       'retention-enabled', 'retention-keep', 'retention-auto',
+                       'notify-enabled', 'notify-url']:
+        assert f'id="{element_id}"' in html, f'missing control: {element_id}'
+
+    js = client.get('/static/js/dashboard.js').get_data(as_text=True)
+    for fn in ['function loadMonitorStatus', 'function saveMonitorConfig',
+               'function runMonitorNow', 'function saveRetentionConfig',
+               'function previewRetention', 'function applyRetention',
+               'function saveNotifyConfig', 'function testNotify']:
+        assert fn in js, f'handler referenced by the template is missing: {fn}'
+
+    # The new knobs must actually be sent, not just rendered.
+    for key in ['max_listing:', 'max_queue_depth:', 'min_free_gb:', 'auto_sweep:']:
+        assert key in js, f'{key} never sent to the server'
+
+
+def test_monitor_accepts_the_v151_brake_settings():
+    client = _client(authenticated=True)
+    resp = client.post('/api/monitor/config', json={
+        'enabled': True, 'max_listing': 25,
+        'max_queue_depth': 7, 'min_free_gb': 250})
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    st = resp.get_json()['status']
+    assert st['max_listing'] == 25
+    assert st['max_queue_depth'] == 7
+    assert st['min_free_gb'] == 250
+
+
+def test_min_free_gb_zero_is_preserved_not_defaulted():
+    """0 means "disable the check"; it must not be replaced by a default."""
+    client = _client(authenticated=True)
+    client.post('/api/monitor/config', json={'min_free_gb': 100})
+    resp = client.post('/api/monitor/config', json={'min_free_gb': 0})
+    assert resp.get_json()['status']['min_free_gb'] == 0
+
+
+def test_retention_auto_sweep_is_a_separate_opt_in():
+    """Enabling retention must not by itself start unattended deletion."""
+    client = _client(authenticated=True)
+    client.post('/api/retention/config', json={'enabled': True})
+    cfg = state.read_json(app_module.CONFIG_FILE).get('retention', {})
+    assert cfg.get('enabled') is True
+    assert not cfg.get('auto_sweep'), 'auto_sweep turned on by enabling retention'
+
+    client.post('/api/retention/config', json={'auto_sweep': True})
+    cfg = state.read_json(app_module.CONFIG_FILE).get('retention', {})
+    assert cfg.get('auto_sweep') is True
+
+
 def test_retention_apply_refuses_without_explicit_confirmation():
     """The only irreversible endpoint in the app must not fire on a bare POST.
 

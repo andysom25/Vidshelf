@@ -175,6 +175,27 @@ def test_ghcr_image_name_is_lowercase():
         'IMAGE_NAME must not derive from github.repository — it capitalises the V.'
 
 
+def test_current_version_has_hand_written_release_notes():
+    """CLAUDE.md requires release-notes/vX.Y.Z.md for the version in VERSION.
+
+    CI falls back to --generate-notes when the file is absent, which produces a
+    single pull-request link and nothing else. v1.4.1 and v1.5.0 both shipped
+    that way. This makes the omission fail on `dev` rather than being discovered
+    on the published release, where fixing it means editing the release by hand.
+    """
+    version = _read('VERSION').strip()
+    notes = os.path.join(ROOT, 'release-notes', f'v{version}.md')
+    assert os.path.isfile(notes), (
+        f'VERSION is {version} but release-notes/v{version}.md is missing. '
+        'Write it as part of the release PR — see CLAUDE.md.')
+    body = open(notes, encoding='utf-8').read().strip()
+    # A stub file would satisfy existence while defeating the point.
+    assert len(body) > 200, f'release-notes/v{version}.md looks like a stub ({len(body)} chars)'
+    assert '##' in body, (
+        f'release-notes/v{version}.md has no section headings — notes should be '
+        'grouped for someone upgrading, not a flat commit list.')
+
+
 def test_retention_never_clears_the_download_tracker():
     """Scheduler/retention interaction guard.
 

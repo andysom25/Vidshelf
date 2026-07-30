@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import threading
 import concurrent.futures
 import time
@@ -1621,11 +1622,75 @@ def _monitor_start_download(video, channel):
     return download_id
 
 
+def _monitor_list_videos(channel_url, limit):
+    """Channel listing for the monitor, bounded.
+
+    get_channel_videos() returns a channel's *entire* listing — fine for the
+    manual endpoint, which slices [:20], but the monitor iterates everything.
+    Slicing here bounds the work per tick; the fetch itself is still the
+    expensive part, which is why max_listing exists at all.
+    """
+    videos = get_channel_videos(channel_url) or []
+    return videos[:limit] if limit else videos
+
+
+def _monitor_downloaded_ids(channel_url):
+    """The set of already-downloaded ids for one channel — read ONCE per channel.
+
+    v1.5.0 passed is_video_downloaded() into the loop, and each call re-read and
+    re-parsed the whole tracker file under a lock: measured at 500 file reads for
+    a 500-video channel, per channel, per tick.
+    """
+    return set(load_downloaded_tracker().get(channel_url, []))
+
+
+def _monitor_queue_depth():
+    """How many downloads are queued or running, so the monitor can stop piling on.
+
+    The executor has 2 workers and an unbounded queue, so nothing else prevents
+    an hourly tick from adding work faster than it drains.
+    """
+    try:
+        active = get_active_downloads() or []
+    except Exception:  # noqa: BLE001
+        return 0
+    return sum(1 for d in active
+               if d.get('status') in ('queued', 'downloading', 'converting'))
+
+
+def _monitor_free_space(path):
+    """Free bytes at a download destination, or None if it can't be determined."""
+    try:
+        target = _resolve_plex_path(path)
+        # Walk up to the nearest existing ancestor: the artist subfolder may not
+        # exist yet, but its parent volume is what we care about.
+        while target and not os.path.isdir(target):
+            parent = os.path.dirname(target)
+            if parent == target:
+                return None
+            target = parent
+        if not target:
+            return None
+        return shutil.disk_usage(target).free
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _monitor_run_retention():
+    """Automatic post-tick sweep across every media root."""
+    config = load_config()
+    result = retention.sweep(config, roots=_gather_media_roots(config), dry_run=False)
+    return result.get('applied') or {}
+
+
 _CHANNEL_MONITOR = scheduler.ChannelMonitor(
     load_config=load_config,
-    list_videos=get_channel_videos,
-    is_downloaded=is_video_downloaded,
+    list_videos=_monitor_list_videos,
+    list_downloaded=_monitor_downloaded_ids,
     start_download=_monitor_start_download,
+    queue_depth=_monitor_queue_depth,
+    free_space=_monitor_free_space,
+    run_retention=_monitor_run_retention,
 )
 
 
@@ -1653,11 +1718,13 @@ def api_monitor_config():
                                               int(data['interval_minutes']))
             except (TypeError, ValueError):
                 return jsonify({'error': 'interval_minutes must be a number'}), 400
-        if 'max_per_channel' in data:
-            try:
-                cfg['max_per_channel'] = max(1, int(data['max_per_channel']))
-            except (TypeError, ValueError):
-                pass
+        for key, minimum in (('max_per_channel', 1), ('max_listing', 1),
+                             ('max_queue_depth', 1), ('min_free_gb', 0)):
+            if key in data:
+                try:
+                    cfg[key] = max(minimum, int(data[key]))
+                except (TypeError, ValueError):
+                    pass
         config['channel_monitor'] = cfg
 
     _update_config(_set)
@@ -1703,6 +1770,11 @@ def api_retention_config():
                 cfg['keep_last_per_artist'] = max(1, int(data['keep_last_per_artist']))
             except (TypeError, ValueError):
                 pass
+        # A second, separate opt-in: 'enabled' allows manual sweeps, 'auto_sweep'
+        # lets the monitor prune unattended. Kept separate so upgrading can never
+        # start deleting media by surprise.
+        if 'auto_sweep' in data:
+            cfg['auto_sweep'] = bool(data['auto_sweep'])
         config['retention'] = cfg
 
     _update_config(_set)
@@ -1714,13 +1786,14 @@ def api_retention_plan():
     """Dry run — what a sweep would delete. Never deletes anything."""
     if 'username' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    result = retention.sweep(load_config(), dry_run=True)
+    cfg = load_config()
+    result = retention.sweep(cfg, roots=_gather_media_roots(cfg), dry_run=True)
     plan = result['plan']
     # Trim the payload: a large library could plan hundreds of deletions and the
     # UI only shows a sample alongside the totals.
     sample = plan['candidates'][:50]
     return jsonify({
-        'root': plan['root'],
+        'roots': plan['roots'],
         'keep_last_per_artist': plan['keep_last_per_artist'],
         'enabled': plan.get('enabled'),
         'artists_scanned': plan['artists_scanned'],
@@ -1750,7 +1823,8 @@ def api_retention_apply():
     if data.get('confirm') != 'DELETE':
         return jsonify({'error': "Refusing to delete without {\"confirm\": \"DELETE\"}"}), 400
 
-    result = retention.sweep(load_config(), dry_run=False)
+    cfg = load_config()
+    result = retention.sweep(cfg, roots=_gather_media_roots(cfg), dry_run=False)
     applied = result['applied'] or {}
     return jsonify({
         'success': not applied.get('error'),
@@ -2387,9 +2461,15 @@ if __name__ == '__main__':
     # effect without a restart. Started here rather than at import so it never
     # runs under the test client or a `python -c "import app"` check.
     _CHANNEL_MONITOR.start()
-    _mon_enabled, _mon_interval, _ = _CHANNEL_MONITOR._settings()
-    print(f'[monitor] channel monitor thread started '
-          f'(enabled={_mon_enabled}, interval={_mon_interval}m)')
+    # status() rather than the private _settings(): this line unpacked
+    # _settings() as a 3-tuple until v1.5.1 turned it into a dict, which
+    # crash-looped the container on startup. Nothing caught it because no test
+    # executes __main__ — only a real container run does.
+    _mon = _CHANNEL_MONITOR.status()
+    print(f"[monitor] channel monitor thread started "
+          f"(enabled={_mon['enabled']}, interval={_mon['interval_minutes']}m, "
+          f"listing={_mon['max_listing']}, queue_limit={_mon['max_queue_depth']}, "
+          f"min_free_gb={_mon['min_free_gb']})")
 
     # debug=True enables Werkzeug's interactive debugger, which lets anyone
     # who can trigger an unhandled exception execute arbitrary Python in the

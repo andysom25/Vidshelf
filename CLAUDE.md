@@ -8,8 +8,63 @@ See [REFERENCE.md](REFERENCE.md) for architecture, file responsibilities, and th
 
 - **`main` is releases-only.** Every commit on `main` should correspond to a tagged release (see `VERSION` file — bump it as part of the merge that cuts a release, following semver: patch for fixes, minor for new features, major for breaking changes).
 - **`dev` is where active work happens.** Day-to-day commits — features, fixes, refactors — go on `dev`, not `main`. Don't push directly to `main` outside of a release merge.
-- **Cutting a release** = merge `dev` → `main`, bump `VERSION`, tag the merge commit (`git tag vX.Y.Z`), push both the branch and the tag, then optionally draft a GitHub Release from that tag.
+- **Cutting a release is automated as of v1.4.0.** Bump `VERSION` on `dev` and merge to `main`; CI tags the release, builds and pushes multi-arch images to `ghcr.io/andysom25/vidshelf`, and creates the GitHub Release. A merge that doesn't change `VERSION` releases nothing, which is what makes docs-only merges to `main` safe. Don't tag by hand — `main` is protected and CI owns the tag.
 - If you're picking up work in this repo and aren't sure which branch you're on, check with `git branch --show-current` before committing — don't assume `main`.
+
+### After a squash merge, realign `dev` onto `main`
+
+This has cost time twice. **Squash-merging a release PR collapses `dev`'s commits
+into one on `main`**, so the same content then exists as different commits on
+each side. `dev` and `main` diverge immediately, and the *next* PR either
+re-lists every already-merged commit or opens as `CONFLICTING`.
+
+Right after a squash merge:
+
+```bash
+git fetch origin
+git diff origin/dev origin/main      # MUST be empty before continuing
+git checkout dev && git reset --hard origin/main
+git push --force-with-lease origin dev
+```
+
+Verify the diff is empty first — that's what makes the reset lossless, since
+main's squash commit already contains everything. If work has already landed on
+`dev` since the merge, rebase it instead: `git reset --hard origin/main` then
+`git cherry-pick <your commits>`.
+
+A regular merge commit (`--no-ff`) avoids this entirely and leaves `dev`
+fast-forwardable, which is why the original convention used it. Either is fine —
+squash just needs this step.
+
+### Every release must carry hand-written release notes
+
+**Create `release-notes/vX.Y.Z.md` as part of the release PR.** CI publishes it
+verbatim via `--notes-file`; if the file is missing it falls back to
+`--generate-notes` and emits a workflow warning. That fallback produces a single
+"Release vX.Y.Z … by @andysom25 in #N" line and nothing else — v1.4.1 and v1.5.0
+both shipped that way before this rule existed, which is exactly what it's here
+to prevent.
+
+Write them for someone upgrading, not for someone reading the diff: what
+changed, what it means for them, whether anything is required of them, and
+whether defaults changed. Lead with anything that alters existing behaviour.
+Group under `##` headings rather than listing commits — the commit list is
+already one click away in the compare link.
+
+### Update the README on any release that changes user-facing behaviour
+
+Not just features: new or changed settings, new endpoints, changed defaults,
+changed deployment or upgrade steps, and removed limitations all belong in the
+README. Two specific traps this has hit before:
+
+- **Stale limitations are worse than missing ones.** "No download scheduling"
+  survived into v1.4.x after it stopped being true, and the Docker volume table
+  documented the pre-v1.1.0 per-file mounts long after that layout was removed
+  for crash-looping fresh installs — actively walking readers into a fixed bug.
+- **Screenshots go stale silently.** A release that adds Settings panels or
+  changes the sidebar makes `screenshots/*.png` wrong with no test to catch it.
+  Recapture the affected ones. `settings.png` in particular changes almost every
+  release.
 
 ## Known gotcha #1: Docker Desktop on Windows cannot bind-mount a network share
 

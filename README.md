@@ -48,7 +48,8 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 ### Automation
 - **Automatic channel monitoring** — checks your channels on a timer and downloads anything new. Channels set to *Manual* are never touched, and videos you already have are always skipped, so "All Videos" won't re-fetch a back catalogue every hour
 - **Notifications** — Discord, Slack, ntfy, Gotify or any JSON webhook, on failed downloads, check results and retention sweeps. Detected from the URL; off by default
-- **Storage retention** — keeps the newest N videos per artist and prunes the rest. Off by default, always previews first, and refuses to run if your media volume looks unmounted
+- **Storage retention** — keeps the newest N videos per artist and prunes the rest, across every configured media root. Off by default, always previews first, refuses to run if a media volume looks unmounted, and can optionally sweep automatically after each check
+- **Brakes on unattended growth** — stop downloading below a free-space floor, skip a check when the download queue is already backed up, and bound how far back each check looks. Channels that keep failing back off instead of retrying every time
 
 ### YouTube Channel Management
 - **Add channels** by URL — automatically fetches the display name
@@ -269,6 +270,30 @@ scratch), and is fully editable from the Settings page. Set
 }
 ```
 
+### Automation settings
+
+All configured from **Settings** (they need to change at runtime), stored in
+`data/config.json` under `channel_monitor`, `notifications` and `retention`.
+Everything here is **off by default**.
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| Check every (minutes) | `60` | How often channels are checked. Floored at 5 |
+| Max new per channel, per check | `5` | So a newly-added channel trickles in rather than flooding the queue |
+| Consider newest N per channel | `50` | How far back a check looks. Lower is faster |
+| Skip check if queue exceeds | `20` | Skips a check entirely when downloads are already backed up |
+| Stop below N GB free | `0` (off) | Stops queuing downloads when the destination is nearly full |
+| Keep newest N per artist | `10` | Retention target, per artist folder, per media root |
+| Automatically prune after each check | off | Second opt-in on top of *Enable retention* |
+
+Two behaviours that surprise people if they don't know them:
+
+- **Videos you already have are never re-downloaded by a check**, even on *All
+  Videos*. That mode only means "ignore history" when *you* trigger it manually.
+- **Pruned videos don't come back.** Retention deletes files but keeps the
+  download history deliberately — otherwise checks would re-fetch exactly what
+  was just pruned, forever. Clearing download history makes them eligible again.
+
 ### Download Modes
 
 | Mode | Behavior |
@@ -302,7 +327,8 @@ scratch), and is fully editable from the Settings page. Set
 1. Set a channel's mode to **New Only** (or **All Videos**) on the Channels page
 2. Go to **Settings** → **Automatic Channel Monitoring**, tick *Enable*, and pick an interval
 3. Optionally set up **Notifications** so you hear about failures without reading logs — paste an ntfy/Discord/Slack/Gotify URL and hit *Send test notification*
-4. If downloads will run unattended for a long time, set up **Storage Retention** — choose how many videos to keep per artist, hit *Preview*, and only then delete
+4. If downloads will run unattended for a long time, set up **Storage Retention** — choose how many videos to keep per artist, hit *Preview*, and only then delete. Once you've seen a preview you trust, **Automatically prune after each check** keeps it bounded without you
+5. Worth setting if you're leaving it alone for weeks: **Stop below N GB free**, so checks stop downloading before the volume fills
 
 Three things worth knowing:
 
