@@ -3695,3 +3695,217 @@ re-run after a fix works.
 Note for future bumps: `dependabot.yml` excludes yt-dlp on purpose, because
 `bump-yt-dlp.yml` already proposes those with a full test run first. Two bots
 on the same line would only conflict.
+
+## ADDED (2026-07-29): unattended monitoring, notifications and retention (v1.5.0)
+
+Closes the gap that made the README's "Sonarr/Radarr for YouTube" framing
+inaccurate: **nothing ran on a schedule.** `download_mode` was read from exactly
+one place — `/api/channels/download-all` — so a channel set to "New Only"
+downloaded nothing until a human clicked a button. The only background thread in
+the app was the artwork watcher.
+
+Three features, shipped together because each one is unsafe without the others:
+monitoring without notifications is automation you can't observe, and monitoring
+without retention fills the disk.
+
+### scheduler.py — ChannelMonitor
+
+A daemon thread on an interval (default 60m, floored at 5m). Collaborators are
+**injected as callables** rather than imported from app.py: app.py imports this
+module, so importing back would be circular, and injection is what lets the
+tests drive it with no Flask, no network and no yt-dlp.
+
+Two behaviours that are deliberate and easy to get wrong:
+
+**Already-downloaded videos are always skipped, regardless of mode.** The manual
+endpoint honours `all` as "fetch up to 20 whether or not we have them" — a
+reasonable thing to ask for by hand and a catastrophic thing to do hourly, since
+it would re-download the same videos forever. On a timer, `all` and `new` behave
+identically. `tests/test_scheduler.py::test_mode_all_still_skips_downloaded_on_a_timer`
+is the guard.
+
+**`manual` channels are never touched.** That mode means "I decide".
+
+The thread always runs; whether a tick *does* anything is decided per-tick from
+config, so toggling it in Settings takes effect without a restart. The wait is
+interruptible (`threading.Event`) so a changed interval or "Check now" applies
+immediately instead of up to an hour later. A per-channel failure is captured
+into that channel's result rather than raised, so one dead channel can't stop
+the others or kill the loop.
+
+Started from `__main__` only, never at import — otherwise `python -c "import app"`
+and the test client would spawn it.
+
+### notify.py
+
+Hand-rolled on `requests` rather than pulling in Apprise. Apprise gives ~80
+targets for one line of config but adds five transitive pins
+(requests-oauthlib, oauthlib, markdown, PyYAML, tzdata) to a project that keeps
+its dependency surface small on purpose and runs its tests with none. Supports
+Discord, Slack, ntfy, Gotify and a generic JSON webhook, with the shape detected
+from the URL. If five targets stops being enough, Apprise is the right upgrade
+and notify.py is the thing to delete.
+
+**No SSRF guard here, deliberately.** artwork_sync.py guards its fetches because
+those hosts arrive from a public search API. This URL is typed in by the admin
+and usually points *into* their own LAN — an ntfy or Gotify container on the same
+host. Refusing private addresses would break the primary use case. Different
+threat model, different answer; recorded here so it doesn't look like an
+oversight.
+
+Two things the tests caught:
+
+- **ntfy puts the title in an HTTP header**, which must be latin-1 encodable.
+  `Björk — Jóga` raised `UnicodeEncodeError` inside requests. Titles are now
+  ASCII-sanitised for that transport only.
+- **Completion notifications are off by default.** A bulk download would emit
+  dozens of messages, which is the fastest route to the user muting the channel
+  and missing the failures that matter.
+
+Every failure is swallowed and logged — a broken webhook must never stop a
+download or wedge the scheduler. The config endpoint **never echoes the URL
+back**, because it usually embeds a secret and the response would land in
+browser history and any intermediate log.
+
+### retention.py
+
+The only code in Vidshelf that deletes media, so it's built to be boring:
+
+- Off by default; `plan()` computes, `apply()` only ever acts on a plan.
+- `keep_last` floored at 1 — no configuration empties a folder.
+- Video extensions only, so artwork, `artist-metadata.json` and
+  `title-cards.json` are never candidates and pruning can't break the Plex
+  integration.
+- A sweep over `SAFETY_MAX_DELETIONS` (200) refuses and asks.
+- `apply()` refuses a plan carrying an error, so a caller can't execute a
+  refused sweep by ignoring the field.
+- The API requires `{"confirm": "DELETE"}`. Not a security control — the session
+  already authenticates the admin — but friction on the one irreversible
+  endpoint is worth it.
+
+**It refuses to sweep a media root with no artist folders.** That guard exists
+because of the decoy-volume incident in CLAUDE.md: a network path that silently
+resolved to a small local directory instead of the NAS. Deleting based on what a
+*wrong* mount contains is the one failure here that isn't recoverable. Verified
+live — in a container with no NAS mounted, the plan endpoint refuses with a
+pointer to `df -h` rather than reporting a clean sweep.
+
+**Tracker entries are never removed.** `downloaded_videos.json` records "we
+downloaded this", not "the file is present". Clearing entries would make the
+scheduler re-download every pruned video on the next tick, prune it again, and
+loop forever. Files go; history stays. `tests/test_invariants.py` asserts
+retention.py contains no executable reference to the tracker at all.
+
+The visible consequence is intended: a pruned video does not come back on its
+own. Clearing download history is what makes it eligible again.
+
+### Verified live in a container
+
+| check | result |
+| --- | --- |
+| monitor thread starts, stays inert while disabled | `enabled=False, thread_alive=True, ticks=0` |
+| interval clamped, not rejected | requested 1m -> 5m |
+| retention refuses an unmounted-looking root | refused, with a `df -h` pointer |
+| `POST /api/retention/apply` without confirm | HTTP 400 |
+| webhook secret in the config response | not present; kind detected as `discord` |
+| "Check now" with no channels | 200, empty results |
+
+### Tests
+
+`tests/test_scheduler.py` (16) and `tests/test_notify.py` (19), both
+dependency-free and network-free. Route tests gained three: retention refusing
+un-confirmed deletion, the notification URL not being echoed, and the monitor
+interval being clamped.
+
+### Test coverage: measured, then targeted (2026-07-29)
+
+Measured with `coverage` (installed locally, deliberately **not** added to
+requirements.txt — that stays runtime-only and the suites stay dependency-free).
+
+Starting point was **28%**, which is a misleading number on its own. The useful
+question isn't "what percentage is covered" but "can the failures this project
+has actually suffered recur without CI noticing". For the worst of them the
+answer was yes:
+
+| Module | Before | After |
+| --- | --- | --- |
+| `notify.py` | 25% | **95%** |
+| `transcode.py` | 30% | **50%** |
+| `artwork_sync.py` | 11% | 15% |
+| `app.py` | 30% | 33% |
+| `state.py` / `updates.py` / `retention.py` / `scheduler.py` | 71-80% | unchanged |
+| `downloader.py` | 23% | 23% |
+| **Total** | **28%** | **33%** |
+
+`downloader.py` staying at 23% is deliberate — see below.
+
+#### The gap that mattered: an invariant, not coverage
+
+`downloader.py`'s uncovered lines include the `copyfileobj` copy. All three copy
+sites were **correct**, but nothing enforced it: someone "simplifying" one back
+to `shutil.copy2` would break nothing in CI, because that bug only manifests
+against a real CIFS mount. It cost two debugging sessions and appeared fixed
+twice (CLAUDE.md gotcha #2).
+
+Raising `downloader.py`'s line coverage would not have caught that. What catches
+it is `tests/test_invariants.py`, which asserts on the **source text**:
+
+- no `shutil.copy/copy2/copyfile` in executable code, and each copy site still
+  contains a `copyfileobj`
+- state files opened only by `state.py`
+- `PYTHONUNBUFFERED=1` still in the Dockerfile
+- compose mounts `./data`, not individual JSON files
+- `app.run()` reachable only under the `debug_mode` branch
+- GHCR image name lowercase and not derived from `${{ github.repository }}`
+- `retention.py` contains no executable reference to the download tracker
+
+Asserting on source text is unusual and the justification is narrow: these
+failures only appear against a real CIFS mount, a real container restart, or a
+real GHCR push, so no functional test reaches them. An invariant that fails in
+CI beats a comment nobody reads at the moment they change the line. Each check
+was verified to actually fire by feeding the checker a synthetic violation —
+`shutil.copy2(a, b)` and a bare `open('config.json', 'w')` were both caught.
+
+#### tests/test_media.py — the four measured gaps
+
+`transcode.needs_conversion` (ffprobe replaced with canned JSON): AV1 and VP9
+need conversion, `.webm`/`.mkv` do too even with compatible codecs, `.MP4`
+uppercase does **not**, a silent video is left alone, and an unprobeable file is
+left alone rather than fed into a re-encode on a guess.
+
+`artwork_sync._is_safe_download_url` — a security control that had **zero
+tests** at 11% coverage. Now covers non-http schemes, loopback (v4 and v6),
+all three RFC1918 ranges, the `169.254.169.254` cloud-metadata address, a host
+resolving to *both* a public and a private address (must reject), unresolvable
+hosts, and a URL with no host. DNS is stubbed, so no network.
+
+`_clean_video_title` / `folder_to_artist` — pure string functions whose edge
+cases have already caused bugs (the stylized-quote incident). Covers YouTube-ID
+stripping, "(Official … Video)" boilerplate, preserving meaningful
+parentheticals like "(US Version)", en/em dash normalisation, and never
+returning empty.
+
+`app._sanitize_folder_name` — invalid-character stripping, separator collapsing,
+and trailing dot/space removal (Windows and SMB reject those).
+
+#### Two expectations that were wrong, and one thing deliberately not fixed
+
+`_clean_video_title('---')` returns `'--'`. The contract guards *empty or
+identical*, and `'--'` is neither, so that's correct behaviour and the test was
+over-specified. It now asserts non-emptiness, which is the invariant that
+matters.
+
+`_sanitize_folder_name('///???')` returns `'_'`. Two different all-punctuation
+names would therefore collide on one folder. **Left as-is on purpose**: real
+artist names contain letters, and changing this function's output would orphan
+every folder created by an earlier version — the app would create duplicates
+alongside the originals. Folder-name stability is worth more than tidying a
+degenerate case. The test documents that rather than asserting a fix.
+
+#### Where to stop
+
+`artwork_sync.py`'s remaining ~1,000 uncovered statements are mostly Plex and
+artwork-provider HTTP calls, where mocking costs more than it protects. The pure
+functions inside it are now covered; the I/O is better verified by an actual
+sync against a real Plex server, which is what the manual Settings actions are
+for.

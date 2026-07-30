@@ -73,6 +73,10 @@ def test_routes_are_registered():
         '/api/downloads/progress', '/api/downloads/clear',
         '/api/system/health', '/api/system/version',
         '/api/plex/libraries',
+        # v1.5.0 — unattended monitoring, notifications, retention
+        '/api/monitor/status', '/api/monitor/config', '/api/monitor/run',
+        '/api/notifications/config', '/api/notifications/test',
+        '/api/retention/config', '/api/retention/plan', '/api/retention/apply',
     ]
     missing = [p for p in expected if p not in paths]
     assert not missing, f'routes disappeared: {missing}'
@@ -180,6 +184,49 @@ def test_static_assets_are_served_and_non_empty():
         body = resp.get_data(as_text=True)
         assert len(body) > 1000, f'{path} is suspiciously small ({len(body)} bytes)'
         assert needle in body, f'{path} does not contain expected content ({needle!r})'
+
+
+def test_retention_apply_refuses_without_explicit_confirmation():
+    """The only irreversible endpoint in the app must not fire on a bare POST.
+
+    The confirm token isn't a security control — the session already
+    authenticates the admin — it's there so a stray request or a mis-wired
+    button can't delete media.
+    """
+    client = _client(authenticated=True)
+    assert client.post('/api/retention/apply', json={}).status_code == 400
+    assert client.post('/api/retention/apply', json={'confirm': 'yes'}).status_code == 400
+    assert client.post('/api/retention/apply', json={'confirm': 'delete'}).status_code == 400
+
+
+def test_notification_config_never_echoes_the_url_back():
+    """The webhook URL usually embeds a secret; the response must not carry it.
+
+    It would otherwise land in browser history and any intermediate request log.
+    """
+    client = _client(authenticated=True)
+    secret = 'https://discord.com/api/webhooks/123/SUPERSECRETTOKENVALUE'
+    resp = client.post('/api/notifications/config',
+                       json={'enabled': True, 'url': secret})
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert 'SUPERSECRETTOKENVALUE' not in body, 'full webhook URL echoed in the response'
+    payload = resp.get_json()['notifications']
+    assert payload['url_set'] is True
+    assert payload['detected_kind'] == 'discord'
+
+
+def test_monitor_settings_round_trip_and_floor_the_interval():
+    client = _client(authenticated=True)
+    resp = client.post('/api/monitor/config',
+                       json={'enabled': True, 'interval_minutes': 1, 'max_per_channel': 3})
+    assert resp.status_code == 200
+    status = resp.get_json()['status']
+    assert status['enabled'] is True
+    # A too-short interval is clamped rather than accepted, so a typo can't
+    # hammer YouTube every minute.
+    assert status['interval_minutes'] >= 5, status['interval_minutes']
+    assert status['max_per_channel'] == 3
 
 
 def test_config_post_preserves_internal_keys():
