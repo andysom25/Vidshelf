@@ -65,6 +65,11 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 - **Quality labels** — each result shows the best available resolution (4K, 1440p, 1080p, 720p)
 - **Automatic artist matching** — searching "Artist + Song" to narrow results won't fork a duplicate artist folder/collection if that artist is already tracked
 
+### Download Control
+- **Cancel** a queued or running download, and **retry** anything that failed or was cancelled — from the Downloads page
+- **Per-channel quality cap** — best available, 4K, 1440p, 1080p or 720p, set per channel so one 4K publisher doesn't force a global downgrade
+- **Cookies support** — drop a yt-dlp `cookies.txt` into `data/` for age-restricted and members-only videos. Settings → System Health shows whether it was found
+
 ### Download Format & Quality
 - Downloads the **best available quality** — 4K, 1080p60, 1440p, etc.
 - **Automatic Plex-compatibility conversion** — prefers a native H.264/AAC stream at download time; if YouTube only offers something else (commonly VP9/AV1 + Opus for 4K or older uploads), converts to H.264/AAC/MP4 afterward so the widest range of Plex clients can direct-play it without server-side transcoding. Already-compatible tracks are stream-copied (no quality loss); only genuinely incompatible video gets re-encoded, at a high-quality setting chosen to be visually indistinguishable from the source.
@@ -286,6 +291,12 @@ Everything here is **off by default**.
 | Keep newest N per artist | `10` | Retention target, per artist folder, per media root |
 | Automatically prune after each check | off | Second opt-in on top of *Enable retention* |
 
+Set per channel on the **Channels** page rather than here:
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| Max | Best available | Caps the resolution downloaded from that channel. Applies to every fallback, so a 1080p cap can't be overridden by a channel that only publishes 4K AV1 |
+
 Two behaviours that surprise people if they don't know them:
 
 - **Videos you already have are never re-downloaded by a check**, even on *All
@@ -359,6 +370,9 @@ Three things worth knowing:
 | `/api/downloads/progress` | GET | Real-time download/conversion status |
 | `/api/downloads/verify` | POST | Verify downloaded files exist at their final destination |
 | `/api/downloads/clear` | POST | Clear download history |
+| `/api/downloads/<id>/cancel` | POST | Cancel a queued or running download |
+| `/api/downloads/<id>/retry` | POST | Re-queue a failed or cancelled download |
+| `/api/channels/quality` | POST | `{url, max_height}` — cap a channel's resolution (0 clears) |
 
 </details>
 

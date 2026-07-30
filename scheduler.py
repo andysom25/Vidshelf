@@ -125,6 +125,19 @@ class ChannelMonitor:
             'min_free_gb': _int('min_free_gb', DEFAULT_MIN_FREE_GB, 0),
         }
 
+    def pending_count(self):
+        """Videos seen on monitored channels that haven't been downloaded.
+
+        Recorded per tick so the dashboard can show something meaningful instead
+        of the download count twice. Returns None when no check has run yet —
+        reporting 0 would claim "nothing new" when the truth is "not looked".
+        """
+        with self._lock:
+            results = self._state.get('last_results') or []
+            if not self._state.get('last_run'):
+                return None
+            return sum(r.get('pending', 0) for r in results)
+
     def status(self):
         with self._lock:
             state = dict(self._state)
@@ -193,7 +206,7 @@ class ChannelMonitor:
             if not url:
                 continue
 
-            entry = {'channel': url, 'found': 0, 'started': 0,
+            entry = {'channel': url, 'found': 0, 'started': 0, 'pending': 0,
                      'error': None, 'skipped': None}
 
             if not ignore_backoff and self._should_skip_for_backoff(url):
@@ -207,6 +220,10 @@ class ChannelMonitor:
 
                 # One tracker read per channel rather than one per video.
                 already = self._list_downloaded(url) or set()
+                # Everything in the (bounded) listing we don't already have —
+                # what the dashboard's "New Available" card reports.
+                entry['pending'] = sum(1 for v in videos
+                                       if v.get('id') and v['id'] not in already)
 
                 dest = channel.get('plex_media_path')
                 low, free = self._space_is_low(dest, settings)

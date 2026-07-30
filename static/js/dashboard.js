@@ -171,7 +171,11 @@
                     document.getElementById('stat-channels').textContent = channelCount;
                 }
                 if (statsData.videos_count !== undefined) {
-                    document.getElementById('stat-videos').textContent = statsData.videos_count;
+                    // null means no automatic check has run yet, which is not
+                    // the same as "nothing new" — show a dash rather than 0.
+                    const pending = statsData.new_available;
+                    document.getElementById('stat-videos').textContent =
+                        (pending === null || pending === undefined) ? '--' : pending;
                 }
                 if (statsData.downloads_count !== undefined) {
                     downloadsCount = statsData.downloads_count;
@@ -314,6 +318,14 @@
                                     <option value="all" ${mode === 'all' ? 'selected' : ''}>📥 All Videos</option>
                                 </select>
                                 <span style="font-size:0.72em;padding:2px 8px;border-radius:4px;background:${modeColor}22;color:${modeColor};border:1px solid ${modeColor}44;">${modeLabel}</span>
+                                <span style="font-size:0.78em;color:#9090a0;margin-left:6px;">Max:</span>
+                                <select onchange="changeChannelQuality('${ch.url}', this.value)" style="padding:4px 8px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e0e0e0;font-size:0.8em;" title="Cap the resolution downloaded from this channel">
+                                    <option value="0" ${!ch.max_height ? 'selected' : ''}>Best available</option>
+                                    <option value="2160" ${ch.max_height == 2160 ? 'selected' : ''}>4K (2160p)</option>
+                                    <option value="1440" ${ch.max_height == 1440 ? 'selected' : ''}>1440p</option>
+                                    <option value="1080" ${ch.max_height == 1080 ? 'selected' : ''}>1080p</option>
+                                    <option value="720" ${ch.max_height == 720 ? 'selected' : ''}>720p</option>
+                                </select>
                             </div>
                             <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
                                 <button class="btn btn-primary btn-sm" onclick="loadChannelVideos('${ch.url}')">📋 List Videos</button>
@@ -330,6 +342,21 @@
                     '<div class="empty-state"><div class="empty-icon">⚠️</div>'
                     + '<p>Couldn\'t load channels — ' + escapeHtml(describeFetchError(e)) + '.</p>'
                     + '<button class="btn btn-secondary" onclick="loadChannels()">Retry</button></div>';
+            }
+        }
+
+        async function changeChannelQuality(url, value) {
+            try {
+                const resp = await fetch('/api/channels/quality', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url, max_height: parseInt(value, 10) || 0 })
+                });
+                const data = await resp.json();
+                if (data.error) { showToast('❌ ' + data.error, 'error'); return; }
+                showToast('✅ ' + data.message, 'success');
+            } catch (e) {
+                showToast('❌ Could not save quality setting', 'error');
             }
         }
 
@@ -483,6 +510,7 @@
                             ${finalStatusHtml}
                             ${finalPathHtml}
                             <div style="font-size:0.72em;color:#505060;margin-top:4px;">${d.video_id} • ${formatTime(d.started_at)}</div>
+                            ${downloadActions(d)}
                         </div>`;
                 });
                 html += '</div>';
@@ -492,13 +520,58 @@
             }
         }
 
+        // Cancel while it's in flight, retry once it isn't. Deliberately no
+        // action on a completed download — re-downloading something you already
+        // have is what the channel pages are for.
+        function downloadActions(d) {
+            const btn = (label, fn, danger) =>
+                `<button class="btn btn-sm" style="margin-top:8px;${danger
+                    ? 'background:rgba(220,53,69,0.12);color:#f8a5b0;border:1px solid rgba(220,53,69,0.28);'
+                    : 'background:rgba(255,255,255,0.06);color:#9090a0;border:1px solid rgba(255,255,255,0.12);'}"`
+                + ` onclick="${fn}('${d.download_id}')">${label}</button>`;
+            if (['queued', 'downloading', 'converting'].includes(d.status)) {
+                return btn('⃠ Cancel', 'cancelDownload', true);
+            }
+            if (['error', 'cancelled'].includes(d.status)) {
+                return btn('↻ Retry', 'retryDownload', false);
+            }
+            return '';
+        }
+
+        async function cancelDownload(id) {
+            try {
+                const resp = await fetchWithTimeout(`/api/downloads/${encodeURIComponent(id)}/cancel`,
+                                                    { method: 'POST' }, 15000);
+                const data = await resp.json();
+                showToast(data.success ? '⃠ ' + data.detail : '❌ ' + (data.detail || data.error),
+                          data.success ? 'success' : 'error');
+                loadDownloads();
+            } catch (e) {
+                showToast('❌ ' + describeFetchError(e), 'error');
+            }
+        }
+
+        async function retryDownload(id) {
+            try {
+                const resp = await fetchWithTimeout(`/api/downloads/${encodeURIComponent(id)}/retry`,
+                                                    { method: 'POST' }, 15000);
+                const data = await resp.json();
+                showToast(data.success ? '↻ ' + data.message : '❌ ' + (data.error || 'Retry failed'),
+                          data.success ? 'success' : 'error');
+                loadDownloads();
+            } catch (e) {
+                showToast('❌ ' + describeFetchError(e), 'error');
+            }
+        }
+
         function getStatusBadge(status) {
             const badges = {
                 'queued': '<span style="font-size:0.72em;padding:3px 10px;border-radius:4px;background:rgba(23,162,184,0.15);color:#8dd7e5;border:1px solid rgba(23,162,184,0.25);white-space:nowrap;">⏳ Queued</span>',
                 'downloading': '<span style="font-size:0.72em;padding:3px 10px;border-radius:4px;background:rgba(233,69,96,0.15);color:#e94560;border:1px solid rgba(233,69,96,0.25);white-space:nowrap;">⬇ Downloading</span>',
                 'converting': '<span style="font-size:0.72em;padding:3px 10px;border-radius:4px;background:rgba(233,196,106,0.15);color:#e9c46a;border:1px solid rgba(233,196,106,0.25);white-space:nowrap;">⚙️ Converting</span>',
                 'completed': '<span style="font-size:0.72em;padding:3px 10px;border-radius:4px;background:rgba(40,167,69,0.15);color:#7ddf90;border:1px solid rgba(40,167,69,0.25);white-space:nowrap;">✅ Completed</span>',
-                'error': '<span style="font-size:0.72em;padding:3px 10px;border-radius:4px;background:rgba(220,53,69,0.15);color:#f8a5b0;border:1px solid rgba(220,53,69,0.25);white-space:nowrap;">❌ Error</span>'
+                'error': '<span style="font-size:0.72em;padding:3px 10px;border-radius:4px;background:rgba(220,53,69,0.15);color:#f8a5b0;border:1px solid rgba(220,53,69,0.25);white-space:nowrap;">❌ Error</span>',
+                'cancelled': '<span style="font-size:0.72em;padding:3px 10px;border-radius:4px;background:rgba(255,255,255,0.06);color:#9090a0;border:1px solid rgba(255,255,255,0.12);white-space:nowrap;">⃠ Cancelled</span>'
             };
             return badges[status] || `<span style="font-size:0.72em;padding:3px 10px;border-radius:4px;background:rgba(255,255,255,0.06);color:#9090a0;white-space:nowrap;">${status}</span>`;
         }
@@ -1998,17 +2071,26 @@ async function findPlexLibraries() {
                     { key: 'ffprobe', label: 'ffprobe', why: 'checking video/audio codecs for format conversion' },
                     { key: 'pillow', label: 'Pillow', why: 'generating per-video title-card posters' },
                     { key: 'fonts', label: 'DejaVu fonts', why: 'legible text on title-card posters (falls back to a tiny bitmap font without it)' },
+                    // Optional, so a missing cookies file is informational
+                    // rather than a failure — but it must be visible, because
+                    // its absence only shows up as unexplained download errors.
+                    { key: 'cookies', label: 'YouTube cookies', why: 'age-restricted and members-only videos', optional: true },
                 ];
 
                 let html = '';
                 rows.forEach(r => {
                     const info = data[r.key] || {};
-                    const ok = !!info.found;
-                    const icon = ok ? '✅' : '❌';
-                    const color = ok ? '#7ddf90' : '#f8a5b0';
+                    // 'found' for dependency probes, 'available' for optional
+                    // extras like the cookies file.
+                    const ok = !!(info.found || info.available);
+                    // A missing optional item is information, not a fault —
+                    // painting it red would imply something is broken.
+                    const icon = ok ? '✅' : (r.optional ? 'ℹ️' : '❌');
+                    const color = ok ? '#7ddf90' : (r.optional ? '#9090a0' : '#f8a5b0');
                     let detail = ok ? 'found' : 'not found';
                     if (ok && info.version) detail = `v${escapeHtml(info.version)}`;
-                    if (ok && info.path) detail += ` <span style="color:#606070;">(${escapeHtml(info.path)})</span>`;
+                    if (info.detail) detail = escapeHtml(info.detail);
+                    if (ok && info.path && !info.detail) detail += ` <span style="color:#606070;">(${escapeHtml(info.path)})</span>`;
                     html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(255,255,255,0.03);border-radius:6px;">
                         <div>
                             <span style="color:${color};">${icon}</span>

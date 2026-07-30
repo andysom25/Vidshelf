@@ -38,6 +38,7 @@ jobs:
           python tests/test_scheduler.py
           python tests/test_notify.py
           python tests/test_media.py
+          python tests/test_downloads.py
           # Source-level invariants for bugs that only manifest against a real
           # CIFS mount or container restart, so nothing else can catch them.
           python tests/test_invariants.py

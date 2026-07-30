@@ -186,6 +186,59 @@ def test_static_assets_are_served_and_non_empty():
         assert needle in body, f'{path} does not contain expected content ({needle!r})'
 
 
+def test_v160_endpoints_are_registered_and_guarded():
+    client = _client(authenticated=True)
+    # Cancel/retry on an unknown id must report, not 500.
+    assert client.post('/api/downloads/nope/cancel').status_code in (409, 404)
+    assert client.post('/api/downloads/nope/retry').status_code == 404
+    # Quality cap on an unknown channel.
+    assert client.post('/api/channels/quality',
+                       json={'url': 'https://nope', 'max_height': 1080}).status_code == 404
+    assert client.post('/api/channels/quality',
+                       json={'url': 'x', 'max_height': 'tall'}).status_code == 400
+
+
+def test_v160_endpoints_reject_anonymous_callers():
+    """These mutate state and one of them starts a download, so the auth check
+    matters more than for a read-only route."""
+    client = _client(authenticated=False)
+    for path in ('/api/downloads/x/cancel', '/api/downloads/x/retry',
+                 '/api/channels/quality'):
+        assert client.post(path).status_code == 401, path
+
+
+def test_stats_no_longer_reports_the_download_count_twice():
+    """The v1.5.x bug: videos_count and downloads_count came from the identical
+    expression, so two dashboard cards always showed the same number."""
+    client = _client(authenticated=True)
+    state.write_json(app_module.TRACKER_FILE,
+                     {'https://c': ['a', 'b', 'c']}, indent=2)
+    stats = client.get('/api/stats').get_json()
+    assert stats['downloads_count'] == 3, stats
+    # No check has run, so "new available" is unknown rather than 0 — claiming 0
+    # would assert "nothing new" when the truth is "haven't looked".
+    assert stats['new_available'] is None, stats
+
+
+def test_downloads_page_offers_cancel_and_retry():
+    client = _client(authenticated=True)
+    js = client.get('/static/js/dashboard.js').get_data(as_text=True)
+    for fn in ['function downloadActions', 'async function cancelDownload',
+               'async function retryDownload']:
+        assert fn in js, f'missing handler: {fn}'
+    assert "'cancelled':" in js, 'no cancelled status badge'
+    # And the channel quality selector.
+    assert 'function changeChannelQuality' in js
+    assert 'changeChannelQuality(' in js
+
+
+def test_beta_badge_is_gone():
+    """It said "beta" while shipping v1.5.1 with published images and CI."""
+    html = _client(authenticated=True).get('/dashboard').get_data(as_text=True)
+    assert '<span>beta</span>' not in html
+    assert 'New Available' in html, 'stat card not relabelled'
+
+
 def test_automation_settings_controls_are_present_and_wired():
     """The monitoring/retention panels span template, CSS and JS.
 

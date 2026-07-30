@@ -65,8 +65,54 @@ def _update_progress(download_id, **kwargs):
             data[download_id].update(kwargs)
             _save_active(data)
 
+class DownloadCancelled(Exception):
+    """Raised from inside the yt-dlp progress hook to abort a running download.
+
+    yt-dlp has no cancel API — the documented way to stop a download in flight
+    is to raise from a progress hook, which unwinds its internals cleanly and
+    leaves the partial .part file for yt-dlp itself to clean up. Cancellation is
+    therefore cooperative: it takes effect at the next progress callback, which
+    for an active download is well under a second.
+    """
+
+
+def request_cancel(download_id):
+    """Mark a download cancelled. Returns False if it is already finished.
+
+    Setting a flag rather than killing a thread: a half-written file moved onto
+    a network share is exactly the kind of mess this codebase has been bitten by
+    before, so the download unwinds through its own error path instead.
+    """
+    with _lock:
+        data = _load_active()
+        entry = data.get(download_id)
+        if not entry:
+            return False, 'Unknown download'
+        if entry.get('status') in ('completed', 'error', 'cancelled'):
+            return False, f"Already {entry.get('status')}"
+        entry['cancel_requested'] = True
+        # Reflected immediately so the UI acknowledges the click even while a
+        # queued item waits for a worker.
+        if entry.get('status') == 'queued':
+            entry['status'] = 'cancelled'
+            entry['error'] = 'Cancelled before it started'
+            entry['completed_at'] = time.time()
+        _save_active(data)
+        return True, 'Cancellation requested'
+
+
+def is_cancelled(download_id):
+    with _lock:
+        entry = _load_active().get(download_id) or {}
+        return bool(entry.get('cancel_requested'))
+
+
 def _progress_hook(download_id):
     def hook(d):
+        # Checked on every callback so a cancel lands promptly rather than at
+        # the end of the file.
+        if is_cancelled(download_id):
+            raise DownloadCancelled(download_id)
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
             downloaded = d.get('downloaded_bytes', 0)
@@ -92,7 +138,36 @@ def _progress_hook(download_id):
             )
     return hook
 
-def download_video(video_id, download_path, plex_media_path, title='Unknown', channel_url='', download_id=None):
+def build_format_selector(max_height=None):
+    """yt-dlp format string, optionally capped at a vertical resolution.
+
+    Prefers a native H.264 (avc1) + AAC (mp4a) stream — the format virtually
+    every Plex client direct-plays with no server-side transcoding. Falls back to
+    the best available (often VP9/AV1 + Opus for 4K or older uploads with no
+    native H.264 option) only when no compatible stream exists; transcode.py
+    fixes that up afterwards rather than silently shipping something
+    incompatible.
+
+    `max_height` caps every branch. Without it, monitoring a 4K channel
+    unattended means 4K files whether or not that's wanted — which costs disk and
+    a CPU-heavy re-encode per file. The cap is applied to the fallbacks too, so
+    asking for 1080p can't be quietly overridden by a channel that only offers
+    AV1 at 2160p.
+    """
+    try:
+        cap = int(max_height) if max_height else 0
+    except (TypeError, ValueError):
+        cap = 0
+    h = f'[height<={cap}]' if cap > 0 else ''
+    return (
+        f'bestvideo[vcodec^=avc1]{h}+bestaudio[acodec^=mp4a]/'
+        f'best[vcodec^=avc1]{h}/'
+        f'bestvideo{h}+bestaudio/'
+        f'best{h}/best'
+    )
+
+
+def download_video(video_id, download_path, plex_media_path, title='Unknown', channel_url='', download_id=None, max_height=None, cookies_file=None):
     """Download a video with progress tracking. Runs synchronously but updates progress file."""
     if download_id is None:
         download_id = f"{video_id}_{int(time.time())}"
@@ -105,14 +180,7 @@ def download_video(video_id, download_path, plex_media_path, title='Unknown', ch
 
     ydl_opts = {
         'outtmpl': os.path.join(download_path, '%(title)s-%(id)s.%(ext)s'),
-        # Prefer a native H.264 (avc1) + AAC (mp4a) stream — the format most
-        # Plex clients can direct-play with no server-side transcoding.
-        # Falls back to the best available (often VP9/AV1 + Opus, e.g. for
-        # 4K or older uploads with no native H.264 option) only when no
-        # compatible stream exists; transcode.py fixes that up after
-        # download instead of silently shipping an incompatible file.
-        'format': ('bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/'
-                   'best[vcodec^=avc1]/bestvideo+bestaudio/best'),
+        'format': build_format_selector(max_height),
         'merge_output_format': 'mp4',
         'quiet': False, # Set quiet to False for debugging
         'no_warnings': False, # Set no_warnings to False for debugging
@@ -120,6 +188,13 @@ def download_video(video_id, download_path, plex_media_path, title='Unknown', ch
     }
     if ffmpeg_bin:
         ydl_opts['ffmpeg_location'] = ffmpeg_bin
+
+    # Cookies unlock age-restricted and members-only content. The file existed
+    # in this repo (gitignored) since long before this, but nothing ever passed
+    # it to yt-dlp — so those downloads simply failed with no indication why.
+    if cookies_file and os.path.isfile(cookies_file):
+        ydl_opts['cookiefile'] = cookies_file
+        print(f'DEBUG: using cookies from {cookies_file}')
     try:
         print(f"DEBUG: download_video called with download_path='{download_path}', plex_media_path='{plex_media_path}'")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -207,6 +282,13 @@ def download_video(video_id, download_path, plex_media_path, title='Unknown', ch
 
         _update_progress(download_id, status='completed', progress=100, completed_at=time.time())
     except Exception as e:
+        # A cancellation is not a failure: it must not be recorded as an error,
+        # and above all must not fire a "download failed" notification for
+        # something the user asked to stop.
+        if isinstance(e, DownloadCancelled) or is_cancelled(download_id):
+            _update_progress(download_id, status='cancelled',
+                             error='Cancelled', completed_at=time.time())
+            raise DownloadCancelled(download_id) from None
         _update_progress(download_id, status='error', error=str(e), completed_at=time.time())
         raise
 
