@@ -11,6 +11,31 @@ See [REFERENCE.md](REFERENCE.md) for architecture, file responsibilities, and th
 - **Cutting a release is automated as of v1.4.0.** Bump `VERSION` on `dev` and merge to `main`; CI tags the release, builds and pushes multi-arch images to `ghcr.io/andysom25/vidshelf`, and creates the GitHub Release. A merge that doesn't change `VERSION` releases nothing, which is what makes docs-only merges to `main` safe. Don't tag by hand — `main` is protected and CI owns the tag.
 - If you're picking up work in this repo and aren't sure which branch you're on, check with `git branch --show-current` before committing — don't assume `main`.
 
+### After a squash merge, realign `dev` onto `main`
+
+This has cost time twice. **Squash-merging a release PR collapses `dev`'s commits
+into one on `main`**, so the same content then exists as different commits on
+each side. `dev` and `main` diverge immediately, and the *next* PR either
+re-lists every already-merged commit or opens as `CONFLICTING`.
+
+Right after a squash merge:
+
+```bash
+git fetch origin
+git diff origin/dev origin/main      # MUST be empty before continuing
+git checkout dev && git reset --hard origin/main
+git push --force-with-lease origin dev
+```
+
+Verify the diff is empty first — that's what makes the reset lossless, since
+main's squash commit already contains everything. If work has already landed on
+`dev` since the merge, rebase it instead: `git reset --hard origin/main` then
+`git cherry-pick <your commits>`.
+
+A regular merge commit (`--no-ff`) avoids this entirely and leaves `dev`
+fast-forwardable, which is why the original convention used it. Either is fine —
+squash just needs this step.
+
 ### Every release must carry hand-written release notes
 
 **Create `release-notes/vX.Y.Z.md` as part of the release PR.** CI publishes it
