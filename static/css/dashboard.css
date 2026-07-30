@@ -684,6 +684,16 @@ body {
     outline: none;
     border-color: #e94560;
 }
+/* Checkboxes and radios must not inherit the width:100% above. Stretching a
+   checkbox to the panel width leaves the box on the far left with its label
+   marooned across the other side — which is exactly how the v1.5.0
+   notification event list rendered until this was added. */
+.form-group input[type="checkbox"],
+.form-group input[type="radio"] {
+    width: auto;
+    flex: none;
+    margin: 0;
+}
 .artwork-result-grid {
     display: flex;
     flex-wrap: wrap;

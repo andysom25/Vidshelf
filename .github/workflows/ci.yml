@@ -206,7 +206,21 @@ jobs:
           V: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          gh release create "v$V" \
-            --title "v$V" \
-            --generate-notes \
-            $([ "${{ needs.version.outputs.is_newest }}" = "true" ] || echo "--latest=false")
+          LATEST_FLAG=""
+          [ "${{ needs.version.outputs.is_newest }}" = "true" ] || LATEST_FLAG="--latest=false"
+
+          # Prefer hand-written notes. Automated releases used --generate-notes,
+          # which produces a single PR link — v1.4.1 and v1.5.0 shipped with
+          # notes that said nothing about what changed. Authoring
+          # release-notes/vX.Y.Z.md as part of the release PR means CI publishes
+          # the real thing, and the fallback keeps releases working if the file
+          # is ever missing.
+          NOTES="release-notes/v$V.md"
+          if [ -f "$NOTES" ]; then
+            echo "Publishing hand-written notes from $NOTES"
+            gh release create "v$V" --title "v$V" --notes-file "$NOTES" $LATEST_FLAG
+          else
+            echo "::warning::$NOTES not found — falling back to auto-generated notes."
+            echo "::warning::Add release-notes/v$V.md in the release PR for a proper changelog."
+            gh release create "v$V" --title "v$V" --generate-notes $LATEST_FLAG
+          fi

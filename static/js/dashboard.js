@@ -1704,6 +1704,9 @@ async function findPlexLibraries() {
                 if (en) en.checked = !!s.enabled;
                 setVal('monitor-interval', s.interval_minutes);
                 setVal('monitor-max', s.max_per_channel);
+                setVal('monitor-listing', s.max_listing);
+                setVal('monitor-queue', s.max_queue_depth);
+                setVal('monitor-freegb', s.min_free_gb);
 
                 const parts = [];
                 parts.push(s.enabled
@@ -1712,6 +1715,12 @@ async function findPlexLibraries() {
                 parts.push(`last check: ${escapeHtml(fmtWhen(s.last_run))}`);
                 if (s.last_run) {
                     parts.push(`${s.checked_channels} channel(s) checked, ${s.started_downloads} queued`);
+                }
+                // A skipped tick (full queue, low disk) is otherwise invisible —
+                // the user would see "last check: <time>, 0 queued" and assume
+                // there was nothing new.
+                if (s.last_skip_reason) {
+                    parts.push(`<span style="color:#f0c674;">skipped: ${escapeHtml(s.last_skip_reason)}</span>`);
                 }
                 if (s.last_error) {
                     parts.push(`<span style="color:#f8a5b0;">last error: ${escapeHtml(s.last_error)}</span>`);
@@ -1738,6 +1747,11 @@ async function findPlexLibraries() {
                 enabled: document.getElementById('monitor-enabled').checked,
                 interval_minutes: parseInt(document.getElementById('monitor-interval').value, 10) || 60,
                 max_per_channel: parseInt(document.getElementById('monitor-max').value, 10) || 5,
+                max_listing: parseInt(document.getElementById('monitor-listing').value, 10) || 50,
+                max_queue_depth: parseInt(document.getElementById('monitor-queue').value, 10) || 20,
+                // 0 is meaningful here (it disables the free-space check), so a
+                // bare || would wrongly replace it with the default.
+                min_free_gb: Math.max(0, parseInt(document.getElementById('monitor-freegb').value, 10) || 0),
             };
             try {
                 const resp = await fetch('/api/monitor/config', {
@@ -1861,6 +1875,8 @@ async function findPlexLibraries() {
                 if (en) en.checked = !!r.enabled;
                 const keep = document.getElementById('retention-keep');
                 if (keep) keep.value = r.keep_last_per_artist || 10;
+                const auto = document.getElementById('retention-auto');
+                if (auto) auto.checked = !!r.auto_sweep;
             } catch (e) { /* non-fatal */ }
         }
 
@@ -1868,6 +1884,7 @@ async function findPlexLibraries() {
             const body = {
                 enabled: document.getElementById('retention-enabled').checked,
                 keep_last_per_artist: parseInt(document.getElementById('retention-keep').value, 10) || 10,
+                auto_sweep: document.getElementById('retention-auto').checked,
             };
             try {
                 const resp = await fetch('/api/retention/config', {
@@ -1895,14 +1912,22 @@ async function findPlexLibraries() {
                     out.innerHTML = `<div style="color:#f8a5b0;">⚠️ ${escapeHtml(p.error)}</div>`;
                     return;
                 }
+                // Per-root problems must be surfaced: a root skipped because it
+                // looks unmounted is important, and would otherwise be silent.
+                const rootErrors = (p.roots || []).filter(r => r.error);
+                const warn = rootErrors.length
+                    ? '<div style="margin-bottom:10px;">' + rootErrors.map(r =>
+                        `<div style="color:#f0c674;font-size:0.88em;">⚠️ ${escapeHtml(r.root)}: ${escapeHtml(r.error)}</div>`
+                      ).join('') + '</div>'
+                    : '';
                 if (!p.candidate_count) {
-                    out.innerHTML = `<div style="color:#7ddf90;">✅ Nothing to delete — `
-                        + `${p.artists_scanned} artist(s), ${p.total_files} video(s), `
-                        + `keeping newest ${p.keep_last_per_artist} each.</div>`;
+                    out.innerHTML = warn + `<div style="color:#7ddf90;">✅ Nothing to delete — `
+                        + `${p.artists_scanned} artist(s), ${p.total_files} video(s) across `
+                        + `${(p.roots || []).length} root(s), keeping newest ${p.keep_last_per_artist} each.</div>`;
                     return;
                 }
                 const gb = (p.total_bytes / (1024 ** 3)).toFixed(2);
-                let html = `<div style="margin-bottom:10px;">`
+                let html = warn + `<div style="margin-bottom:10px;">`
                     + `Would delete <strong>${p.candidate_count}</strong> video(s), freeing <strong>${gb} GB</strong>`
                     + ` — keeping the newest ${p.keep_last_per_artist} per artist.</div>`;
                 html += '<div style="max-height:220px;overflow:auto;border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:8px;">';
