@@ -312,6 +312,68 @@ def test_retention_apply_refuses_without_explicit_confirmation():
     assert client.post('/api/retention/apply', json={'confirm': 'delete'}).status_code == 400
 
 
+def test_plex_token_is_not_returned_by_either_config_endpoint():
+    """v1.6.1: the token was the prize for any script in the admin session."""
+    client = _client(authenticated=True)
+    secret = 'PLEX-TOKEN-SHOULD-NOT-LEAK'
+    state.write_json(app_module.CONFIG_FILE,
+                     {'plex': {'token': secret, 'server_url': 'http://plex.local:32400'},
+                      '_secret_key': 'k'}, indent=4)
+
+    for path in ('/api/config', '/api/plex/config'):
+        body = client.get(path).get_data(as_text=True)
+        assert secret not in body, f'{path} leaked the Plex token'
+        assert 'token_set' in body, f'{path} does not report token_set'
+
+    # Presence is still discoverable, which is all the UI needs.
+    assert client.get('/api/plex/config').get_json()['token_set'] is True
+    # And the non-secret fields still come through.
+    assert client.get('/api/plex/config').get_json()['server_url'] == 'http://plex.local:32400'
+
+
+def test_config_round_trip_does_not_disconnect_plex():
+    """The GET no longer returns the token, so a client POSTing the document back
+    would otherwise wipe it — silently disconnecting Plex."""
+    client = _client(authenticated=True)
+    state.write_json(app_module.CONFIG_FILE,
+                     {'plex': {'token': 'KEEP-TOKEN', 'server_url': 'http://p:32400'},
+                      '_secret_key': 'k'}, indent=4)
+
+    # Exactly what the raw-config editor does: GET, then POST it back.
+    document = client.get('/api/config').get_json()
+    assert 'token' not in document['plex']
+    assert client.post('/api/config', json=document).status_code == 200
+
+    after = state.read_json(app_module.CONFIG_FILE)
+    assert after['plex']['token'] == 'KEEP-TOKEN', 'round-trip wiped the Plex token'
+    assert 'token_set' not in after['plex'], 'the presence marker was persisted'
+    assert after['_secret_key'] == 'k'
+
+
+def test_config_round_trip_from_a_disconnected_install_persists_no_marker():
+    """The same round-trip with no Plex token stored.
+
+    The first version of the merge dropped `token_set` only inside the branch
+    that restored the token, so an install that had never connected Plex wrote
+    `"token_set": false` into config.json and kept it forever — a computed
+    presence flag masquerading as a stored setting. The connected case above
+    passed throughout, which is why this needs its own test.
+    """
+    client = _client(authenticated=True)
+    state.write_json(app_module.CONFIG_FILE,
+                     {'plex': {'server_url': '', 'music_video_library_key': ''},
+                      '_secret_key': 'k'}, indent=4)
+
+    document = client.get('/api/config').get_json()
+    assert document['plex']['token_set'] is False, 'GET should report absence explicitly'
+    assert client.post('/api/config', json=document).status_code == 200
+
+    after = state.read_json(app_module.CONFIG_FILE)
+    assert 'token_set' not in after['plex'], \
+        'the presence marker was persisted by a disconnected install'
+    assert 'token' not in after['plex'], 'an empty token should not be invented'
+
+
 def test_notification_config_never_echoes_the_url_back():
     """The webhook URL usually embeds a secret; the response must not carry it.
 

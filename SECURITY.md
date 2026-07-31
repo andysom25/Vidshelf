@@ -52,7 +52,35 @@ Vidshelf holds real credentials, so these are the things worth reporting:
 
 Documented in `REFERENCE.md` rather than being oversights:
 
-- `/api/artwork/search_noauth` and `/swap_noauth` are unauthenticated on
-  purpose, with the reasoning recorded in `REFERENCE.md`.
+- **`/api/artwork/search_noauth` and `/swap_noauth` are unauthenticated on
+  purpose**, with the reasoning recorded in `REFERENCE.md`. Being precise about
+  what that means, since "deliberate" is not the same as "harmless": anyone who
+  can reach the port can overwrite `folder.jpg`/`poster.jpg` **in an existing
+  artist folder**, and can cause the server to update that artist's Plex
+  collection artwork using the stored Plex token. Reviewed and confirmed bounded:
+  the artist name cannot escape the media root (path separators are stripped —
+  tested), the image URL goes through the SSRF guard, and no folder can be
+  created. Treat it as a defacement surface if the port is exposed. Reports of a
+  *bypass* of any of those bounds are in scope; the endpoints being open is not.
 - Secret scanning and push protection are enabled on this repo. If you find a
   live credential in the history, please report it privately — don't test it.
+
+## Previously found and fixed
+
+A whole-project review before v1.6.1 found and fixed: stored XSS via YouTube
+video titles rendered unescaped into the dashboard (which allowed reading the
+Plex token from the API); the container being granted `SYS_ADMIN` for a mount it
+never performs; and `config.json` written world-readable.
+
+Reviewing that fix before merge found a **second XSS site of the same class** —
+the Plex server name and URI, as reported by plex.tv, interpolated raw into an
+inline `onclick` handler — plus thirteen further unescaped sites the first pass
+had missed. The regression check written alongside the original fix had not
+caught them: it matched on a fixed list of variable and field names, so it was
+testing naming rather than safety, and it never looked at string concatenation at
+all. It has been rewritten, and there are now six checks covering this area.
+
+Every one of them has been verified to fail against a deliberately broken
+version of the code — including one ordering assertion that turned out to be
+vacuously true and could never have failed. See the v1.6.1 release notes and
+`REFERENCE.md`.

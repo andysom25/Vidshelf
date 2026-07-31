@@ -213,7 +213,9 @@
             try {
                 const plexResp = await fetch('/api/plex/config');
                 const plexData = await plexResp.json();
-                plexConnected = !!plexData.token;
+                // token_set, not token: the server no longer sends the
+                // credential itself, only whether one exists.
+                plexConnected = !!plexData.token_set;
             } catch (e) { /* leave plexConnected false if this fails */ }
 
             const hasChannel = channelCount > 0;
@@ -284,7 +286,7 @@
                 const resp = await fetchWithTimeout('/api/channels');
                 const data = await resp.json();
                 if (data.error) {
-                    container.innerHTML = '<div class="empty-state"><p>Error loading channels: ' + data.error + '</p></div>';
+                    container.innerHTML = '<div class="empty-state"><p>Error loading channels: ' + escapeHtml(data.error) + '</p></div>';
                     return;
                 }
                 if (!data.channels || data.channels.length === 0) {
@@ -305,21 +307,21 @@
                         <div class="video-card" style="padding:16px;">
                             <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;">
                                 <div style="font-weight:600;color:#fff;">📺 ${displayName}</div>
-                                <button class="btn btn-sm" style="background:rgba(220,53,69,0.15);color:#f8a5b0;border:1px solid rgba(220,53,69,0.3);" onclick="confirmRemoveChannel('${ch.url}')" title="Remove channel">✕</button>
+                                <button class="btn btn-sm" style="background:rgba(220,53,69,0.15);color:#f8a5b0;border:1px solid rgba(220,53,69,0.3);" onclick="confirmRemoveChannel('${encodeURIComponent(ch.url)}')" title="Remove channel">✕</button>
                             </div>
-                            <div style="font-size:0.85em;color:#8888a0;word-break:break-all;margin-bottom:4px;">${ch.url}</div>
-                            <div style="font-size:0.8em;color:#606070;">Download: ${ch.download_path}</div>
-                            <div style="font-size:0.8em;color:#606070;">Plex: ${ch.plex_media_path}</div>
+                            <div style="font-size:0.85em;color:#8888a0;word-break:break-all;margin-bottom:4px;">${escapeHtml(ch.url)}</div>
+                            <div style="font-size:0.8em;color:#606070;">Download: ${escapeHtml(ch.download_path)}</div>
+                            <div style="font-size:0.8em;color:#606070;">Plex: ${escapeHtml(ch.plex_media_path)}</div>
                             <div style="margin-top:8px;display:flex;align-items:center;gap:10px;">
                                 <span style="font-size:0.78em;color:#9090a0;">Mode:</span>
-                                <select onchange="changeChannelMode('${ch.url}', this.value)" style="padding:4px 8px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e0e0e0;font-size:0.8em;">
+                                <select onchange="changeChannelMode('${encodeURIComponent(ch.url)}', this.value)" style="padding:4px 8px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e0e0e0;font-size:0.8em;">
                                     <option value="manual" ${mode === 'manual' ? 'selected' : ''}>🖐 Manual</option>
                                     <option value="new" ${mode === 'new' ? 'selected' : ''}>🆕 New Only</option>
                                     <option value="all" ${mode === 'all' ? 'selected' : ''}>📥 All Videos</option>
                                 </select>
                                 <span style="font-size:0.72em;padding:2px 8px;border-radius:4px;background:${modeColor}22;color:${modeColor};border:1px solid ${modeColor}44;">${modeLabel}</span>
                                 <span style="font-size:0.78em;color:#9090a0;margin-left:6px;">Max:</span>
-                                <select onchange="changeChannelQuality('${ch.url}', this.value)" style="padding:4px 8px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e0e0e0;font-size:0.8em;" title="Cap the resolution downloaded from this channel">
+                                <select onchange="changeChannelQuality('${encodeURIComponent(ch.url)}', this.value)" style="padding:4px 8px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e0e0e0;font-size:0.8em;" title="Cap the resolution downloaded from this channel">
                                     <option value="0" ${!ch.max_height ? 'selected' : ''}>Best available</option>
                                     <option value="2160" ${ch.max_height == 2160 ? 'selected' : ''}>4K (2160p)</option>
                                     <option value="1440" ${ch.max_height == 1440 ? 'selected' : ''}>1440p</option>
@@ -328,8 +330,8 @@
                                 </select>
                             </div>
                             <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-                                <button class="btn btn-primary btn-sm" onclick="loadChannelVideos('${ch.url}')">📋 List Videos</button>
-                                <button class="btn btn-sm" style="background:rgba(40,167,69,0.12);color:#7ddf90;border:1px solid rgba(40,167,69,0.25);" onclick="downloadAllChannelVideos('${ch.url}')">⬇ Download All</button>
+                                <button class="btn btn-primary btn-sm" onclick="loadChannelVideos('${encodeURIComponent(ch.url)}')">📋 List Videos</button>
+                                <button class="btn btn-sm" style="background:rgba(40,167,69,0.12);color:#7ddf90;border:1px solid rgba(40,167,69,0.25);" onclick="downloadAllChannelVideos('${encodeURIComponent(ch.url)}')">⬇ Download All</button>
                             </div>
                         </div>`;
                 });
@@ -346,6 +348,9 @@
         }
 
         async function changeChannelQuality(url, value) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { url = decodeURIComponent(url); } catch (e) { /* leave as-is */ }
             try {
                 const resp = await fetch('/api/channels/quality', {
                     method: 'POST',
@@ -361,6 +366,9 @@
         }
 
         async function loadChannelVideos(channelUrl) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { channelUrl = decodeURIComponent(channelUrl); } catch (e) { /* leave as-is */ }
             const section = document.getElementById('videos-section');
             const grid = document.getElementById('videos-grid');
             section.style.display = 'block';
@@ -377,7 +385,7 @@
                         return;
                     }
                 } catch (e) {
-                    grid.innerHTML = '<div class="empty-state"><p>Error: ' + e.message + '</p></div>';
+                    grid.innerHTML = '<div class="empty-state"><p>Error: ' + escapeHtml(e.message) + '</p></div>';
                     return;
                 }
             }
@@ -386,7 +394,7 @@
                 const resp = await fetch('/api/channel/videos?url=' + encodeURIComponent(channelUrl));
                 const data = await resp.json();
                 if (data.error) {
-                    grid.innerHTML = '<div class="empty-state"><p>Error: ' + data.error + '</p></div>';
+                    grid.innerHTML = '<div class="empty-state"><p>Error: ' + escapeHtml(data.error) + '</p></div>';
                     return;
                 }
                 if (!data.videos || data.videos.length === 0) {
@@ -410,14 +418,14 @@
                                     <span>👁 ${views}</span>
                                 </div>
                                 <div class="video-actions">
-                                    <button class="btn btn-primary btn-sm" data-video-id="${v.id}" data-channel-url="${escapeHtml(channelUrl)}" onclick="downloadVideo(this)">⬇ Download</button>
+                                    <button class="btn btn-primary btn-sm" data-video-id="${escapeHtml(v.id)}" data-channel-url="${escapeHtml(channelUrl)}" onclick="downloadVideo(this)">⬇ Download</button>
                                 </div>
                             </div>
                         </div>`;
                 });
                 grid.innerHTML = html;
             } catch (e) {
-                grid.innerHTML = '<div class="empty-state"><p>Failed to fetch videos: ' + e.message + '</p></div>';
+                grid.innerHTML = '<div class="empty-state"><p>Failed to fetch videos: ' + escapeHtml(e.message) + '</p></div>';
             }
         }
 
@@ -464,7 +472,7 @@
                     const statusBadge = getStatusBadge(d.status);
                     const speed = d.speed ? formatSpeed(d.speed) : '';
                     const eta = d.eta ? formatETA(d.eta) : '';
-                    const errorMsg = d.error ? `<div style="color:#f8a5b0;font-size:0.8em;margin-top:4px;">❌ ${d.error}</div>` : '';
+                    const errorMsg = d.error ? `<div style="color:#f8a5b0;font-size:0.8em;margin-top:4px;">❌ ${escapeHtml(d.error)}</div>` : '';
                     const isActive = d.status === 'downloading' || d.status === 'queued' || d.status === 'converting';
                     
                     // Final path status badge
@@ -491,7 +499,7 @@
                     html += `
                         <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:14px 16px;">
                             <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
-                                <div style="font-weight:500;color:#fff;font-size:0.9em;flex:1;word-break:break-word;margin-right:12px;">${d.title || d.video_id}</div>
+                                <div style="font-weight:500;color:#fff;font-size:0.9em;flex:1;word-break:break-word;margin-right:12px;">${escapeHtml(d.title || d.video_id)}</div>
                                 ${statusBadge}
                             </div>
                             ${isActive ? `
@@ -506,17 +514,17 @@
                             </div>
                             ` : ''}
                             ${d.status === 'error' ? errorMsg : ''}
-                            ${d.filename ? `<div style="font-size:0.75em;color:#606070;margin-top:4px;">📄 ${d.filename}</div>` : ''}
+                            ${d.filename ? `<div style="font-size:0.75em;color:#606070;margin-top:4px;">📄 ${escapeHtml(d.filename)}</div>` : ''}
                             ${finalStatusHtml}
                             ${finalPathHtml}
-                            <div style="font-size:0.72em;color:#505060;margin-top:4px;">${d.video_id} • ${formatTime(d.started_at)}</div>
+                            <div style="font-size:0.72em;color:#505060;margin-top:4px;">${escapeHtml(d.video_id)} • ${formatTime(d.started_at)}</div>
                             ${downloadActions(d)}
                         </div>`;
                 });
                 html += '</div>';
                 container.innerHTML = html;
             } catch (e) {
-                container.innerHTML = '<div class="empty-state"><p>Failed to load downloads: ' + e.message + '</p></div>';
+                container.innerHTML = '<div class="empty-state"><p>Failed to load downloads: ' + escapeHtml(e.message) + '</p></div>';
             }
         }
 
@@ -528,7 +536,7 @@
                 `<button class="btn btn-sm" style="margin-top:8px;${danger
                     ? 'background:rgba(220,53,69,0.12);color:#f8a5b0;border:1px solid rgba(220,53,69,0.28);'
                     : 'background:rgba(255,255,255,0.06);color:#9090a0;border:1px solid rgba(255,255,255,0.12);'}"`
-                + ` onclick="${fn}('${d.download_id}')">${label}</button>`;
+                + ` onclick="${fn}('${encodeURIComponent(d.download_id)}')">${label}</button>`;
             if (['queued', 'downloading', 'converting'].includes(d.status)) {
                 return btn('⃠ Cancel', 'cancelDownload', true);
             }
@@ -539,6 +547,9 @@
         }
 
         async function cancelDownload(id) {
+            // Encoded at the call site (downloadActions) because it lands
+            // inside an inline onclick JS string, where escapeHtml cannot help.
+            try { id = decodeURIComponent(id); } catch (e) { /* leave as-is */ }
             try {
                 const resp = await fetchWithTimeout(`/api/downloads/${encodeURIComponent(id)}/cancel`,
                                                     { method: 'POST' }, 15000);
@@ -552,6 +563,9 @@
         }
 
         async function retryDownload(id) {
+            // Encoded at the call site (downloadActions) because it lands
+            // inside an inline onclick JS string, where escapeHtml cannot help.
+            try { id = decodeURIComponent(id); } catch (e) { /* leave as-is */ }
             try {
                 const resp = await fetchWithTimeout(`/api/downloads/${encodeURIComponent(id)}/retry`,
                                                     { method: 'POST' }, 15000);
@@ -642,7 +656,7 @@
                             ${qualityBadge ? '<span>' + qualityBadge + '</span>' : ''}
                         </div>
                         <div class="video-actions">
-                            <button class="btn btn-primary btn-sm" data-video-id="${v.id}" data-title="${escapeHtml(title)}" onclick="downloadMusicVideo(this)">⬇ Download</button>
+                            <button class="btn btn-primary btn-sm" data-video-id="${escapeHtml(v.id)}" data-title="${escapeHtml(title)}" onclick="downloadMusicVideo(this)">⬇ Download</button>
                         </div>
                     </div>
                 </div>`;
@@ -702,7 +716,7 @@
                 const data = await resp.json();
 
                 if (data.error) {
-                    status.innerHTML = '<div class="empty-state"><p>Error: ' + data.error + '</p></div>';
+                    status.innerHTML = '<div class="empty-state"><p>Error: ' + escapeHtml(data.error) + '</p></div>';
                     return;
                 }
 
@@ -721,7 +735,7 @@
 
                 if (data.has_more) addMusicVideoLoadMoreButton(grid);
             } catch (e) {
-                status.innerHTML = '<div class="empty-state"><p>Failed to search: ' + e.message + '</p></div>';
+                status.innerHTML = '<div class="empty-state"><p>Failed to search: ' + escapeHtml(e.message) + '</p></div>';
             } finally {
                 btn.disabled = false;
                 btn.textContent = '🔍 Search';
@@ -821,7 +835,7 @@
                 container.innerHTML = '<pre style="background:#0f0f1a;padding:16px;border-radius:8px;overflow-x:auto;font-size:0.85em;color:#c0c0d0;">' +
                     JSON.stringify(data, null, 2) + '</pre>';
             } catch (e) {
-                container.innerHTML = '<div class="empty-state"><p>Failed to load config: ' + e.message + '</p></div>';
+                container.innerHTML = '<div class="empty-state"><p>Failed to load config: ' + escapeHtml(e.message) + '</p></div>';
             }
             loadSystemInfo();
         }
@@ -832,7 +846,7 @@
                 const resp = await fetch('/api/system/info');
                 const data = await resp.json();
                 if (data.error) {
-                    container.innerHTML = '<div class="empty-state"><p>Error: ' + data.error + '</p></div>';
+                    container.innerHTML = '<div class="empty-state"><p>Error: ' + escapeHtml(data.error) + '</p></div>';
                     return;
                 }
                 container.innerHTML = `
@@ -871,7 +885,7 @@
                         </div>
                     </div>`;
             } catch (e) {
-                container.innerHTML = '<div class="empty-state"><p>Failed to load system info: ' + e.message + '</p></div>';
+                container.innerHTML = '<div class="empty-state"><p>Failed to load system info: ' + escapeHtml(e.message) + '</p></div>';
             }
         }
 
@@ -1073,6 +1087,9 @@
         }
 
         function confirmRemoveChannel(url) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { url = decodeURIComponent(url); } catch (e) { /* leave as-is */ }
             showConfirmModal(
                 'Are you sure you want to remove this channel?\n\n' + url,
                 function() { removeChannel(url); }
@@ -1102,6 +1119,9 @@
         }
 
         async function changeChannelMode(channelUrl, newMode) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { channelUrl = decodeURIComponent(channelUrl); } catch (e) { /* leave as-is */ }
             showToast('⏳ Updating download mode...', 'success');
             try {
                 const resp = await fetch('/api/channels/mode', {
@@ -1122,6 +1142,9 @@
         }
 
         async function downloadAllChannelVideos(channelUrl) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { channelUrl = decodeURIComponent(channelUrl); } catch (e) { /* leave as-is */ }
             showConfirmModal(
                 'Download all videos from this channel?\n\nThis may take a while for large channels.',
                 async function() {
@@ -1174,7 +1197,7 @@
                 });
                 const data = await resp.json();
                 if (data.error) {
-                    listEl.innerHTML = `<div class="empty-state"><p>Error: ${data.error}</p></div>`;
+                    listEl.innerHTML = `<div class="empty-state"><p>Error: ${escapeHtml(data.error)}</p></div>`;
                     return;
                 }
                 if (data.entries.length === 0) {
@@ -1193,8 +1216,8 @@
                     const entryEscaped = entry.path.replace(/\\/g, '\\\\');
                     html += `<div class="folder-item" data-path="${entryEscaped}" style="padding:10px 14px;cursor:pointer;border-radius:6px;transition:all 0.15s;display:flex;align-items:center;gap:10px;border-bottom:1px solid rgba(255,255,255,0.04);">
                         <span style="font-size:1.1em;">📁</span>
-                        <span style="flex:1;color:#e0e0e0;">${entry.name}</span>
-                        <span style="font-size:0.72em;color:#606070;font-family:Consolas,monospace;">${entry.path}</span>
+                        <span style="flex:1;color:#e0e0e0;">${escapeHtml(entry.name)}</span>
+                        <span style="font-size:0.72em;color:#606070;font-family:Consolas,monospace;">${escapeHtml(entry.path)}</span>
                     </div>`;
                 });
                 listEl.innerHTML = html;
@@ -1207,7 +1230,7 @@
                     });
                 });
             } catch (e) {
-                listEl.innerHTML = `<div class="empty-state"><p>Failed: ${e.message}</p></div>`;
+                listEl.innerHTML = `<div class="empty-state"><p>Failed: ${escapeHtml(e.message)}</p></div>`;
             }
         }
 
@@ -1266,7 +1289,7 @@
             try {
                 const resp = await fetch('/api/plex/config');
                 const data = await resp.json();
-                const hasToken = data.token && data.token.length > 0;
+                const hasToken = !!data.token_set;
                 const hasServer = data.server_url && data.server_url.length > 0;
                 const hasLibrary = data.music_video_library_key && data.music_video_library_key.length > 0;
 
@@ -1295,7 +1318,7 @@
                     connectedSection.style.display = 'none';
                 }
             } catch (e) {
-                statusEl.innerHTML = '<div class="empty-state"><p>Failed to check Plex connection: ' + e.message + '</p></div>';
+                statusEl.innerHTML = '<div class="empty-state"><p>Failed to check Plex connection: ' + escapeHtml(e.message) + '</p></div>';
             }
         }
 
@@ -1318,7 +1341,7 @@
                                 Click the button below to authorize Vidshelf with your Plex account.
                                 A new tab will open with Plex's secure login page.
                             </p>
-                            <a href="${data.auth_url}" target="_blank" class="btn btn-primary" style="display:inline-block;padding:12px 24px;text-decoration:none;font-size:1em;">
+                            <a href="${escapeHtml(data.auth_url)}" target="_blank" class="btn btn-primary" style="display:inline-block;padding:12px 24px;text-decoration:none;font-size:1em;">
                                 🔗 Authorize with Plex
                             </a>
                             <div style="margin-top:12px;font-size:0.85em;color:#8888a0;">
@@ -1338,7 +1361,7 @@
                     btn.textContent = '🔗 Connect to Plex';
                 }
             } catch (e) {
-                statusEl.innerHTML = '<div style="color:#f8a5b0;">Error: ' + e.message + '</div>';
+                statusEl.innerHTML = '<div style="color:#f8a5b0;">Error: ' + escapeHtml(e.message) + '</div>';
                 btn.disabled = false;
                 btn.textContent = '🔗 Connect to Plex';
             }
@@ -1371,7 +1394,7 @@
                     document.getElementById('plex-oauth-btn').textContent = '🔗 Connect to Plex';
                 }
             } catch (e) {
-                statusEl.innerHTML = '<div style="color:#f8a5b0;">Error: ' + e.message + '</div>';
+                statusEl.innerHTML = '<div style="color:#f8a5b0;">Error: ' + escapeHtml(e.message) + '</div>';
             }
         }
 
@@ -1396,12 +1419,12 @@
                     <div style="padding:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:6px;cursor:pointer;transition:all 0.15s;"
                          onmouseenter="this.style.background='rgba(255,255,255,0.08)'"
                          onmouseleave="this.style.background='rgba(255,255,255,0.03)'"
-                         onclick="selectPlexServer('${srv.uri}', '${srv.name}')">
+                         onclick="selectPlexServer('${encodeURIComponent(srv.uri || '')}', '${encodeURIComponent(srv.name || '')}')">
                         <div style="display:flex;align-items:center;gap:10px;">
                             <span style="font-size:1.2em;">🖥</span>
                             <div>
-                                <div style="font-weight:600;color:#fff;">${srv.name}</div>
-                                <div style="font-size:0.8em;color:#8888a0;">${srv.uri || 'No URI'} • Last seen: ${lastSeen}</div>
+                                <div style="font-weight:600;color:#fff;">${escapeHtml(srv.name)}</div>
+                                <div style="font-size:0.8em;color:#8888a0;">${escapeHtml(srv.uri || 'No URI')} • Last seen: ${lastSeen}</div>
                             </div>
                         </div>
                     </div>`;
@@ -1411,6 +1434,10 @@
         }
 
         async function selectPlexServer(uri, name) {
+            // Encoded at the call site because both land inside an inline
+            // onclick JS string, where escapeHtml cannot help.
+            try { uri = decodeURIComponent(uri); } catch (e) { /* leave as-is */ }
+            try { name = decodeURIComponent(name); } catch (e) { /* leave as-is */ }
             if (!uri) {
                 showToast('❌ This server has no accessible URI', 'error');
                 return;
@@ -1478,7 +1505,7 @@ async function findPlexLibraries() {
                 picker.style.display = 'block';
                 statusEl.innerHTML = `<div style="color:#8888a0;">Found ${libraries.length} librar${libraries.length === 1 ? 'y' : 'ies'} — confirm the right one below, then save.</div>`;
             } catch (e) {
-                statusEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
+                statusEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${escapeHtml(e.message)}</div>`;
             } finally {
                 btn.disabled = false;
                 btn.textContent = '🔍 Find Libraries';
@@ -1508,10 +1535,10 @@ async function findPlexLibraries() {
                     showToast('✅ Library saved', 'success');
                     checkPlexConnection();
                 } else {
-                    statusEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    statusEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                 }
             } catch (e) {
-                statusEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
+                statusEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${escapeHtml(e.message)}</div>`;
             } finally {
                 btn.disabled = false;
                 btn.textContent = '💾 Save Selected Library';
@@ -1533,8 +1560,8 @@ async function findPlexLibraries() {
                     let html = '<div style="margin-top:12px;">';
                     data.results.forEach(r => {
                         const status = r.collection_created ? '✅' : '❌';
-                        const errors = r.errors && r.errors.length > 0 ? ` (${r.errors.join(', ')})` : '';
-                        html += `<div style="font-size:0.85em;color:#c0c0d0;margin-bottom:4px;">${status} ${r.artist}: ${r.videos_found} videos${errors}</div>`;
+                        const errors = r.errors && r.errors.length > 0 ? ` (${escapeHtml(r.errors.join(', '))})` : '';
+                        html += `<div style="font-size:0.85em;color:#c0c0d0;margin-bottom:4px;">${status} ${escapeHtml(r.artist)}: ${r.videos_found} videos${errors}</div>`;
                     });
                     html += '</div>';
                     resultEl.innerHTML = html;
@@ -1542,14 +1569,14 @@ async function findPlexLibraries() {
                 } else if (data.result) {
                     const r = data.result;
                     const status = r.collection_created ? '✅' : '❌';
-                    const errors = r.errors && r.errors.length > 0 ? ` (${r.errors.join(', ')})` : '';
-                    resultEl.innerHTML = `<div style="font-size:0.85em;color:#c0c0d0;">${status} ${r.artist}: ${r.videos_found} videos${errors}</div>`;
+                    const errors = r.errors && r.errors.length > 0 ? ` (${escapeHtml(r.errors.join(', '))})` : '';
+                    resultEl.innerHTML = `<div style="font-size:0.85em;color:#c0c0d0;">${status} ${escapeHtml(r.artist)}: ${r.videos_found} videos${errors}</div>`;
                     showToast(`✅ Synced collection for ${r.artist}`, 'success');
                 } else {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error || 'Sync failed'}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error || 'Sync failed')}</div>`;
                 }
             } catch (e) {
-                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
+                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${escapeHtml(e.message)}</div>`;
             } finally {
                 btn.disabled = false;
                 btn.textContent = '🔄 Sync Collections';
@@ -1565,7 +1592,7 @@ async function findPlexLibraries() {
                 const data = await resp.json();
 
                 if (data.error) {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                     return;
                 }
 
@@ -1580,13 +1607,13 @@ async function findPlexLibraries() {
                 if (data.folders) {
                     data.folders.forEach(f => {
                         const icon = f.has_collection ? '✅' : '⬜';
-                        html += `<div style="font-size:0.85em;color:#c0c0d0;margin-bottom:2px;">${icon} ${f.artist}</div>`;
+                        html += `<div style="font-size:0.85em;color:#c0c0d0;margin-bottom:2px;">${icon} ${escapeHtml(f.artist)}</div>`;
                     });
                 }
                 html += '</div>';
                 resultEl.innerHTML = html;
             } catch (e) {
-                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
+                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${escapeHtml(e.message)}</div>`;
             }
         }
 
@@ -1602,7 +1629,7 @@ async function findPlexLibraries() {
                 const data = await resp.json();
 
                 if (data.errors && data.errors.length > 0 && data.scanned === 0) {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.errors.join(', ')}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.errors.join(', '))}</div>`;
                     return;
                 }
 
@@ -1623,7 +1650,7 @@ async function findPlexLibraries() {
                 resultEl.innerHTML = html;
                 showToast(`✅ Cleaned ${data.cleaned} of ${data.scanned} titles`, 'success');
             } catch (e) {
-                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
+                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${escapeHtml(e.message)}</div>`;
             } finally {
                 btn.disabled = false;
                 btn.textContent = '🧹 Clean Up Titles';
@@ -1646,7 +1673,7 @@ async function findPlexLibraries() {
                 const data = await resp.json();
 
                 if (data.error) {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                     return;
                 }
 
@@ -1662,7 +1689,7 @@ async function findPlexLibraries() {
                 resultEl.innerHTML = html;
                 showToast(`✅ Generated ${data.total_generated} title card(s)`, 'success');
             } catch (e) {
-                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
+                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${escapeHtml(e.message)}</div>`;
             } finally {
                 btn.disabled = false;
                 btn.textContent = '🖼️ Generate Title Cards';
@@ -1681,7 +1708,7 @@ async function findPlexLibraries() {
                 const data = await resp.json();
 
                 if (data.error) {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                     return;
                 }
 
@@ -1704,7 +1731,7 @@ async function findPlexLibraries() {
                     ? '✅ No duplicate collections found'
                     : `✅ Removed ${data.deleted.length} duplicate collection(s)`, 'success');
             } catch (e) {
-                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
+                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${escapeHtml(e.message)}</div>`;
             } finally {
                 btn.disabled = false;
                 btn.textContent = '🧬 Remove Duplicate Collections';
@@ -2094,15 +2121,15 @@ async function findPlexLibraries() {
                     html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(255,255,255,0.03);border-radius:6px;">
                         <div>
                             <span style="color:${color};">${icon}</span>
-                            <strong style="margin-left:4px;">${r.label}</strong>
-                            <span style="color:#707080;font-size:0.85em;"> — ${r.why}</span>
+                            <strong style="margin-left:4px;">${escapeHtml(r.label)}</strong>
+                            <span style="color:#707080;font-size:0.85em;"> — ${escapeHtml(r.why)}</span>
                         </div>
                         <div style="font-size:0.85em;color:#8888a0;">${detail}</div>
                     </div>`;
                 });
                 list.innerHTML = html;
             } catch (e) {
-                list.innerHTML = `<div style="color:#f8a5b0;">Failed to check system health: ${e.message}</div>`;
+                list.innerHTML = `<div style="color:#f8a5b0;">Failed to check system health: ${escapeHtml(e.message)}</div>`;
             }
         }
 
@@ -2120,7 +2147,7 @@ async function findPlexLibraries() {
                 const resp = await fetch('/api/conversion/scan', { method: 'POST' });
                 const data = await resp.json();
                 if (data.error) {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                     return;
                 }
                 let html = `<div style="padding:12px;background:rgba(255,255,255,0.03);border-radius:8px;">
@@ -2138,7 +2165,7 @@ async function findPlexLibraries() {
                 html += '</div>';
                 resultEl.innerHTML = html;
             } catch (e) {
-                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
+                resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${escapeHtml(e.message)}</div>`;
             } finally {
                 btn.disabled = false;
                 btn.textContent = '🔍 Scan Library';
@@ -2447,7 +2474,7 @@ function fetchSwapArtImagePage(resultsDiv, append) {
             if (data.has_more) addSwapArtLoadMoreButton(resultsDiv);
         })
         .catch(e => {
-            statusEl.innerHTML = `<div class="empty-state"><p>Error searching images: ${e.message}</p></div>`;
+            statusEl.innerHTML = `<div class="empty-state"><p>Error searching images: ${escapeHtml(e.message)}</p></div>`;
         });
 }
 

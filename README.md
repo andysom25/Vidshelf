@@ -94,6 +94,8 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 - No hardcoded credentials — a random admin password is generated on first run (or set your own via env vars) and printed once to the logs
 - Session-signing key is randomly generated and persisted, not a fixed value baked into source
 - Login throttling, security response headers, SSRF guarding on the public artwork-search endpoint, hardened session cookies
+- Runs with **no added Linux capabilities** (`cap_drop: ALL`), and `config.json` is written owner-only
+- The Plex token is never sent to the browser — the interface only needs to know whether one is set
 
 ---
 

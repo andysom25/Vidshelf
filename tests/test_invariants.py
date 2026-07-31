@@ -175,6 +175,247 @@ def test_ghcr_image_name_is_lowercase():
         'IMAGE_NAME must not derive from github.repository — it capitalises the V.'
 
 
+def test_no_unescaped_server_data_in_the_dom():
+    """v1.6.1 regression guard for stored XSS.
+
+    `d.title` comes from yt-dlp's extracted YouTube title, so it is
+    attacker-influenced: downloading a video titled `<img src=x onerror=...>`
+    executed script in the admin's authenticated session, from which
+    `GET /api/config` returned the Plex token. Nine sites interpolated server
+    data into innerHTML without escaping.
+
+    escapeHtml() escapes all five of & < > " ' so it is correct for text and
+    quoted-attribute contexts. encodeURIComponent is accepted too, and is the
+    right tool inside an inline handler — there, HTML entities are decoded by the
+    parser before the JS engine sees them, so escaping alone would not prevent a
+    quote breaking out of the JS string.
+
+    The first version of this check required BOTH a receiver from a fixed list
+    (`d`, `ch`, `v`, …) and a field from a fixed list of twelve names. That made
+    it a naming test, not a safety test: it passed while `ch.download_path`,
+    `ch.plex_media_path` and two `${errors}` sites sat unescaped in the same
+    file, and a future rename to `dl.title` or `entry.error` would have walked
+    straight through it. It also only looked at `${…}`, so nine
+    `'…' + e.message + '…'` concatenations into innerHTML were invisible.
+
+    So: any receiver, name patterns rather than exact names, and concatenation
+    counts too. Expressions that genuinely cannot be escaped are listed
+    individually in REVIEWED_SAFE with the reason, which is the part that has to
+    stay short — a long exemption list means the check has stopped being one.
+    """
+    src = _read(os.path.join('static', 'js', 'dashboard.js'))
+
+    # Names that carry free text, on any receiver. Suffix patterns (_path,
+    # _name, _url, _title, _error, _id) matter as much as the bare names —
+    # that is what `download_path` and `plex_media_path` needed.
+    texty = re.compile(r'''
+        (?: \b \w+ \. )?
+        \b( title | url | urls | uri | uris | name | names | filename | filenames
+          | error | errors | message | messages | artist | artists
+          | channel | detail | details | path | paths | root | roots
+          | folder | label | text | reason | description | query
+          | video_id | id
+          | \w+_path | \w+_name | \w+_url | \w+_title | \w+_error | \w+_id
+          )\b
+    ''', re.VERBOSE)
+
+    # Text sinks are excluded structurally rather than per-expression, because
+    # the correct treatment there is the opposite of escaping — see
+    # test_text_sinks_are_not_pre_escaped. Blanking the spans keeps the offset
+    # arithmetic (and so the reported line numbers) intact.
+    def _blank(match):
+        return ' ' * len(match.group(0))
+
+    scan = re.sub(r'\.textContent\s*=\s*`[^`]*`', _blank, src)
+    scan = re.sub(r'\b(?:showToast|showConfirmModal)\s*\(\s*`[^`]*`', _blank, scan)
+    scan = re.sub(r"\b(?:showToast|showConfirmModal)\s*\(\s*'(?:[^'\\]|\\.)*'", _blank, scan)
+
+    # Each of these is safe by construction, not by naming.
+    REVIEWED_SAFE = {
+        # Ternaries whose branches are both literals we wrote.
+        "d.status === 'error' ? '#dc3545' : '#e94560'",
+        "a.has_artwork ? '' : ' <span class=\\\"artist-row-count\\\">(no artwork)</span>'",
+        # Pre-built HTML fragments; their own inputs are escaped where they are
+        # assembled, and escaping them again would render the markup as text.
+        "d.status === 'error' ? errorMsg : ''",
+        'detail',
+        'errors',
+        # Numeric.
+        '(p.roots || []).length',
+        # `fn` and `label` are literals passed by downloadActions' own call
+        # sites ('cancelDownload', '⃠ Cancel'), never server data.
+        'fn',
+        'label',
+    }
+
+    offenders = []
+
+    def _check(expr, pos, why):
+        expr = expr.strip()
+        if 'escapeHtml' in expr or 'encodeURIComponent' in expr:
+            return
+        if expr in REVIEWED_SAFE:
+            return
+        if texty.search(expr):
+            line = src[:pos].count('\n') + 1
+            offenders.append(f'dashboard.js:{line}: {why} {expr[:70]}')
+
+    # Template-literal interpolation.
+    for match in re.finditer(r'\$\{([^{}]{1,200})\}', scan):
+        _check(match.group(1), match.start(), '${...}')
+
+    # String concatenation into a DOM sink -- `'<div>' + e.message + '</div>'`.
+    for match in re.finditer(r"\+\s*([A-Za-z_$][\w.$]*(?:\([^()]*\))?)\s*\+", scan):
+        _check(match.group(1), match.start(), 'concat')
+
+    assert not offenders, (
+        'Server-supplied data reaching the DOM without escaping. Wrap it in '
+        'escapeHtml() — or encodeURIComponent() if it lands inside an inline '
+        'onclick/onchange handler. If it is genuinely safe by construction, add '
+        'it to REVIEWED_SAFE with the reason.\n  ' + '\n  '.join(offenders))
+
+
+def test_text_sinks_are_not_pre_escaped():
+    """The mirror image of the check above, and a real v1.6.1 bug.
+
+    showToast() and showConfirmModal() assign `textContent`, which neutralises
+    markup on its own. Passing escapeHtml() output to them does not add safety —
+    it renders the entities literally, so "Guns N' Roses" reached the user as
+    "Guns N&#39; Roses". Escaping is per-sink, and these two are text sinks.
+    """
+    src = _read(os.path.join('static', 'js', 'dashboard.js'))
+    offenders = []
+    for match in re.finditer(r'\b(showToast|showConfirmModal)\s*\(', src):
+        # Scan to the end of that statement -- far enough to cover the message
+        # argument without needing a JS parser.
+        chunk = src[match.end():match.end() + 400]
+        chunk = chunk.split('\n\n')[0]
+        if 'escapeHtml' in chunk.split(');')[0]:
+            line = src[:match.start()].count('\n') + 1
+            offenders.append(f'dashboard.js:{line}: {match.group(1)}(... escapeHtml ...)')
+
+    assert not offenders, (
+        'escapeHtml() passed to a textContent sink. textContent already makes '
+        'markup inert; escaping first means the user sees &amp; and &#39; in '
+        'artist names.\n  ' + '\n  '.join(offenders))
+
+
+def test_encoded_handler_arguments_are_decoded_by_their_handler():
+    """encodeURIComponent in an inline handler is half of a pair.
+
+    Without the matching decodeURIComponent the value arrives percent-encoded,
+    so the fetch targets a channel URL or download id that does not exist. That
+    fails *quietly* — the request 200s against nothing, or 404s into a toast —
+    which is a worse failure mode than the XSS it was added to prevent, and no
+    functional test in this repo exercises those click paths.
+    """
+    src = _read(os.path.join('static', 'js', 'dashboard.js'))
+
+    # onclick="someHandler('${encodeURIComponent(x)}'...  /  onchange="..."
+    # Counted, not just detected: selectPlexServer takes two encoded arguments,
+    # and a body that decodes only one of them still contains the word
+    # decodeURIComponent. A presence check passes that; this does not.
+    called = {}
+    for match in re.finditer(
+            r'on(?:click|change)="(\w+)\((?:[^"]*?\$\{encodeURIComponent\()[^"]*"', src):
+        name = match.group(1)
+        n = match.group(0).count('encodeURIComponent(')
+        called[name] = max(called.get(name, 0), n)
+    assert called, 'no encoded inline-handler call sites found — did the pattern change?'
+
+    # downloadActions() builds its buttons through a `btn(label, fn, danger)`
+    # helper, so the handler name reaches the DOM as `onclick="${fn}(...)"` — not
+    # a literal, and invisible to the pattern above. That indirection is exactly
+    # how cancelDownload/retryDownload slipped past the first version of this
+    # check: it reported a clean pass with both decodes deleted.
+    if re.search(r'on(?:click|change)="\$\{\w+\}\(\s*\'\$\{encodeURIComponent\(', src):
+        indirect = set(re.findall(r"btn\(\s*'[^']*',\s*'(\w+)'", src))
+        assert indirect, \
+            'indirect handler call site found but its handler names could not be resolved'
+        for name in indirect:
+            called.setdefault(name, 1)
+
+    offenders = []
+    for name, encoded in sorted(called.items()):
+        match = re.search(r'(?:async\s+)?function\s+' + name + r'\s*\([^)]*\)\s*\{', src)
+        if not match:
+            offenders.append(f'{name}: called with an encoded argument but not defined here')
+            continue
+        # The declaration through to the next top-level function is body enough.
+        nxt = re.search(r'\n\s*(?:async\s+)?function\s', src[match.end():])
+        body = src[match.end(): match.end() + (nxt.start() if nxt else 4000)]
+        decoded = body.count('decodeURIComponent(')
+        if decoded < encoded:
+            line = src[:match.start()].count('\n') + 1
+            offenders.append(
+                f'dashboard.js:{line}: {name}() receives {encoded} encoded '
+                f'argument(s) but decodes {decoded}')
+
+    assert not offenders, (
+        'encodeURIComponent at a call site without a matching decodeURIComponent '
+        'in the handler. Both halves, for every argument, or neither.\n  '
+        + '\n  '.join(offenders))
+
+
+def test_state_files_are_written_owner_only():
+    """config.json holds the Plex token, the admin password hash and the session
+    signing key, in a bind-mounted directory — 0644 meant any local user on the
+    host could read all three.
+
+    Asserted at source level rather than by writing a file and stat-ing it,
+    because os.chmod on Windows only toggles the read-only bit: a mode assertion
+    would pass on Linux and fail on the machine this is usually developed on. Of
+    the four v1.6.1 fixes this was the only one with no regression guard at all,
+    which made it the only one that could be deleted silently.
+    """
+    src = _read('state.py')
+    assert 'os.chmod(abs_path, 0o600)' in src, \
+        'state.write_json no longer restricts the mode of the file it writes'
+    # The chmod must follow the replace: os.replace preserves the source file's
+    # mode, so chmod-ing the temp file first would be silently undone.
+    #
+    # Anchored on the real call and on comment-stripped source. Matching bare
+    # 'os.replace' against the raw text looked equivalent and was not — the
+    # module docstring mentions os.replace four times before any code does, so
+    # the ordering assertion was vacuously true and could not fail.
+    code = '\n'.join(_code_lines(src))
+    replace_call = '_replace_with_retry(tmp_path, abs_path)'
+    assert replace_call in code, \
+        'state.write_json no longer replaces via %s — update this test' % replace_call
+    assert code.index(replace_call) < code.index('os.chmod(abs_path, 0o600)'), \
+        'chmod must come after the replace, which preserves the source mode'
+
+
+def test_plex_token_is_never_returned_by_the_api():
+    """The Plex token is a bearer credential for the user's whole Plex account.
+
+    Both /api/config and /api/plex/config used to return it, so any script in the
+    admin session could exfiltrate it with one fetch. The UI only ever needed to
+    know whether one exists, which is what token_set reports.
+    """
+    src = _read('app.py')
+    # Both GET handlers must strip it and expose the boolean instead.
+    assert src.count("plex['token_set']") >= 2 or src.count("['token_set']") >= 2, \
+        'token_set marker missing — did a GET handler stop stripping the token?'
+    assert "plex.pop('token', None)" in src, \
+        'the Plex token is no longer being popped before serialisation'
+    # And the POST merge must restore it, or round-tripping config disconnects Plex.
+    assert "incoming_plex.setdefault('token', current_token)" in src, \
+        'POST /api/config no longer preserves the stored Plex token'
+
+
+def test_container_grants_no_extra_capabilities():
+    """SYS_ADMIN was granted for a CIFS mount the container never performs — the
+    `cifs` volume driver mounts on the host. Verified: a container with zero
+    added capabilities both reads and writes the share. SYS_ADMIN is close to a
+    container-escape primitive, so it must not come back."""
+    compose = _read('docker-compose.yml')
+    for line in _code_lines(compose):
+        assert 'SYS_ADMIN' not in line, f'SYS_ADMIN granted again: {line.strip()}'
+        assert 'privileged: true' not in line.lower(), f'privileged mode: {line.strip()}'
+    assert 'cap_drop' in compose, 'cap_drop: ALL removed from docker-compose.yml'
+
+
 def test_current_version_has_hand_written_release_notes():
     """CLAUDE.md requires release-notes/vX.Y.Z.md for the version in VERSION.
 

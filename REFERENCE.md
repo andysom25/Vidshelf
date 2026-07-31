@@ -4128,3 +4128,252 @@ already in the sidebar footer.
 `tests/test_downloads.py` adds 10 tests over the format selector and the
 cancellation flag; `test_routes.py` gained 5 for the endpoints, the stats fix and
 the removed badge.
+
+## SECURITY (2026-07-31): whole-project review before further work (v1.6.1)
+
+Reviewed the entire project rather than a diff — `dev` and `main` were identical,
+so a diff-scoped review had nothing to look at. Everything below was verified by
+execution, not by reading.
+
+### HIGH — stored XSS via video title, chaining to Plex token disclosure
+
+`d.title` is set from yt-dlp's extracted YouTube title
+(`real_title = info.get('title', title)` in downloader.py), persisted to
+`active_downloads.json`, served by `/api/downloads/progress`, and interpolated
+into `innerHTML` **unescaped**. Proven end-to-end: a title of
+`<img src=x onerror=alert(1)>` reached the client verbatim, as did `d.error`.
+
+The title is **not** operator-controlled — it comes from YouTube — so this is
+attacker-influenced input, not self-XSS.
+
+**The chain is what made it high.** `GET /api/config` returned `plex.token` in
+plaintext, and so did `GET /api/plex/config`. Script in the admin session could
+therefore read a bearer credential for the user's entire Plex account with one
+fetch. Two things limited it: `/api/password` requires the current password, and
+SameSite=Lax blocks cross-site CSRF.
+
+Nine sites were unescaped (21 interpolations). Fixed in two layers:
+
+1. **Escaped at every site.** `escapeHtml()` already existed and handles all five
+   of ampersand, angle brackets and both quote characters, so it is correct for
+   text and quoted-attribute contexts.
+2. **Removed the prize.** Neither config endpoint returns the token now; both
+   report a `token_set` boolean, which is all the UI ever did with it.
+
+**The subtlety in (1):** five sites were inside inline onclick/onchange handlers.
+`escapeHtml` is the *wrong tool* there — the HTML parser decodes the entity back
+to a raw quote before the JS engine sees it, so a quote still breaks out of the
+JS string. Those use `encodeURIComponent` at the call site with a matching
+`decodeURIComponent` in the handler, since encodeURIComponent emits none of the
+dangerous characters. Only reachable via the operator's own channel URL (the add
+endpoint validates a YouTube *prefix* but not the remainder), so self-XSS — fixed
+because a security release is the moment to do it.
+
+**The interaction that needed care in (2):** the raw-config editor does GET then
+POST. With the token stripped from the GET, a round-trip would POST a `plex`
+object without it and silently disconnect Plex. The v1.4.0 merge preserves
+top-level underscore keys, which cannot cover a nested one, so `plex.token` is
+restored explicitly and the `token_set` marker is dropped before persisting.
+`test_config_round_trip_does_not_disconnect_plex` performs the exact GET-then-POST
+the editor does.
+
+### MEDIUM — SYS_ADMIN granted for a mount the container never performs
+
+`docker-compose.yml` granted `cap_add: SYS_ADMIN`, left over from an approach
+where the container mounted the CIFS share itself. It doesn't: the `cifs` volume
+driver mounts on the host and the container sees an ordinary bind.
+
+**Tested rather than assumed** — a plain alpine container with zero added
+capabilities listed all 28 artist directories and successfully wrote to the share.
+So the capability bought nothing while granting close to a container-escape
+primitive, which matters far more given the XSS above hands an attacker the admin
+session.
+
+Replaced with `cap_drop: ALL`. Verified on the live deployment after a full
+recreate: CapAdd empty, CapDrop ALL, 28 dirs visible, write OK.
+
+**Capability changes need `docker compose down && up`, not a restart** — a plain
+`up -d` will not re-apply them.
+
+The container still runs as **root** (the python:3.12-slim default). Left alone
+here: changing USER interacts with file ownership on the CIFS mount (uid/gid 1000
+in the volume options) and deserves its own change rather than riding along in a
+security fix.
+
+### LOW
+
+- **config.json was 0644**, holding the Plex token, admin password hash and
+  session signing key — and the data directory is bind-mounted, so any local user
+  on the *host* could read all three. `state.write_json()` now chmods 0600.
+  Best-effort with a swallowed OSError: SMB/CIFS and Windows bind mounts often
+  reject chmod, and failing a state write over file permissions would be a much
+  worse outcome. The mode must be set *after* `os.replace()`, because replace
+  preserves the source file's mode and the temp file is created under the umask.
+- **ffmpeg argument injection.** argv was already a list (no shell), and
+  `src_path` directly follows `-i` so it is consumed as that option's value. The
+  output is a trailing positional, and filenames derive from video titles, so a
+  title beginning with a dash could be misread as an option. Added an
+  end-of-options marker. **Verified ffmpeg accepts it** — byte-identical output
+  with and without — because ffmpeg's parser is not GNU-style and assuming would
+  have risked breaking all conversion.
+
+### Reviewed and found sound
+
+No `shell=True`, `os.system` or `eval` anywhere; all three subprocess calls use
+argv lists. Path traversal via artist names is blocked — `artist_to_folder()`
+replaces both path separators, and four traversal payloads were tested with none
+escaping the media root. Login throttling (5 attempts / 300s per IP). HttpOnly
+plus SameSite=Lax. Secret key generated and persisted, never a fixed default.
+SSRF guard rejects loopback (v4 and v6), all three RFC1918 ranges, the
+cloud-metadata address, and hosts resolving to both a public and a private
+address. Notification URL withheld from API responses. Dependencies pinned with
+Dependabot active. Secret scanning and push protection on. No credentials in git
+history.
+
+Only `/login` and `/favicon.ico` are reachable unauthenticated by GET; the two
+`_noauth` artwork endpoints are deliberate and now documented precisely in
+SECURITY.md rather than merely labelled deliberate.
+
+### Three new invariants
+
+`tests/test_invariants.py` gained checks that fail the build if any finding
+regresses: unescaped server data reaching the DOM, the Plex token being returned
+by either config endpoint, and SYS_ADMIN or privileged mode reappearing in
+compose. **Each was verified to actually fire** by feeding the checker a synthetic
+violation — a bare title interpolation, a compose file granting SYS_ADMIN, and an
+`/api/config` returning the raw document.
+
+### Still open, deliberately
+
+`/api/artwork/swap_noauth` remains an unauthenticated write. Bounded (no
+traversal, no folder creation, SSRF-guarded) and documented, but if the port is
+ever exposed it is a defacement surface that also spends the Plex token. Requiring
+auth would break whatever consumes it; worth revisiting with that consumer in
+hand.
+
+### Review pass on the v1.6.1 branch — what the first fix missed
+
+The v1.6.1 changes above were reviewed before merging. The security reasoning
+held, but the review found four problems, and fixing the first one properly then
+surfaced a *second XSS vector of the same class* that neither the original pass
+nor the review had spotted. Recorded in full because the failure mode is general:
+**a regression guard written from the list of bugs you just fixed will only ever
+catch those bugs.**
+
+#### The guard was a naming test, not a safety test
+
+The first `test_no_unescaped_server_data_in_the_dom` required a match on *both*
+a receiver from a fixed list (`d`, `ch`, `v`, `a`, `c`, `r`, `p`, `s`, `data`,
+`video`, `item`) *and* a field from a fixed list of twelve names. It reported a
+clean pass — "unescaped server data remaining: none" — while:
+
+- `ch.download_path` and `ch.plex_media_path` sat unescaped **in the same
+  template literal** as five sites the same commit had just fixed. Neither field
+  name was in the list.
+- two `${errors}` interpolations sat unescaped immediately beside a newly-added
+  `escapeHtml(r.artist)`. A bare local has no receiver to match.
+- nine `'<div>' + e.message + '</div>'` concatenations reached `innerHTML`. The
+  guard only ever looked at `${...}`, so **an entire sink syntax was invisible to
+  it.**
+- a rename to `dl.title` or `entry.error` would have walked straight through.
+  Verified, not assumed: both were fed to the guard and both passed.
+
+Rewritten to use name *patterns* on any receiver (`\w+_path`, `\w+_url`,
+`\w+_id`, …) and to scan concatenation as well as interpolation. Expressions that
+are genuinely safe by construction are now listed individually in
+`REVIEWED_SAFE` with the reason — a short list is the point; a long one means the
+check has stopped being one.
+
+#### What the rewritten guard immediately found
+
+Fourteen more unescaped sites, one of them a real vulnerability of the same class
+as the original finding:
+
+```
+onclick="selectPlexServer('${srv.uri}', '${srv.name}')"
+```
+
+`srv.name` and `srv.uri` come from **plex.tv**, interpolated raw into an inline
+`onclick` JS string. A Plex server named with a quote breaks out of the string.
+This is precisely the case the v1.6.1 commit had already reasoned about correctly
+for channel URLs — and it was sitting three hundred lines away, unfixed, because
+the guard's field list did not contain `uri` and its receiver list did not
+contain `srv`. Both arguments are now `encodeURIComponent`-encoded with matching
+decodes in the handler.
+
+Also escaped: `entry.name` and `entry.path` (folder browser), `data.auth_url`,
+`srv.name` in its display span, `lib.title`, `r.label`, `r.why`, `f.artist`,
+`data.errors.join()`, `v.id` (twice), `d.download_id`, and thirteen `e.message` /
+`data.error` concatenations. Escape call sites went from 45 on `main` to 60 in the
+first pass to **98** after the review.
+
+#### Escaping into a text sink is a bug, not belt-and-braces
+
+The first pass added `escapeHtml()` to a `showToast()` argument. `showToast()`
+assigns `textContent`, which already makes markup inert — so the escape added
+nothing and the entities became *visible*: **Guns N' Roses** reached the user as
+`Guns N&#39; Roses`. Escaping is per-sink, and picking the wrong tool is possible
+in both directions. `test_text_sinks_are_not_pre_escaped` now asserts the inverse
+rule for `showToast` and `showConfirmModal`, and the DOM guard excludes those two
+call sites structurally so the two checks cannot contradict each other.
+
+#### `token_set` leaked into persisted state
+
+`incoming_plex.pop('token_set', None)` was inside `if isinstance(incoming_plex,
+dict) and current_token:`. On a **disconnected** install `current_token` is
+falsy, so a raw-config round-trip persisted `"token_set": false` into
+`config.json` and kept it there — a per-response presence flag masquerading as a
+stored setting. The connected case passed throughout, which is exactly why it
+needed its own test
+(`test_config_round_trip_from_a_disconnected_install_persists_no_marker`). The
+pop is now unconditional.
+
+#### The one fix with no guard, and a guard that could not fail
+
+`chmod 0600` had no test at all — the only one of the four fixes that could be
+deleted silently. It cannot be asserted behaviourally, because `os.chmod` on
+Windows only toggles the read-only bit, so a mode assertion would pass in CI and
+fail on the development machine. It is now asserted at source level, like the
+other invariants in that file.
+
+The ordering half of that assertion was written as
+`src.index('os.replace') < src.index('os.chmod(...)')` and was **vacuously
+true**: `state.py`'s module docstring mentions `os.replace` four times before any
+code does, and the real call is `_replace_with_retry(...)`, not `os.replace(...)`.
+It could never have failed. Caught only by mutating the source to move the chmod
+above the replace and observing that the test still passed — which is the whole
+argument for proving a guard fires rather than observing it pass.
+
+#### New invariant: encode and decode are a pair
+
+`encodeURIComponent` at a call site with no matching `decodeURIComponent` in the
+handler is a *silent functional break* — the fetch targets a channel URL or
+download id that does not exist, so it 404s into a toast rather than erroring
+visibly. No functional test in this repo clicks those buttons.
+
+Two subtleties, both found by mutation rather than by reading:
+
+- `downloadActions()` renders `onclick="${fn}(...)"`, so `cancelDownload` and
+  `retryDownload` reach the DOM through a variable, not a literal. The first
+  version of the pairing check reported a clean pass with **both** decodes
+  deleted. It now resolves that indirection through the `btn(label, fn, danger)`
+  helper's call sites.
+- `selectPlexServer` takes *two* encoded arguments. A body that decodes only one
+  still contains the word `decodeURIComponent`, so a presence check passes it.
+  The check now counts encoded arguments per call site and requires at least as
+  many decodes.
+
+#### Verification
+
+All six new or rewritten guards were proven to fail against a synthetic
+violation — new receiver name, suffix-matched field, concatenation sink,
+escaping into a text sink, chmod deleted, chmod moved before the replace — plus
+four separate decode-removal mutations including the partial-decode case. A guard
+that has only ever been observed passing has not been tested.
+
+Re-verified in a container built from the branch and run with `--cap-drop ALL`:
+`CapAdd=[]`, `CapDrop=[ALL]`, `config.json` mode `600`, `/dashboard` renders 200
+with the JS wired up, neither config endpoint returns a stored
+`SECRET-PLEX-TOKEN` while both report `token_set`, and a download record with a
+`<img src=x onerror=…>` title is served raw by the API and escaped at every one
+of its five render sites.

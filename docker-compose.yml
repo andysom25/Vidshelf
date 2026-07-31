@@ -40,8 +40,15 @@ services:
       - PLEX_CLIENT_ID=${PLEX_CLIENT_ID:-}
       - PLEX_PRODUCT=${PLEX_PRODUCT:-}
       - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-2}
-    cap_add:
-      - SYS_ADMIN
+    # No added capabilities. SYS_ADMIN used to be granted here, left over from
+    # an approach where the container mounted the CIFS share itself. It does
+    # not: the `cifs` volume driver below performs the mount on the host, and a
+    # container with zero added capabilities can both read and write the share
+    # (verified). SYS_ADMIN is one of the broadest capabilities available and is
+    # close to a container-escape primitive, so granting it for nothing was the
+    # worst trade in this file.
+    cap_drop:
+      - ALL
 
 volumes:
   music_videos_final:
