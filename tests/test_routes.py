@@ -63,6 +63,21 @@ def _routes():
         yield rule
 
 
+def _all_unparameterised_routes():
+    """Every rule with no URL parameters, *whatever* methods it accepts.
+
+    Deliberately separate from _routes(): that one drops anything without GET,
+    which is fine for a "does it 500 on a plain visit" smoke test and wrong for
+    an auth sweep. `/api/artwork/swap_noauth` is POST-only, so it was filtered
+    out here — one method check above the assertion that was supposed to be
+    covering it — and went unauthenticated for five releases.
+    """
+    for rule in app_module.app.url_map.iter_rules():
+        if rule.arguments:
+            continue
+        yield rule
+
+
 def test_routes_are_registered():
     # A bare count would be brittle; what matters is that the known areas are
     # all still present after any restructuring.
@@ -102,19 +117,83 @@ def test_no_route_500s_when_authenticated():
 
 
 def test_protected_routes_reject_anonymous_callers():
+    """Every non-public route must refuse an anonymous caller *before* it does
+    anything else.
+
+    This test had two blind spots until v1.7.0, and
+    `/api/artwork/search_noauth` sat in both of them for five releases while
+    serving artist artwork searches — and outbound requests to four external
+    APIs — to anyone who could reach the port:
+
+    1. **It only treated 200 as a failure.** A route that validates its
+       parameters before checking the session answers a bare probe with 400, so
+       it looked compliant. `?artist=Nirvana` returned 200 to an anonymous
+       caller the whole time.
+    2. **It only issued GET — and could not have done otherwise.** The
+       `_routes()` helper it iterated drops any rule without GET in its methods,
+       so `/api/artwork/swap_noauth`, being POST-only, was filtered out one line
+       above the assertion meant to cover it. Adding POST to the loop below is
+       not enough on its own; this now iterates
+       `_all_unparameterised_routes()`. Found by registering a throwaway
+       POST-only open route and watching the "fixed" sweep still pass.
+
+    Hence the stricter rule below: anonymous requests get 302 (pages), 401/403
+    (APIs) or 405 (wrong method), and *nothing else*. A 400 or a 200 both mean
+    the handler ran before the auth check. Verified against the real route table
+    — 57 routes already satisfied this; exactly the two above did not.
+    """
     client = _client(authenticated=False)
+    ALLOWED = {301, 302, 401, 403, 405}
     leaked = []
-    for rule in _routes():
+    for rule in _all_unparameterised_routes():
         if rule.endpoint in PUBLIC_ENDPOINTS:
             continue
-        resp = client.get(str(rule))
-        # Either a redirect to login (pages) or 401/403 (APIs). A 200 means
-        # the route is serving data to anyone who can reach the port.
-        if resp.status_code == 200:
-            leaked.append(f'{rule} -> HTTP 200 without a session')
-        elif resp.status_code >= 500:
-            leaked.append(f'{rule} -> HTTP {resp.status_code} without a session')
-    assert not leaked, 'unauthenticated access problems:\n  ' + '\n  '.join(leaked)
+        for method in ('GET', 'POST'):
+            if method not in rule.methods:
+                continue
+            resp = client.open(str(rule), method=method,
+                               json={} if method == 'POST' else None)
+            if resp.status_code not in ALLOWED:
+                leaked.append(
+                    f'{method} {rule} -> HTTP {resp.status_code} without a session '
+                    f'(expected one of {sorted(ALLOWED)})')
+    assert not leaked, (
+        'Unauthenticated access problems. A 400 is as much a failure as a 200 '
+        'here: it means the handler validated input before checking the '
+        'session.\n  ' + '\n  '.join(leaked))
+
+
+def test_artwork_endpoints_require_a_session_under_both_names():
+    """The v1.7.0 fix, pinned on the exact requests that used to succeed.
+
+    `?artist=` is the one that actually leaked — a bare call always returned 400
+    and so looked fine. The `_noauth` paths are kept as aliases so an existing
+    bookmark gets a 401 instead of a 404; if they are ever dropped, this test
+    should be updated deliberately rather than deleted.
+    """
+    anon = _client(authenticated=False)
+    for path in ('/api/artwork/search?artist=Nirvana',
+                 '/api/artwork/search_noauth?artist=Nirvana'):
+        assert anon.get(path).status_code == 401, f'{path} served an anonymous caller'
+    for path in ('/api/artwork/swap', '/api/artwork/swap_noauth'):
+        resp = anon.post(path, json={'artist_name': 'Nirvana',
+                                     'new_image_url': 'https://example.com/a.jpg'})
+        assert resp.status_code == 401, f'{path} accepted an anonymous write'
+
+    # Authenticated callers must still get past the auth check on both names —
+    # a 401 here would mean the fix broke the dashboard.
+    auth = _client(authenticated=True)
+    for path in ('/api/artwork/search', '/api/artwork/search_noauth'):
+        assert auth.get(path).status_code != 401, f'{path} rejects a valid session'
+
+
+def test_dashboard_does_not_reference_the_noauth_aliases():
+    """The dashboard is the only consumer, and it should use the canonical
+    names — otherwise the aliases can never be retired."""
+    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'static', 'js', 'dashboard.js'), encoding='utf-8') as fh:
+        js = fh.read()
+    assert '_noauth' not in js, 'dashboard.js still calls a deprecated _noauth alias'
 
 
 def test_login_page_renders_anonymously():

@@ -52,18 +52,19 @@ Vidshelf holds real credentials, so these are the things worth reporting:
 
 Documented in `REFERENCE.md` rather than being oversights:
 
-- **`/api/artwork/search_noauth` and `/swap_noauth` are unauthenticated on
-  purpose**, with the reasoning recorded in `REFERENCE.md`. Being precise about
-  what that means, since "deliberate" is not the same as "harmless": anyone who
-  can reach the port can overwrite `folder.jpg`/`poster.jpg` **in an existing
-  artist folder**, and can cause the server to update that artist's Plex
-  collection artwork using the stored Plex token. Reviewed and confirmed bounded:
-  the artist name cannot escape the media root (path separators are stripped —
-  tested), the image URL goes through the SSRF guard, and no folder can be
-  created. Treat it as a defacement surface if the port is exposed. Reports of a
-  *bypass* of any of those bounds are in scope; the endpoints being open is not.
 - Secret scanning and push protection are enabled on this repo. If you find a
   live credential in the history, please report it privately — don't test it.
+
+**Removed from this list in v1.7.0.** `/api/artwork/search_noauth` and
+`/swap_noauth` were listed here as unauthenticated *on purpose*, on the stated
+grounds that requiring auth would break their consumer. That was never checked,
+and it was wrong: the only consumer was this app's own already-authenticated
+dashboard. Both endpoints now require a session, under the canonical names
+`/api/artwork/search` and `/api/artwork/swap`.
+
+Treat anything in this section as a claim to be re-tested, not a settled one — a
+"deliberate" label is only as good as the reasoning behind it, and that one went
+unexamined through five releases and a full security review.
 
 ## Previously found and fixed
 

@@ -4251,6 +4251,11 @@ ever exposed it is a defacement surface that also spends the Plex token. Requiri
 auth would break whatever consumes it; worth revisiting with that consumer in
 hand.
 
+> **Closed in v1.7.0.** The premise above was wrong, and checking it took one
+> grep: the consumer was this app's own dashboard, in an authenticated page.
+> There was no third-party consumer to break. See "v1.7.0 — the `_noauth`
+> endpoints" below.
+
 ### Review pass on the v1.6.1 branch — what the first fix missed
 
 The v1.6.1 changes above were reviewed before merging. The security reasoning
@@ -4377,3 +4382,103 @@ with the JS wired up, neither config endpoint returns a stored
 `SECRET-PLEX-TOKEN` while both report `token_set`, and a download record with a
 `<img src=x onerror=…>` title is served raw by the API and escaped at every one
 of its five render sites.
+
+## v1.7.0 — the `_noauth` endpoints, and three blind spots in the test that should have caught them
+
+`/api/artwork/search_noauth` and `/api/artwork/swap_noauth` now require a
+session. The interesting part is not the fix — it is four lines — but why an
+open endpoint survived five releases *and* a dedicated security review in a repo
+that has a test named
+`test_protected_routes_reject_anonymous_callers`.
+
+### The premise that kept it open was never checked
+
+Through v1.6.1 this was recorded as "deliberate, bounded", on the grounds that
+*"requiring auth would break whatever consumes it; worth revisiting with that
+consumer in hand."* That reasoning was repeated across `SECURITY.md`,
+`REFERENCE.md` and a release note without anyone establishing who the consumer
+was.
+
+One grep answered it. The only callers were two `fetch()` calls in
+`static/js/dashboard.js`, both on an authenticated page. There was no
+third-party consumer, and there was no authenticated equivalent to migrate to —
+the `_noauth` routes *were* the only artwork search and swap endpoints. Nothing
+was ever at risk of breaking.
+
+**The lesson is about the shape of the claim, not the endpoint.** "We can't fix
+this because it would break X" is a load-bearing assumption; if X is never
+named, it is a guess wearing the clothes of a design decision. It survived
+precisely because it sounded like one.
+
+### What was actually exposed
+
+Anyone who could reach the port could:
+
+- run artist artwork searches, which fan out to TheAudioDB, Fanart.tv,
+  MusicBrainz and Wikimedia — an unauthenticated outbound-request amplifier
+  using the operator's own Fanart.tv API key, and a cache-poisoning surface for
+  `_ARTWORK_SEARCH_CACHE`
+- overwrite `folder.jpg`/`poster.jpg` in any existing artist folder, and spend
+  the stored Plex token updating that collection's artwork
+
+Bounded, as documented — no traversal, no folder creation, SSRF-guarded. Still
+not something to leave open once the stated reason for leaving it open had
+evaporated.
+
+### Three reasons the auth sweep passed anyway
+
+This is the part worth keeping. The sweep asserted that every non-public route
+rejects an anonymous caller, and it reported a clean pass throughout.
+
+1. **It only treated `200` as a failure.** `search_noauth` validates its
+   `artist` parameter *before* checking anything else, so a bare probe returns
+   `400` — which the sweep accepted as evidence of a working guard. Adding
+   `?artist=Nirvana` returned `200` to an anonymous caller the entire time.
+   Measured, not inferred: that exact request returned `200` before the fix and
+   `401` after.
+
+2. **It only issued `GET` — and could not have done otherwise.** The `_routes()`
+   helper it iterated skips any rule without `GET` in `methods`. `swap_noauth`
+   is POST-only, so it was filtered out *one method check above* the assertion
+   meant to cover it. The sweep never called it once.
+
+3. **Adding POST to the loop did not fix #2.** This is the trap. The obvious
+   repair — iterate `('GET', 'POST')` — still yields nothing for a POST-only
+   route, because the generator dropped it before the loop ever saw it. The
+   "fixed" sweep passed against a deliberately-open POST-only probe route. Only
+   then did the generator itself get replaced with
+   `_all_unparameterised_routes()`.
+
+Found by registering two throwaway routes that reproduce each shape — one that
+validates before authenticating, one POST-only and wide open — and confirming
+the sweep now catches both. #3 would not have been found by reading the diff.
+
+### The rule now
+
+An anonymous request to any non-public route must return `301/302` (pages),
+`401/403` (APIs) or `405` (wrong method) — and **nothing else**. A `400` is
+treated as a failure, because it means the handler ran before the session check.
+That is a stricter contract than "don't return 200", and it is what makes the
+validate-then-authenticate ordering enforceable rather than a convention.
+
+Verified against the real route table: 57 routes already satisfied it, and
+exactly the two above did not.
+
+### Route naming
+
+Canonical names are now `/api/artwork/search` and `/api/artwork/swap`. The
+`_noauth` paths are kept as aliases on the same handlers so an existing bookmark
+or script gets a `401` rather than a `404` — the rename is cosmetic; the auth
+check is the change. `test_dashboard_does_not_reference_the_noauth_aliases`
+keeps the dashboard on the canonical names, so the aliases can actually be
+retired later instead of becoming permanent.
+
+`request.get_json()` in the swap handler became `get_json(silent=True)`: with
+the auth check first, an anonymous caller posting no body should get `401`, not
+a `400` from JSON parsing.
+
+### What to check first if this regresses
+
+`python tests/test_routes.py`. If a new endpoint trips
+`test_protected_routes_reject_anonymous_callers` with a `400`, the fix is to move
+its session check above its parameter validation — not to relax the allowed set.

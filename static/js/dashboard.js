@@ -2459,7 +2459,7 @@ function fetchSwapArtImagePage(resultsDiv, append) {
         return;
     }
     statusEl.innerHTML = '<div class="loading"><div class="spinner"></div><p>Searching for artwork...</p></div>';
-    fetch(`/api/artwork/search_noauth?artist=${encodeURIComponent(swapArtSearchArtist)}&page=${swapArtSearchPage}`)
+    fetch(`/api/artwork/search?artist=${encodeURIComponent(swapArtSearchArtist)}&page=${swapArtSearchPage}`)
         .then(r => r.json())
         .then(data => {
             statusEl.innerHTML = '';
@@ -2496,7 +2496,7 @@ function swapArtwork() {
     const btn = document.getElementById('swap-art-swap-btn');
     btn.disabled = true;
     btn.textContent = '⏳ Swapping...';
-    fetch('/api/artwork/swap_noauth', {
+    fetch('/api/artwork/swap', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ artist_name: artist, new_image_url: imageUrl })
