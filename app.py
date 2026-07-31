@@ -15,7 +15,8 @@ import retention
 import scheduler
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
-from downloader import download_video, get_active_downloads, queue_download
+from downloader import (download_video, get_active_downloads, queue_download,
+                        request_cancel, DownloadCancelled, build_format_selector)
 from artwork_sync import (
     ArtworkWatcher, sync_artist_artwork, sync_all_artists,
     trigger_plex_refresh, setup_logging, folder_to_artist,
@@ -265,6 +266,39 @@ def _set_security_headers(response):
     response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'same-origin')
     return response
+
+def _cookies_file():
+    """Path to a yt-dlp cookies file, or None.
+
+    Lives in the data directory so it survives rebuilds and is covered by the
+    same volume as config. A repo-root cookies.txt is also honoured, because one
+    has existed there (gitignored) since long before anything read it.
+    """
+    for candidate in (os.path.join(state.DATA_DIR, 'cookies.txt'), './cookies.txt'):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _download_options(channel_url=None):
+    """Resolve per-download yt-dlp options: quality cap and cookies.
+
+    A channel's own max_height wins; otherwise the global default applies. 0 or
+    absent means no cap, which is the pre-v1.6.0 behaviour.
+    """
+    config = load_config()
+    cap = config.get('max_height') or 0
+    for ch in config.get('channels', []):
+        if channel_url and ch.get('url') == channel_url:
+            if ch.get('max_height'):
+                cap = ch['max_height']
+            break
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        cap = 0
+    return {'max_height': cap if cap > 0 else None, 'cookies_file': _cookies_file()}
+
 
 def _notify_download(kind, title, channel_url, error=None):
     """Fire a download notification. Never raises — callers are worker threads.
@@ -630,7 +664,8 @@ def api_channels():
             'display_name': display_name or 'Unknown Channel',
             'download_path': ch['download_path'],
             'plex_media_path': ch.get('plex_media_path', './downloads'),
-            'download_mode': ch.get('download_mode', 'manual')
+            'download_mode': ch.get('download_mode', 'manual'),
+            'max_height': ch.get('max_height', 0)
         })
     return jsonify({'channels': channels})
 
@@ -795,7 +830,8 @@ def api_download():
         try:
             os.makedirs(plex_media_path, exist_ok=True)
             download_video(video_id, download_path, plex_media_path,
-                          title=title, channel_url=channel_url, download_id=download_id)
+                          title=title, channel_url=channel_url, download_id=download_id,
+                          **_download_options(channel_url))
             mark_video_downloaded(video_id, channel_url)
             _notify_download('complete', title, channel_url)
         except Exception as exc:  # noqa: BLE001
@@ -803,8 +839,13 @@ def api_download():
             # thread — but no longer silently. Before notifications existed the
             # only trace of a failure was a line in `docker logs`, which nobody
             # reads until they notice something missing.
-            print(f'[download] FAILED {video_id} ({title}): {exc}')
-            _notify_download('failed', title, channel_url, error=exc)
+            # A cancellation is the user's own request, not a failure — it must
+            # not send a "download failed" notification.
+            if isinstance(exc, DownloadCancelled):
+                print(f'[download] cancelled {video_id} ({title})')
+            else:
+                print(f'[download] FAILED {video_id} ({title}): {exc}')
+                _notify_download('failed', title, channel_url, error=exc)
 
     _DOWNLOAD_EXECUTOR.submit(_do_download)
     return jsonify({'success': True, 'message': f'Download started for {video_id}', 'video_id': video_id})
@@ -921,12 +962,16 @@ def api_channels_download_all():
         vid = video['id']
         title = video.get('title', 'Unknown')
         try:
-            download_video(vid, path, plex, title=title, channel_url=url, download_id=download_id)
+            download_video(vid, path, plex, title=title, channel_url=url,
+                           download_id=download_id, **_download_options(url))
             mark_video_downloaded(vid, url)
             _notify_download('complete', title, url)
         except Exception as exc:  # noqa: BLE001
-            print(f'[download] FAILED {vid} ({title}): {exc}')
-            _notify_download('failed', title, url, error=exc)
+            if isinstance(exc, DownloadCancelled):
+                print(f'[download] cancelled {vid} ({title})')
+            else:
+                print(f'[download] FAILED {vid} ({title}): {exc}')
+                _notify_download('failed', title, url, error=exc)
 
     started = []
     for video in videos[:20]:
@@ -951,7 +996,14 @@ def api_stats():
         return jsonify({'error': 'Unauthorized'}), 401
     tracker = load_downloaded_tracker()
     downloads_count = sum(len(vids) for vids in tracker.values())
-    videos_count = sum(len(vids) for vids in tracker.values())
+
+    # "Videos Available" used to be computed from the identical expression as
+    # downloads_count, so the dashboard showed the same number in two cards and
+    # one of them meant nothing. It now reports videos seen on your channels that
+    # have NOT been downloaded — which is the number that tells you whether
+    # there's anything to fetch. Populated by the channel monitor, so it reads
+    # None until a check has run rather than pretending to be 0.
+    new_available = _CHANNEL_MONITOR.pending_count()
 
     disk_usage = 0
     for dirpath, _, filenames in os.walk('./downloads'):
@@ -963,7 +1015,10 @@ def api_stats():
                 pass
 
     return jsonify({
-        'videos_count': videos_count,
+        # Kept for backwards compatibility with any existing client; the
+        # dashboard now uses new_available.
+        'videos_count': new_available,
+        'new_available': new_available,
         'downloads_count': downloads_count,
         'disk_usage': disk_usage
     })
@@ -1562,11 +1617,24 @@ def api_system_health():
         return jsonify({'error': 'Unauthorized'}), 401
     binaries = transcode.check_dependencies()
     title_card_deps = check_title_card_dependencies()
+    # Cookies are optional, but their absence used to be invisible: a
+    # cookies.txt sat in the repo for months while nothing passed it to yt-dlp,
+    # so age-restricted downloads failed with no indication why. Reporting it
+    # here means "is it being used" is answerable without reading the source.
+    cookies = _cookies_file()
     return jsonify({
         'ffmpeg': binaries['ffmpeg'],
         'ffprobe': binaries['ffprobe'],
         'pillow': title_card_deps['pillow'],
         'fonts': title_card_deps['fonts'],
+        'cookies': {
+            'available': bool(cookies),
+            'path': cookies,
+            'detail': (f'In use: {cookies}' if cookies else
+                       'Not found — age-restricted and members-only videos will '
+                       'fail. Drop a yt-dlp cookies.txt into the data directory '
+                       'to enable them.'),
+        },
     })
 
 
@@ -1611,12 +1679,16 @@ def _monitor_start_download(video, channel):
         try:
             os.makedirs(plex_media_path, exist_ok=True)
             download_video(vid, download_path, plex_media_path,
-                           title=title, channel_url=url, download_id=download_id)
+                           title=title, channel_url=url, download_id=download_id,
+                           **_download_options(url))
             mark_video_downloaded(vid, url)
             _notify_download('complete', title, url)
         except Exception as exc:  # noqa: BLE001
-            print(f'[monitor] FAILED {vid} ({title}): {exc}')
-            _notify_download('failed', title, url, error=exc)
+            if isinstance(exc, DownloadCancelled):
+                print(f'[monitor] cancelled {vid} ({title})')
+            else:
+                print(f'[monitor] FAILED {vid} ({title}): {exc}')
+                _notify_download('failed', title, url, error=exc)
 
     _DOWNLOAD_EXECUTOR.submit(_run)
     return download_id
@@ -1692,6 +1764,111 @@ _CHANNEL_MONITOR = scheduler.ChannelMonitor(
     free_space=_monitor_free_space,
     run_retention=_monitor_run_retention,
 )
+
+
+@app.route('/api/channels/quality', methods=['POST'])
+def api_channels_quality():
+    """Cap the resolution downloaded from one channel. 0 clears the cap.
+
+    Per-channel rather than global because the reason to cap is usually one
+    specific channel publishing 4K — capping everything to protect against that
+    would needlessly downgrade the rest.
+    """
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    url = (data.get('url') or '').strip()
+    try:
+        height = max(0, int(data.get('max_height', 0)))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'max_height must be a number'}), 400
+
+    found = {'ok': False}
+
+    def _set(config):
+        for ch in config.get('channels', []):
+            if ch.get('url') == url:
+                if height:
+                    ch['max_height'] = height
+                else:
+                    ch.pop('max_height', None)
+                found['ok'] = True
+                break
+
+    _update_config(_set)
+    if not found['ok']:
+        return jsonify({'error': 'Channel not found'}), 404
+    label = f'{height}p' if height else 'best available'
+    return jsonify({'success': True, 'message': f'Quality cap set to {label}'})
+
+
+@app.route('/api/downloads/<download_id>/cancel', methods=['POST'])
+def api_download_cancel(download_id):
+    """Cancel a queued or running download.
+
+    Cooperative: a queued item flips to cancelled immediately, while a running
+    one stops at its next progress callback — under a second in practice. Killing
+    the worker thread instead would risk leaving a half-written file on a network
+    share, which is a failure mode this project has paid for before.
+    """
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    ok, detail = request_cancel(download_id)
+    return jsonify({'success': ok, 'detail': detail}), (200 if ok else 409)
+
+
+@app.route('/api/downloads/<download_id>/retry', methods=['POST'])
+def api_download_retry(download_id):
+    """Re-queue a failed or cancelled download.
+
+    Re-queues as a *new* download rather than resurrecting the old entry, so the
+    Downloads list keeps an honest record of the attempt that failed instead of
+    rewriting history.
+    """
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    entry = next((d for d in (get_active_downloads() or [])
+                  if d.get('download_id') == download_id), None)
+    if not entry:
+        return jsonify({'error': 'Unknown download'}), 404
+    if entry.get('status') not in ('error', 'cancelled'):
+        return jsonify({'error': f"Can only retry a failed or cancelled download "
+                                 f"(this one is {entry.get('status')})"}), 409
+
+    video_id = entry.get('video_id')
+    channel_url = entry.get('channel_url') or ''
+    title = entry.get('title') or 'Unknown'
+
+    config = load_config()
+    download_path = './downloads'
+    plex_media_path = _resolve_plex_path('./downloads')
+    for ch in config.get('channels', []):
+        if ch['url'] == channel_url:
+            download_path = ch.get('download_path', './downloads')
+            plex_media_path = _resolve_plex_path(ch.get('plex_media_path', './downloads'))
+            break
+
+    new_id = queue_download(video_id, title, channel_url, final_path=plex_media_path)
+
+    def _run():
+        try:
+            os.makedirs(plex_media_path, exist_ok=True)
+            download_video(video_id, download_path, plex_media_path, title=title,
+                           channel_url=channel_url, download_id=new_id,
+                           **_download_options(channel_url))
+            mark_video_downloaded(video_id, channel_url)
+            _notify_download('complete', title, channel_url)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, DownloadCancelled):
+                print(f'[retry] cancelled {video_id} ({title})')
+            else:
+                print(f'[retry] FAILED {video_id} ({title}): {exc}')
+                _notify_download('failed', title, channel_url, error=exc)
+
+    _DOWNLOAD_EXECUTOR.submit(_run)
+    return jsonify({'success': True, 'download_id': new_id,
+                    'message': f'Retrying {title}'})
 
 
 @app.route('/api/monitor/status')

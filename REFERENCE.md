@@ -4022,3 +4022,109 @@ CLAUDE.md now records both standing rules: hand-written notes on every release,
 and README updates on any release that changes user-facing behaviour — including
 recapturing screenshots, which go stale silently with no test to catch them.
 `settings.png` was recaptured here for exactly that reason.
+
+## ADDED (2026-07-30): download control — cancel/retry, quality caps, cookies (v1.6.0)
+
+v1.5.x added unattended automation; this adds the handles for it. Plus two
+user-visible bugs found by reading the code rather than hitting them.
+
+### Cancel and retry
+
+There was no cancel or retry path anywhere. Tolerable when every download was a
+deliberate click; poor once monitoring queues work on a timer and a deep queue
+skips ticks.
+
+**Cancellation is cooperative, not a kill.** yt-dlp has no cancel API; the
+documented way to stop a download in flight is to **raise from a progress hook**,
+which unwinds its internals cleanly and lets yt-dlp clean up its own `.part`
+file. `request_cancel()` sets a flag; `_progress_hook` checks it on every
+callback and raises `DownloadCancelled`. Latency is one progress callback — well
+under a second for an active download.
+
+Terminating the worker thread instead would risk a half-written file being moved
+onto a network share, which is precisely the failure mode CLAUDE.md gotcha #2
+exists because of.
+
+A **queued** download has no worker to notice the flag, so `request_cancel()`
+flips its status itself — otherwise the button would appear to do nothing until a
+worker eventually picked it up.
+
+**A cancellation is not a failure.** It records as `cancelled`, and all three
+download workers plus the retry worker check `isinstance(exc, DownloadCancelled)`
+before notifying, so stopping a download can't send a "download failed" alert for
+something the user asked to stop. That guard is in four places because the
+notification call is.
+
+**Retry re-queues as a new download** rather than resurrecting the old entry, so
+the record of the attempt that failed stays intact instead of being rewritten.
+
+### Per-channel quality cap
+
+The format selector was a hardcoded constant. Monitoring a 4K channel unattended
+meant 4K files regardless — disk plus a CPU-heavy re-encode each.
+
+`build_format_selector(max_height)` applies the cap to **every branch**, not just
+the preferred one. That matters: the selector falls back through
+`bestvideo[vcodec^=avc1]` → `best[vcodec^=avc1]` → `bestvideo+bestaudio` →
+`best`, and without capping the fallbacks a channel publishing only AV1 at 2160p
+would satisfy a later branch and silently ignore a 1080p request. There's a test
+asserting every branch except the final bare `best` carries the cap.
+
+Uncapped output is byte-identical to pre-v1.6.0 — pinned by a test, because a
+change there would silently alter which stream every existing install picks.
+
+Per channel rather than global: the reason to cap is usually one specific
+channel, and a global cap to handle that would needlessly downgrade the rest.
+
+### Cookies
+
+`cookies.txt` has existed in this repo (gitignored) since long before anything
+read it — `ydl_opts` never contained `cookiefile`, so age-restricted and
+members-only videos failed with **no indication why**.
+
+Now read from `data/cookies.txt` (preferred, since it's inside the mounted volume)
+or a repo-root `cookies.txt` for continuity. Settings → System Health reports
+whether one was found, so this specific class of silent misconfiguration is
+answerable from the UI instead of by reading source.
+
+The health row renderer needed extending: it keyed on `info.found` and painted
+anything missing as a red ❌. An absent cookies file is *information*, not a
+fault, so optional rows now render neutral (ℹ️) when missing.
+
+### Bug: the dashboard showed the same number twice
+
+```python
+downloads_count = sum(len(vids) for vids in tracker.values())
+videos_count    = sum(len(vids) for vids in tracker.values())
+```
+
+Identical expressions. "Videos Available" and "Downloads" were therefore always
+equal — visible in the v1.3.0 screenshots as 24/24 — and one of four cards
+conveyed nothing.
+
+Now **New Available**: videos seen on monitored channels that aren't downloaded,
+recorded per tick by the scheduler (`pending` per channel, summed by
+`pending_count()`). It returns `None` until a check has run and the UI shows
+`--`, because reporting `0` would assert "nothing new" when the truth is "nothing
+has looked".
+
+### Bug: the sidebar said "beta"
+
+Untrue since v1.0.0, and the first thing a visitor read. Removed; the version was
+already in the sidebar footer.
+
+### Verified in a container
+
+| check | result |
+| --- | --- |
+| cookies absent | reported, with instructions |
+| cookies present | `available: true`, and `DEBUG: using cookies from ./data/cookies.txt` confirms yt-dlp received it |
+| channel cap 1080 | resolved to 1080 |
+| no channel cap | resolved to None (unchanged behaviour) |
+| cancel queued | 200, status `cancelled` |
+| cancel twice | 409 `Already cancelled` |
+| retry | 200, genuinely re-queued and executed |
+
+`tests/test_downloads.py` adds 10 tests over the format selector and the
+cancellation flag; `test_routes.py` gained 5 for the endpoints, the stats fix and
+the removed badge.
