@@ -174,6 +174,21 @@ def write_json(path, data, indent=2):
         except (OSError, AttributeError):
             pass
 
+        # Owner-only. config.json holds the Plex token, the admin password hash
+        # and the session signing key, and the data directory is bind-mounted —
+        # so 0644 meant any local user on the *host* could read all three. The
+        # temp file is created by open() under the process umask, and
+        # os.replace() preserves the source's mode, so the mode has to be set
+        # here rather than relying on the umask.
+        #
+        # Best-effort: SMB/CIFS shares and Windows bind mounts frequently reject
+        # or ignore chmod, and failing a state write over file permissions would
+        # be a far worse outcome than a permissive mode.
+        try:
+            os.chmod(abs_path, 0o600)
+        except OSError:
+            pass
+
 
 def update_json(path, mutate, default=None, indent=2):
     """Read-modify-write under one lock, so concurrent updates can't clobber.

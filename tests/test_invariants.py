@@ -175,6 +175,74 @@ def test_ghcr_image_name_is_lowercase():
         'IMAGE_NAME must not derive from github.repository — it capitalises the V.'
 
 
+def test_no_unescaped_server_data_in_the_dom():
+    """v1.6.1 regression guard for stored XSS.
+
+    `d.title` comes from yt-dlp's extracted YouTube title, so it is
+    attacker-influenced: downloading a video titled `<img src=x onerror=...>`
+    executed script in the admin's authenticated session, from which
+    `GET /api/config` returned the Plex token. Nine sites interpolated server
+    data into innerHTML without escaping.
+
+    escapeHtml() escapes all five of & < > " ' so it is correct for text and
+    quoted-attribute contexts. encodeURIComponent is accepted too, and is the
+    right tool inside an inline handler — there, HTML entities are decoded by the
+    parser before the JS engine sees them, so escaping alone would not prevent a
+    quote breaking out of the JS string.
+    """
+    src = _read(os.path.join('static', 'js', 'dashboard.js'))
+    # Fields that carry remote or filesystem-derived content.
+    fields = ('title', 'url', 'name', 'filename', 'error', 'artist', 'channel',
+              'detail', 'message', 'root', 'video_id', 'final_path')
+    pattern = re.compile(r'\$\{([^}]{1,120})\}')
+    field_re = re.compile(
+        r'\b(d|ch|v|a|c|r|p|s|data|video|item)\.(' + '|'.join(fields) + r')\b')
+
+    offenders = []
+    for match in pattern.finditer(src):
+        expr = match.group(1)
+        if 'escapeHtml' in expr or 'encodeURIComponent' in expr:
+            continue
+        if field_re.search(expr):
+            line = src[:match.start()].count('\n') + 1
+            offenders.append(f'dashboard.js:{line}: ${{{expr.strip()[:70]}}}')
+
+    assert not offenders, (
+        'Server-supplied data interpolated into the DOM without escaping. Wrap '
+        'it in escapeHtml() — or encodeURIComponent() if it lands inside an '
+        'inline onclick/onchange handler.\n  ' + '\n  '.join(offenders))
+
+
+def test_plex_token_is_never_returned_by_the_api():
+    """The Plex token is a bearer credential for the user's whole Plex account.
+
+    Both /api/config and /api/plex/config used to return it, so any script in the
+    admin session could exfiltrate it with one fetch. The UI only ever needed to
+    know whether one exists, which is what token_set reports.
+    """
+    src = _read('app.py')
+    # Both GET handlers must strip it and expose the boolean instead.
+    assert src.count("plex['token_set']") >= 2 or src.count("['token_set']") >= 2, \
+        'token_set marker missing — did a GET handler stop stripping the token?'
+    assert "plex.pop('token', None)" in src, \
+        'the Plex token is no longer being popped before serialisation'
+    # And the POST merge must restore it, or round-tripping config disconnects Plex.
+    assert "incoming_plex.setdefault('token', current_token)" in src, \
+        'POST /api/config no longer preserves the stored Plex token'
+
+
+def test_container_grants_no_extra_capabilities():
+    """SYS_ADMIN was granted for a CIFS mount the container never performs — the
+    `cifs` volume driver mounts on the host. Verified: a container with zero
+    added capabilities both reads and writes the share. SYS_ADMIN is close to a
+    container-escape primitive, so it must not come back."""
+    compose = _read('docker-compose.yml')
+    for line in _code_lines(compose):
+        assert 'SYS_ADMIN' not in line, f'SYS_ADMIN granted again: {line.strip()}'
+        assert 'privileged: true' not in line.lower(), f'privileged mode: {line.strip()}'
+    assert 'cap_drop' in compose, 'cap_drop: ALL removed from docker-compose.yml'
+
+
 def test_current_version_has_hand_written_release_notes():
     """CLAUDE.md requires release-notes/vX.Y.Z.md for the version in VERSION.
 

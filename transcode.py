@@ -165,10 +165,16 @@ def convert_to_plex_compatible(src_path, dest_path=None):
     # filesystem copy.
     tmp_path = dest_path + '.converting.mp4'
 
+    # Filenames derive from YouTube video titles, so a title beginning with '-'
+    # produces a path ffmpeg would parse as an option. src_path is safe (it
+    # directly follows -i and is consumed as its value), but the output is a
+    # trailing positional. '--' ends option parsing so it can't be misread.
+    # Worst case without this is a failed conversion rather than execution — the
+    # argv list already rules out shell injection — but it costs one token.
     cmd = [_ffmpeg_bin(), '-y', '-i', src_path,
            '-map', '0:v:0', '-map', '0:a:0?',
            *video_args, *audio_args,
-           '-movflags', '+faststart', tmp_path]
+           '-movflags', '+faststart', '--', tmp_path]
 
     _log.info("Converting %s -> %s (video %s, audio %s)", src_path, dest_path,
               'copy' if video_ok else f'libx264 crf={_X264_CRF}',

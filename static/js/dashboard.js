@@ -213,7 +213,9 @@
             try {
                 const plexResp = await fetch('/api/plex/config');
                 const plexData = await plexResp.json();
-                plexConnected = !!plexData.token;
+                // token_set, not token: the server no longer sends the
+                // credential itself, only whether one exists.
+                plexConnected = !!plexData.token_set;
             } catch (e) { /* leave plexConnected false if this fails */ }
 
             const hasChannel = channelCount > 0;
@@ -305,21 +307,21 @@
                         <div class="video-card" style="padding:16px;">
                             <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;">
                                 <div style="font-weight:600;color:#fff;">📺 ${displayName}</div>
-                                <button class="btn btn-sm" style="background:rgba(220,53,69,0.15);color:#f8a5b0;border:1px solid rgba(220,53,69,0.3);" onclick="confirmRemoveChannel('${ch.url}')" title="Remove channel">✕</button>
+                                <button class="btn btn-sm" style="background:rgba(220,53,69,0.15);color:#f8a5b0;border:1px solid rgba(220,53,69,0.3);" onclick="confirmRemoveChannel('${encodeURIComponent(ch.url)}')" title="Remove channel">✕</button>
                             </div>
-                            <div style="font-size:0.85em;color:#8888a0;word-break:break-all;margin-bottom:4px;">${ch.url}</div>
+                            <div style="font-size:0.85em;color:#8888a0;word-break:break-all;margin-bottom:4px;">${escapeHtml(ch.url)}</div>
                             <div style="font-size:0.8em;color:#606070;">Download: ${ch.download_path}</div>
                             <div style="font-size:0.8em;color:#606070;">Plex: ${ch.plex_media_path}</div>
                             <div style="margin-top:8px;display:flex;align-items:center;gap:10px;">
                                 <span style="font-size:0.78em;color:#9090a0;">Mode:</span>
-                                <select onchange="changeChannelMode('${ch.url}', this.value)" style="padding:4px 8px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e0e0e0;font-size:0.8em;">
+                                <select onchange="changeChannelMode('${encodeURIComponent(ch.url)}', this.value)" style="padding:4px 8px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e0e0e0;font-size:0.8em;">
                                     <option value="manual" ${mode === 'manual' ? 'selected' : ''}>🖐 Manual</option>
                                     <option value="new" ${mode === 'new' ? 'selected' : ''}>🆕 New Only</option>
                                     <option value="all" ${mode === 'all' ? 'selected' : ''}>📥 All Videos</option>
                                 </select>
                                 <span style="font-size:0.72em;padding:2px 8px;border-radius:4px;background:${modeColor}22;color:${modeColor};border:1px solid ${modeColor}44;">${modeLabel}</span>
                                 <span style="font-size:0.78em;color:#9090a0;margin-left:6px;">Max:</span>
-                                <select onchange="changeChannelQuality('${ch.url}', this.value)" style="padding:4px 8px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e0e0e0;font-size:0.8em;" title="Cap the resolution downloaded from this channel">
+                                <select onchange="changeChannelQuality('${encodeURIComponent(ch.url)}', this.value)" style="padding:4px 8px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:#e0e0e0;font-size:0.8em;" title="Cap the resolution downloaded from this channel">
                                     <option value="0" ${!ch.max_height ? 'selected' : ''}>Best available</option>
                                     <option value="2160" ${ch.max_height == 2160 ? 'selected' : ''}>4K (2160p)</option>
                                     <option value="1440" ${ch.max_height == 1440 ? 'selected' : ''}>1440p</option>
@@ -328,8 +330,8 @@
                                 </select>
                             </div>
                             <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-                                <button class="btn btn-primary btn-sm" onclick="loadChannelVideos('${ch.url}')">📋 List Videos</button>
-                                <button class="btn btn-sm" style="background:rgba(40,167,69,0.12);color:#7ddf90;border:1px solid rgba(40,167,69,0.25);" onclick="downloadAllChannelVideos('${ch.url}')">⬇ Download All</button>
+                                <button class="btn btn-primary btn-sm" onclick="loadChannelVideos('${encodeURIComponent(ch.url)}')">📋 List Videos</button>
+                                <button class="btn btn-sm" style="background:rgba(40,167,69,0.12);color:#7ddf90;border:1px solid rgba(40,167,69,0.25);" onclick="downloadAllChannelVideos('${encodeURIComponent(ch.url)}')">⬇ Download All</button>
                             </div>
                         </div>`;
                 });
@@ -346,6 +348,9 @@
         }
 
         async function changeChannelQuality(url, value) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { url = decodeURIComponent(url); } catch (e) { /* leave as-is */ }
             try {
                 const resp = await fetch('/api/channels/quality', {
                     method: 'POST',
@@ -361,6 +366,9 @@
         }
 
         async function loadChannelVideos(channelUrl) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { channelUrl = decodeURIComponent(channelUrl); } catch (e) { /* leave as-is */ }
             const section = document.getElementById('videos-section');
             const grid = document.getElementById('videos-grid');
             section.style.display = 'block';
@@ -464,7 +472,7 @@
                     const statusBadge = getStatusBadge(d.status);
                     const speed = d.speed ? formatSpeed(d.speed) : '';
                     const eta = d.eta ? formatETA(d.eta) : '';
-                    const errorMsg = d.error ? `<div style="color:#f8a5b0;font-size:0.8em;margin-top:4px;">❌ ${d.error}</div>` : '';
+                    const errorMsg = d.error ? `<div style="color:#f8a5b0;font-size:0.8em;margin-top:4px;">❌ ${escapeHtml(d.error)}</div>` : '';
                     const isActive = d.status === 'downloading' || d.status === 'queued' || d.status === 'converting';
                     
                     // Final path status badge
@@ -491,7 +499,7 @@
                     html += `
                         <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:14px 16px;">
                             <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
-                                <div style="font-weight:500;color:#fff;font-size:0.9em;flex:1;word-break:break-word;margin-right:12px;">${d.title || d.video_id}</div>
+                                <div style="font-weight:500;color:#fff;font-size:0.9em;flex:1;word-break:break-word;margin-right:12px;">${escapeHtml(d.title || d.video_id)}</div>
                                 ${statusBadge}
                             </div>
                             ${isActive ? `
@@ -506,10 +514,10 @@
                             </div>
                             ` : ''}
                             ${d.status === 'error' ? errorMsg : ''}
-                            ${d.filename ? `<div style="font-size:0.75em;color:#606070;margin-top:4px;">📄 ${d.filename}</div>` : ''}
+                            ${d.filename ? `<div style="font-size:0.75em;color:#606070;margin-top:4px;">📄 ${escapeHtml(d.filename)}</div>` : ''}
                             ${finalStatusHtml}
                             ${finalPathHtml}
-                            <div style="font-size:0.72em;color:#505060;margin-top:4px;">${d.video_id} • ${formatTime(d.started_at)}</div>
+                            <div style="font-size:0.72em;color:#505060;margin-top:4px;">${escapeHtml(d.video_id)} • ${formatTime(d.started_at)}</div>
                             ${downloadActions(d)}
                         </div>`;
                 });
@@ -1073,6 +1081,9 @@
         }
 
         function confirmRemoveChannel(url) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { url = decodeURIComponent(url); } catch (e) { /* leave as-is */ }
             showConfirmModal(
                 'Are you sure you want to remove this channel?\n\n' + url,
                 function() { removeChannel(url); }
@@ -1102,6 +1113,9 @@
         }
 
         async function changeChannelMode(channelUrl, newMode) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { channelUrl = decodeURIComponent(channelUrl); } catch (e) { /* leave as-is */ }
             showToast('⏳ Updating download mode...', 'success');
             try {
                 const resp = await fetch('/api/channels/mode', {
@@ -1122,6 +1136,9 @@
         }
 
         async function downloadAllChannelVideos(channelUrl) {
+            // Encoded at the call site — see the comment there on why
+            // escapeHtml is not the right tool inside an inline handler.
+            try { channelUrl = decodeURIComponent(channelUrl); } catch (e) { /* leave as-is */ }
             showConfirmModal(
                 'Download all videos from this channel?\n\nThis may take a while for large channels.',
                 async function() {
@@ -1174,7 +1191,7 @@
                 });
                 const data = await resp.json();
                 if (data.error) {
-                    listEl.innerHTML = `<div class="empty-state"><p>Error: ${data.error}</p></div>`;
+                    listEl.innerHTML = `<div class="empty-state"><p>Error: ${escapeHtml(data.error)}</p></div>`;
                     return;
                 }
                 if (data.entries.length === 0) {
@@ -1266,7 +1283,7 @@
             try {
                 const resp = await fetch('/api/plex/config');
                 const data = await resp.json();
-                const hasToken = data.token && data.token.length > 0;
+                const hasToken = !!data.token_set;
                 const hasServer = data.server_url && data.server_url.length > 0;
                 const hasLibrary = data.music_video_library_key && data.music_video_library_key.length > 0;
 
@@ -1508,7 +1525,7 @@ async function findPlexLibraries() {
                     showToast('✅ Library saved', 'success');
                     checkPlexConnection();
                 } else {
-                    statusEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    statusEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                 }
             } catch (e) {
                 statusEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
@@ -1534,7 +1551,7 @@ async function findPlexLibraries() {
                     data.results.forEach(r => {
                         const status = r.collection_created ? '✅' : '❌';
                         const errors = r.errors && r.errors.length > 0 ? ` (${r.errors.join(', ')})` : '';
-                        html += `<div style="font-size:0.85em;color:#c0c0d0;margin-bottom:4px;">${status} ${r.artist}: ${r.videos_found} videos${errors}</div>`;
+                        html += `<div style="font-size:0.85em;color:#c0c0d0;margin-bottom:4px;">${status} ${escapeHtml(r.artist)}: ${r.videos_found} videos${errors}</div>`;
                     });
                     html += '</div>';
                     resultEl.innerHTML = html;
@@ -1543,10 +1560,10 @@ async function findPlexLibraries() {
                     const r = data.result;
                     const status = r.collection_created ? '✅' : '❌';
                     const errors = r.errors && r.errors.length > 0 ? ` (${r.errors.join(', ')})` : '';
-                    resultEl.innerHTML = `<div style="font-size:0.85em;color:#c0c0d0;">${status} ${r.artist}: ${r.videos_found} videos${errors}</div>`;
-                    showToast(`✅ Synced collection for ${r.artist}`, 'success');
+                    resultEl.innerHTML = `<div style="font-size:0.85em;color:#c0c0d0;">${status} ${escapeHtml(r.artist)}: ${r.videos_found} videos${errors}</div>`;
+                    showToast(`✅ Synced collection for ${escapeHtml(r.artist)}`, 'success');
                 } else {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error || 'Sync failed'}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error || 'Sync failed')}</div>`;
                 }
             } catch (e) {
                 resultEl.innerHTML = `<div style="color:#f8a5b0;">Error: ${e.message}</div>`;
@@ -1565,7 +1582,7 @@ async function findPlexLibraries() {
                 const data = await resp.json();
 
                 if (data.error) {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                     return;
                 }
 
@@ -1646,7 +1663,7 @@ async function findPlexLibraries() {
                 const data = await resp.json();
 
                 if (data.error) {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                     return;
                 }
 
@@ -1681,7 +1698,7 @@ async function findPlexLibraries() {
                 const data = await resp.json();
 
                 if (data.error) {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                     return;
                 }
 
@@ -2120,7 +2137,7 @@ async function findPlexLibraries() {
                 const resp = await fetch('/api/conversion/scan', { method: 'POST' });
                 const data = await resp.json();
                 if (data.error) {
-                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${data.error}</div>`;
+                    resultEl.innerHTML = `<div style="color:#f8a5b0;">❌ ${escapeHtml(data.error)}</div>`;
                     return;
                 }
                 let html = `<div style="padding:12px;background:rgba(255,255,255,0.03);border-radius:8px;">

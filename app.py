@@ -1033,6 +1033,16 @@ def api_config():
         # feeds the Settings page's raw config editor, and there's no reason
         # for either value to round-trip through the browser at all.
         config = {k: v for k, v in load_config().items() if k not in ('_secret_key', '_auth')}
+        # The Plex token is a bearer credential for the user's whole Plex
+        # account. Nothing in the UI needs its value — only whether one is set —
+        # and returning it made any script running in the admin session (e.g. via
+        # a stored-XSS payload in a video title) able to exfiltrate it with one
+        # fetch. Replaced with a boolean; POST preserves the stored value when
+        # the key is absent, so the editor still round-trips safely.
+        if isinstance(config.get('plex'), dict):
+            plex = dict(config['plex'])
+            plex['token_set'] = bool(plex.pop('token', None))
+            config['plex'] = plex
         return jsonify(config)
     elif request.method == 'POST':
         # This endpoint replaces the whole document, and the Settings page's
@@ -1064,6 +1074,15 @@ def api_config():
             for key in ('update_check_enabled',):
                 if key in current:
                     merged.setdefault(key, current[key])
+            # Nested preservation for plex.token specifically. The GET above no
+            # longer returns it, so a client round-tripping the document would
+            # otherwise POST a `plex` object without it and silently disconnect
+            # Plex. The top-level underscore rule can't cover a nested key.
+            incoming_plex = merged.get('plex')
+            current_token = (current.get('plex') or {}).get('token')
+            if isinstance(incoming_plex, dict) and current_token:
+                incoming_plex.pop('token_set', None)   # never persist the marker
+                incoming_plex.setdefault('token', current_token)
             return merged
 
         _update_config(_merge)
@@ -2448,7 +2467,11 @@ def api_plex_config():
     config = load_config()
     
     if request.method == 'GET':
-        return jsonify(config.get('plex', {}))
+        # Same reasoning as /api/config: the UI only ever tests presence, so the
+        # token itself never needs to leave the server.
+        plex = dict(config.get('plex', {}))
+        plex['token_set'] = bool(plex.pop('token', None))
+        return jsonify(plex)
     
     elif request.method == 'POST':
         data = request.get_json()
