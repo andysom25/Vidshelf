@@ -1451,15 +1451,26 @@ def api_artist_videos():
     return jsonify({'artist': artist, 'videos': videos})
 
 # Unauthenticated search endpoint
+# `search_noauth` is kept as an alias so an existing bookmark or script gets a
+# 401 rather than a 404 — the rename is cosmetic, the auth check is the change.
+# It was never called by anything but this app's own dashboard (verified: the
+# only two call sites were in static/js/dashboard.js, both inside an
+# authenticated page), so requiring a session breaks no known consumer.
+@app.route('/api/artwork/search', methods=['GET'])
 @app.route('/api/artwork/search_noauth', methods=['GET'])
-def api_artwork_search_noauth():
-    """Search for artwork images for a given artist without authentication.
+def api_artwork_search():
+    """Search for artwork images for a given artist.
 
     Paginated: returns ARTWORK_SEARCH_PAGE_SIZE (5) images per call. The full
     result set is fetched once per artist and cached for
     _ARTWORK_SEARCH_CACHE_TTL seconds so clicking "Load More" (page=2, 3, ...)
     slices the cached list instead of re-querying every external API again.
     """
+    # Before the parameter check, not after: returning 400 to an anonymous
+    # caller leaks that the endpoint exists and, worse, made this route look
+    # compliant to the route-level auth sweep, which only flagged a 200.
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
     artist = request.args.get('artist', '').strip()
     if not artist:
         return jsonify({'error': 'Artist name is required'}), 400
@@ -1508,11 +1519,19 @@ def api_artwork_current_image():
         return jsonify({'error': 'No artwork found for this artist'}), 404
     return send_file(image_path, mimetype='image/jpeg')
 
-# Unauthenticated swap endpoint
+# Was unauthenticated. That made it a defacement surface for anyone who could
+# reach the port — overwrite folder.jpg/poster.jpg in an existing artist folder,
+# and spend the stored Plex token updating that collection's artwork. Documented
+# as "deliberate, bounded" through v1.6.1 on the grounds that requiring auth
+# would break its consumer; the consumer turned out to be this app's own
+# dashboard, which is authenticated. See the `search` alias note above.
+@app.route('/api/artwork/swap', methods=['POST'])
 @app.route('/api/artwork/swap_noauth', methods=['POST'])
-def api_artwork_swap_noauth():
-    """Swap artwork for a Plex collection without authentication."""
-    data = request.get_json() or {}
+def api_artwork_swap():
+    """Swap artwork for a Plex collection."""
+    if 'username' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
     artist_name = data.get('artist_name', '').strip()
     new_image_url = data.get('new_image_url', '').strip()
     if not artist_name or not new_image_url:

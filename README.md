@@ -93,9 +93,10 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 ### Security
 - No hardcoded credentials — a random admin password is generated on first run (or set your own via env vars) and printed once to the logs
 - Session-signing key is randomly generated and persisted, not a fixed value baked into source
-- Login throttling, security response headers, SSRF guarding on the public artwork-search endpoint, hardened session cookies
+- Login throttling, security response headers, SSRF guarding on every endpoint that fetches a URL, hardened session cookies
 - Runs with **no added Linux capabilities** (`cap_drop: ALL`), and `config.json` is written owner-only
 - The Plex token is never sent to the browser — the interface only needs to know whether one is set
+- **Every endpoint requires a login**, and the test suite enforces it: an endpoint must refuse an anonymous caller before it validates anything else, across both GET and POST
 
 ---
 
@@ -403,7 +404,7 @@ Three things worth knowing:
 | `/api/plex/titles/clean` | POST | Clean up video titles in the library |
 | `/api/plex/title-cards/generate` | POST | Generate designed poster art per video |
 | `/api/artwork/sync` / `/status` | POST/GET | Sync/check artist artwork |
-| `/api/artwork/search_noauth` / `/swap_noauth` | GET/POST | Search and swap artist artwork (unauthenticated by design — see `REFERENCE.md`) |
+| `/api/artwork/search` / `/swap` | GET/POST | Search and swap artist artwork. The former `_noauth` paths remain as aliases and now also require a session (v1.7.0); prefer these names |
 
 </details>
 
