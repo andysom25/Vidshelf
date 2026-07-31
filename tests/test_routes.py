@@ -350,6 +350,30 @@ def test_config_round_trip_does_not_disconnect_plex():
     assert after['_secret_key'] == 'k'
 
 
+def test_config_round_trip_from_a_disconnected_install_persists_no_marker():
+    """The same round-trip with no Plex token stored.
+
+    The first version of the merge dropped `token_set` only inside the branch
+    that restored the token, so an install that had never connected Plex wrote
+    `"token_set": false` into config.json and kept it forever — a computed
+    presence flag masquerading as a stored setting. The connected case above
+    passed throughout, which is why this needs its own test.
+    """
+    client = _client(authenticated=True)
+    state.write_json(app_module.CONFIG_FILE,
+                     {'plex': {'server_url': '', 'music_video_library_key': ''},
+                      '_secret_key': 'k'}, indent=4)
+
+    document = client.get('/api/config').get_json()
+    assert document['plex']['token_set'] is False, 'GET should report absence explicitly'
+    assert client.post('/api/config', json=document).status_code == 200
+
+    after = state.read_json(app_module.CONFIG_FILE)
+    assert 'token_set' not in after['plex'], \
+        'the presence marker was persisted by a disconnected install'
+    assert 'token' not in after['plex'], 'an empty token should not be invented'
+
+
 def test_notification_config_never_echoes_the_url_back():
     """The webhook URL usually embeds a secret; the response must not carry it.
 

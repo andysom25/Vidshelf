@@ -1078,11 +1078,18 @@ def api_config():
             # longer returns it, so a client round-tripping the document would
             # otherwise POST a `plex` object without it and silently disconnect
             # Plex. The top-level underscore rule can't cover a nested key.
+            #
+            # Dropping the marker is unconditional: gating it on current_token
+            # meant a POST from a *disconnected* install persisted
+            # "token_set": false into config.json, where it reads like a real
+            # setting forever after. token_set is a presence flag computed per
+            # response, never state.
             incoming_plex = merged.get('plex')
-            current_token = (current.get('plex') or {}).get('token')
-            if isinstance(incoming_plex, dict) and current_token:
+            if isinstance(incoming_plex, dict):
                 incoming_plex.pop('token_set', None)   # never persist the marker
-                incoming_plex.setdefault('token', current_token)
+                current_token = (current.get('plex') or {}).get('token')
+                if current_token:
+                    incoming_plex.setdefault('token', current_token)
             return merged
 
         _update_config(_merge)

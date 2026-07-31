@@ -43,9 +43,12 @@ auto-creates correctly, so `./data` fixes that case for free.
 """
 
 import json
+import logging
 import os
 import threading
 import time
+
+_log = logging.getLogger('state')
 
 # Overridable so a local (non-Docker) run can keep state somewhere else; the
 # Docker image leaves it at the default and mounts ./data over it.
@@ -183,11 +186,18 @@ def write_json(path, data, indent=2):
         #
         # Best-effort: SMB/CIFS shares and Windows bind mounts frequently reject
         # or ignore chmod, and failing a state write over file permissions would
-        # be a far worse outcome than a permissive mode.
+        # be a far worse outcome than a permissive mode. Logged rather than
+        # swallowed silently, because SECURITY.md claims these files are
+        # owner-only — if that quietly stops being true, there should be a
+        # trace of it somewhere other than an ls.
+        #
+        # Applies to every state file, not just config.json: the tracker and
+        # active_downloads.json don't hold credentials, but they're written by
+        # this same function and there's no reason to widen them.
         try:
             os.chmod(abs_path, 0o600)
-        except OSError:
-            pass
+        except OSError as exc:
+            _log.debug("could not chmod 0600 %s: %s", abs_path, exc)
 
 
 def update_json(path, mutate, default=None, indent=2):
