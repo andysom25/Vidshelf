@@ -453,6 +453,69 @@ def test_config_round_trip_from_a_disconnected_install_persists_no_marker():
     assert 'token' not in after['plex'], 'an empty token should not be invented'
 
 
+def test_retried_music_video_lands_in_its_artist_folder():
+    """v1.8.0 review finding — a gap in the v1.8.0 retry fix itself.
+
+    The retry route falls back to the destination recorded on the entry, which
+    fixed music videos going to ./downloads. But that recorded path is only the
+    artist folder once a worker has *started* the job: the music route queues it
+    with the music root, and download_video re-inits the entry with root/Artist
+    later. A download cancelled while still queued keeps the root — so the
+    original fix still mislaid that case, just less badly.
+
+    Both shapes are pinned here because the connected one passed throughout.
+    """
+    root = '/app/music_videos_final'
+    artist = 'Nine Inch Nails'
+    expected = app_module._sanitize_folder_name(artist)
+
+    # Cancelled while queued: only the root was ever recorded.
+    got = app_module._music_retry_destination(root, artist)
+    assert os.path.basename(os.path.normpath(got)) == expected, got
+
+    # Failed mid-download: already the artist folder — must not nest a second.
+    already = os.path.join(root, expected)
+    assert app_module._music_retry_destination(already, artist) == already
+
+    # A real channel download is untouched.
+    assert app_module._music_retry_destination('./downloads', None) == './downloads'
+
+
+def test_retry_folder_survives_the_lossy_tracker_key():
+    """The property the retry fix actually depends on.
+
+    The synthetic key is `artist.replace(' ', '_')`, so recovering the artist
+    from it is *not* the identity — 'AC_DC' comes back as 'AC DC'. The retry
+    path nonetheless has to land in the same folder the original download used,
+    and it does, because `_sanitize_folder_name` collapses `[_\\s]+` to a single
+    `_`, which cancels exactly that lossiness.
+
+    That is load-bearing and it is a property of a *different* function. Pinned
+    here so that changing `_sanitize_folder_name` to stop collapsing runs fails
+    loudly, instead of silently sending retries to a new folder.
+
+    Asserting artist round-trip identity instead would be a test that only
+    passes for the examples it happens to pick — the same shape of false
+    assurance as the v1.6.1 XSS guard that matched on variable names.
+    """
+    root = '/app/music_videos_final'
+    for artist in ('Nirvana', 'Nine Inch Nails', 'AC/DC', 'AC_DC', 'A  B',
+                   'X  Y_Z', '"Weird Al" Yankovic', '  Leading Space'):
+        original = os.path.join(root, app_module._sanitize_folder_name(artist))
+        recovered = app_module._artist_from_music_key(
+            app_module._music_key_for_artist(artist))
+        retried = app_module._music_retry_destination(root, recovered)
+        assert os.path.normpath(retried) == os.path.normpath(original), (
+            f'{artist!r}: retry would use {retried!r}, download used {original!r}')
+
+
+def test_a_real_channel_url_is_not_mistaken_for_a_music_key():
+    assert app_module._artist_from_music_key('https://www.youtube.com/@x') is None
+    assert app_module._artist_from_music_key('') is None
+    assert app_module._artist_from_music_key(None) is None
+    assert app_module._music_key_for_artist('Nirvana').startswith('music_video_')
+
+
 def test_notification_config_never_echoes_the_url_back():
     """The webhook URL usually embeds a secret; the response must not carry it.
 

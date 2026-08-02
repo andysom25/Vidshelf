@@ -290,6 +290,8 @@
                             <button class="btn btn-secondary btn-sm" onclick="openFolderBrowser('settings-music-video-path')" title="Browse folders" style="white-space:nowrap;display:flex;align-items:center;gap:4px;">📁 Browse</button>
                         </div>
                         <div class="help-text">Current: <span id="music-video-path-display" style="color:#c0c0d0;font-family:Consolas,monospace;"></span></div>
+                        <div class="help-text">Where music videos are downloaded to, and the folder Vidshelf watches for artist artwork and Plex collections.</div>
+                        <div id="music-path-conflict" style="display:none;"></div>
                     </div>
                     <button class="btn btn-primary" onclick="saveMusicVideoPath()">💾 Save Music Video Path</button>
                 </div>

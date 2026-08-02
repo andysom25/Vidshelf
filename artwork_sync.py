@@ -19,6 +19,18 @@ import socket
 import ipaddress
 import uuid
 import state
+import titles
+
+# Title and folder-name logic lives in titles.py so the *download* path can
+# use it too. It was only ever reachable from here, which meant a title could
+# only be cleaned after a file had already been written with a bad name — the
+# ordering that made the "Artist - Song" incidents in REFERENCE.md unfixable.
+# Re-exported under the old private names so nothing else had to move.
+folder_to_artist = titles.folder_to_artist
+artist_to_folder = titles.artist_to_folder
+_clean_video_title = titles.clean_video_title
+_normalize_artist_prefix = titles.normalize_artist_prefix
+_strip_artist_prefix_quotes = titles._strip_artist_prefix_quotes
 from datetime import datetime, timezone
 from urllib.parse import quote, urlencode, urlparse, urljoin
 
@@ -43,37 +55,6 @@ _log = logging.getLogger('artwork_sync')
 ARTWORK_FILES = ('folder.jpg', 'poster.jpg', 'fanart.jpg', 'background.jpg')
 METADATA_FILE = 'artist-metadata.json'
 LOG_FILE = 'artwork-sync.log'
-
-# ---------------------------------------------------------------------------
-# Folder name → artist name conversion
-# ---------------------------------------------------------------------------
-
-def folder_to_artist(folder_name):
-    """Convert a filesystem folder name back to a clean artist name.
-    
-    Foo_Fighters  → "Foo Fighters"
-    The_Killers   → "The Killers"
-    Sugar_Ray     → "Sugar Ray"
-    AC_DC         → "AC/DC" (edge case, keep as AC_DC since we can't know)
-    """
-    name = folder_name.strip()
-    # Replace underscores with spaces
-    name = name.replace('_', ' ')
-    # Collapse multiple spaces
-    name = re.sub(r'\s+', ' ', name).strip()
-    return name
-
-
-def artist_to_folder(artist):
-    """Convert an artist name to a safe folder name (mirrors _sanitize_folder_name)."""
-    invalid_chars = '<>:"/\\|?*'
-    for c in invalid_chars:
-        artist = artist.replace(c, '_')
-    artist = artist.strip().strip('.')
-    artist = re.sub(r'[_\s]+', '_', artist)
-    if not artist:
-        artist = 'Unknown_Artist'
-    return artist
 
 # ---------------------------------------------------------------------------
 # Artwork detection
@@ -1363,81 +1344,6 @@ def plex_list_libraries(config):
     return libraries
 
 
-_TRAILING_YOUTUBE_ID_RE = re.compile(r'-[A-Za-z0-9_-]{11}$')
-_TRAILING_URL_RE = re.compile(r'\s*www\.\S+\s*$', re.IGNORECASE)
-_OFFICIAL_VIDEO_PHRASE_RE = re.compile(r'\bofficial(?:\s+hd|\s+music)?\s+video\b', re.IGNORECASE)
-_DANGLING_DASH_BEFORE_PAREN_RE = re.compile(r'\s*-\s*\)')
-_DANGLING_DASH_AFTER_PAREN_RE = re.compile(r'\(\s*-\s*')
-_EMPTY_PARENS_RE = re.compile(r'\(\s*\)')
-_MULTI_SPACE_RE = re.compile(r'\s{2,}')
-_TRAILING_DASH_RE = re.compile(r'\s*-\s*$')
-# Some channels title uploads "Artist – Song" with an en dash (U+2013) or em
-# dash (U+2014) instead of a plain hyphen (confirmed on The Raconteurs' own
-# uploads — 7 of their 8 videos use this). Every artist-prefix match in this
-# codebase (plex_ensure_smart_collection's filter, plex_find_videos_by_artist,
-# _normalize_artist_prefix, the title-card song-title split) looks for a
-# literal " - ", so an en/em-dash title silently never matches — no smart
-# collection item, no title-card, no casing normalization, with no error
-# anywhere. Normalizing here means every downstream consumer reads it off
-# Plex's already-cleaned, already-hyphenated title field instead of needing
-# its own dash-variant handling.
-_EN_EM_DASH_SEPARATOR_RE = re.compile(r'\s[–—]\s')
-# Full-width and curly quote characters some artists stylize part of their
-# own stage name with in their video titles - e.g. "＂Weird Al＂ Yankovic" /
-# "＂Weird＂ Al Yankovic" (confirmed inconsistent even across that one
-# artist's own uploads). Deliberately narrow (not ASCII " or ') so this
-# never touches a song title that's legitimately quoted, e.g. Death Cab's
-# "＂Black Sun＂" - see _strip_artist_prefix_quotes() below for why only the
-# portion before the first " - " ever gets this treatment.
-_QUOTE_DECORATION_CHARS_RE = re.compile(r'[＂“”]')
-
-
-def _strip_artist_prefix_quotes(title):
-    """Strip decorative quote characters from the ARTIST-NAME portion of a
-    title only (everything before the first " - "), leaving any quotes in
-    the song-title portion untouched. Without this, a title like
-    '＂Weird Al＂ Yankovic - Eat It' never matches the plain "ArtistName -"
-    prefix every collection filter / title-card / casing-normalization step
-    in this codebase looks for - not because the artist name is wrong, but
-    because of stylized punctuation actually inside it.
-    """
-    parts = title.split(' - ', 1)
-    if len(parts) != 2:
-        return title
-    artist_part, rest = parts
-    cleaned_artist = _QUOTE_DECORATION_CHARS_RE.sub('', artist_part)
-    cleaned_artist = _MULTI_SPACE_RE.sub(' ', cleaned_artist).strip()
-    if cleaned_artist == artist_part:
-        return title
-    return f'{cleaned_artist} - {rest}'
-
-
-def _clean_video_title(raw_title):
-    """Strip the trailing YouTube ID, any embedded artist-website URL, and
-    generic "(Official [HD/Music] Video)" boilerplate from a raw video title,
-    while preserving other meaningful parenthetical text (e.g. "(US Version)").
-
-    Returns the original title unchanged if cleaning would produce an empty
-    or identical result.
-    """
-    title = raw_title
-    title = _EN_EM_DASH_SEPARATOR_RE.sub(' - ', title)
-    title = _strip_artist_prefix_quotes(title)
-    title = _TRAILING_YOUTUBE_ID_RE.sub('', title)
-    title = _TRAILING_URL_RE.sub('', title)
-    title = _OFFICIAL_VIDEO_PHRASE_RE.sub('', title)
-    title = _DANGLING_DASH_BEFORE_PAREN_RE.sub(')', title)
-    title = _DANGLING_DASH_AFTER_PAREN_RE.sub('(', title)
-    title = _EMPTY_PARENS_RE.sub('', title)
-    title = _MULTI_SPACE_RE.sub(' ', title)
-    title = _TRAILING_DASH_RE.sub('', title)
-    title = title.strip()
-
-    if not title or title == raw_title:
-        return raw_title
-    return title
-
-
 def plex_set_item_title(config, library_key, rating_key, new_title):
     """Edit a library item's title and lock the field so future library
     rescans don't revert it. Returns True on success."""
@@ -1486,17 +1392,6 @@ def _canonical_artist_names(config):
                 names.append(folder_to_artist(entry))
     names.sort(key=len, reverse=True)
     return names
-
-
-def _normalize_artist_prefix(title, canonical_names):
-    """Rewrite the "ArtistName -" prefix of title to match its canonical
-    capitalization, leaving everything else (including the song title)
-    untouched. No-op if title doesn't start with any known artist's prefix."""
-    for name in canonical_names:
-        prefix = f"{name} -"
-        if title.lower().startswith(prefix.lower()) and not title.startswith(prefix):
-            return name + title[len(name):]
-    return title
 
 
 def plex_clean_video_titles(config, library_key=None):

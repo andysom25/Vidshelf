@@ -8,6 +8,7 @@ import math
 import datetime
 import secrets
 import requests
+import functools
 import state
 import updates
 import notify
@@ -107,7 +108,9 @@ TRACKER_FILE = state.TRACKER_FILE
 ACTIVE_DOWNLOADS_FILE = state.ACTIVE_DOWNLOADS_FILE
 
 for _migration in state.MIGRATIONS_PERFORMED:
-    print(f"[state] Migrated legacy state file: {_migration}")
+    # Not all migrations relocate a file any more — v1.8.0 added a config-key
+    # fold — so the message says what happened rather than assuming.
+    print(f"[state] Migration: {_migration}")
 
 # Youtube-only allowlist for any endpoint that hands a caller-supplied URL to
 # yt-dlp — yt-dlp supports hundreds of sites via a "generic" extractor, so an
@@ -278,6 +281,50 @@ def _cookies_file():
         if os.path.isfile(candidate):
             return candidate
     return None
+
+
+# Music-video downloads have no channel, so they're filed in the tracker under a
+# synthetic key. Both directions live here rather than being spelled out at each
+# site: the retry path needs to read the artist back out, and getting the
+# transform subtly wrong there is invisible until a retry lands in the wrong
+# folder. Lossy by construction — "A B" and "A_B" collapse to the same key — and
+# left that way deliberately, since changing it would orphan existing history.
+MUSIC_KEY_PREFIX = 'music_video_'
+
+
+def _music_key_for_artist(artist):
+    """Tracker key for an artist's music videos."""
+    return f"{MUSIC_KEY_PREFIX}{artist.replace(' ', '_')}"
+
+
+def _artist_from_music_key(channel_url):
+    """Artist name from a synthetic music key, or None for a real channel URL."""
+    if not channel_url or not channel_url.startswith(MUSIC_KEY_PREFIX):
+        return None
+    return channel_url[len(MUSIC_KEY_PREFIX):].replace('_', ' ').strip() or None
+
+
+def _music_retry_destination(recorded_path, music_artist):
+    """Where a retried music video should land.
+
+    The path recorded on a download entry is only the artist folder once the job
+    has actually *started*: the music route queues it with the music root, and
+    download_video re-inits the entry with root/Artist when a worker picks it
+    up. A download cancelled while still queued never got that far — so
+    retrying one would drop the file loose in the root. Inside the library, but
+    with no artist folder, so no artwork, no collection, and nothing on the
+    Artists page.
+
+    No-op for channel downloads, and idempotent: a path that already ends in the
+    artist folder is returned unchanged, so the normal failed-mid-download case
+    doesn't get a second folder nested inside the first.
+    """
+    if not music_artist:
+        return recorded_path
+    folder = _sanitize_folder_name(music_artist)
+    if os.path.basename(os.path.normpath(recorded_path)) == folder:
+        return recorded_path
+    return os.path.join(recorded_path, folder)
 
 
 def _download_options(channel_url=None):
@@ -649,12 +696,33 @@ def dashboard():
         return redirect(url_for('login'))
     return render_template('dashboard.html', username=session['username'])
 
+def require_auth(view):
+    """Reject anonymous callers before the view runs.
+
+    This check used to be two hand-written lines at the top of 58 route
+    bodies. Both v1.6.1 and v1.7.0 were, in part, "an endpoint was missing
+    it" — and v1.7.0 found that /api/artwork/search_noauth had validated its
+    query parameter *before* checking the session, so it answered anonymous
+    probes with 400 and looked guarded to the route sweep while serving
+    ?artist=... to anyone. A decorator makes both failures structural: you
+    cannot forget half of it, and it cannot run after anything else.
+
+    functools.wraps matters here beyond tidiness — Flask derives the
+    endpoint name from __name__, and tests/test_routes.py keys its
+    public-endpoint allowlist off those names.
+    """
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        if 'username' not in session:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return view(*args, **kwargs)
+    return wrapper
+
 # ---------- API Routes ----------
 
 @app.route('/api/channels')
+@require_auth
 def api_channels():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     channels = []
     for ch in config.get('channels', []):
@@ -670,9 +738,8 @@ def api_channels():
     return jsonify({'channels': channels})
 
 @app.route('/api/channel/videos')
+@require_auth
 def api_channel_videos():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     channel_url = request.args.get('url', '')
     if not channel_url:
         return jsonify({'error': 'Missing channel URL'}), 400
@@ -683,6 +750,26 @@ def api_channel_videos():
         return jsonify({'videos': videos[:50]})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+DEFAULT_MUSIC_ROOT = '/app/music_videos_final'
+
+
+def _music_root(config=None):
+    """The one directory music videos live in.
+
+    There used to be two settings for this. `artwork_sync.root_path` had twelve
+    readers — the Artists page, artwork sync, retention, collections, title
+    cards — and `music_video_plex_path` had none in any download path: it was
+    editable in Settings, persisted, seeded into config.json.example and
+    documented in the README, while the download route ignored it and hardcoded
+    the value below. A setting that lies is worse than no setting, so v1.8.0
+    made this the single source of truth and migrated the other key away
+    (see state.migrate_music_video_path).
+    """
+    cfg = config if config is not None else load_config()
+    root = (cfg.get('artwork_sync', {}) or {}).get('root_path') or DEFAULT_MUSIC_ROOT
+    return root
+
 
 def _resolve_plex_path(per_channel_plex_path):
     """Resolve the actual Plex destination path.
@@ -707,8 +794,7 @@ def _gather_media_roots(config):
     music-video root plus every configured channel's resolved
     plex_media_path plus the global plex_base_path, deduplicated."""
     roots = set()
-    artwork_cfg = config.get('artwork_sync', {})
-    music_root = artwork_cfg.get('root_path', '/app/music_videos_final')
+    music_root = _music_root(config)
     if os.path.isdir(music_root):
         roots.add(os.path.normpath(music_root))
     for ch in config.get('channels', []):
@@ -804,9 +890,8 @@ def _run_conversion_job(config):
 
 
 @app.route('/api/download', methods=['POST'])
+@require_auth
 def api_download():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     video_id = data.get('video_id', '')
     channel_url = data.get('channel_url', '')
@@ -851,15 +936,13 @@ def api_download():
     return jsonify({'success': True, 'message': f'Download started for {video_id}', 'video_id': video_id})
 
 @app.route('/api/downloads/progress')
+@require_auth
 def api_downloads_progress():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     return jsonify({'downloads': get_active_downloads()})
 
 @app.route('/api/channels/add', methods=['POST'])
+@require_auth
 def api_channels_add():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     url = data.get('url', '').strip()
     download_path = data.get('download_path', './downloads').strip()
@@ -891,9 +974,8 @@ def api_channels_add():
     return jsonify({'success': True, 'message': 'Channel added successfully'}), 201
 
 @app.route('/api/channels/remove', methods=['POST'])
+@require_auth
 def api_channels_remove():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     url = data.get('url', '').strip()
 
@@ -911,9 +993,8 @@ def api_channels_remove():
     return jsonify({'success': True, 'message': 'Channel removed successfully'})
 
 @app.route('/api/channels/mode', methods=['POST'])
+@require_auth
 def api_channels_mode():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     url = data.get('url', '').strip()
     mode = data.get('download_mode', 'manual')
@@ -933,9 +1014,8 @@ def api_channels_mode():
     return jsonify({'error': 'Channel not found'}), 404
 
 @app.route('/api/channels/download-all', methods=['POST'])
+@require_auth
 def api_channels_download_all():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     channel_url = data.get('url', '').strip()
 
@@ -991,9 +1071,8 @@ def api_channels_download_all():
     })
 
 @app.route('/api/stats')
+@require_auth
 def api_stats():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     tracker = load_downloaded_tracker()
     downloads_count = sum(len(vids) for vids in tracker.values())
 
@@ -1024,9 +1103,8 @@ def api_stats():
     })
 
 @app.route('/api/config', methods=['GET', 'POST'])
+@require_auth
 def api_config():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     if request.method == 'GET':
         # Strip internal-only keys (session-signing secret, password hash)
         # before handing config.json back to the frontend — this endpoint
@@ -1161,6 +1239,7 @@ def favicon():
 
 
 @app.route('/api/music-videos/search', methods=['POST'])
+@require_auth
 def api_music_videos_search():
     """Search for music videos by artist name, returns ranked results.
 
@@ -1172,8 +1251,6 @@ def api_music_videos_search():
     per video) format-quality enrichment, not the whole cached set up
     front.
     """
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     artist = data.get('artist', '').strip()
     if not artist:
@@ -1217,10 +1294,9 @@ def api_music_videos_search():
 
 
 @app.route('/api/music-videos/download', methods=['POST'])
+@require_auth
 def api_music_videos_download():
     """Download a music video to the configured music video Plex path."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     video_id = data.get('video_id', '')
     title = data.get('title', 'Music Video')
@@ -1232,7 +1308,7 @@ def api_music_videos_download():
     # Download locally first (ext4 filesystem) to avoid CIFS/os.sendfile issues,
     # then download_video will copy the finished file to the final Y:\ mount.
     download_path = './downloads/music_videos'
-    final_path = '/app/music_videos_final'
+    final_path = _music_root(load_config())
 
     # The search box doubles as a YouTube search query, so a more specific
     # search (artist + song, to narrow results) shouldn't fork a second
@@ -1240,7 +1316,7 @@ def api_music_videos_download():
     # known — snap back to the existing artist's canonical name.
     artist = _resolve_existing_artist(artist, final_path)
 
-    channel_url = f"music_video_{artist.replace(' ', '_')}"
+    channel_url = _music_key_for_artist(artist)
     download_id = queue_download(video_id, title, channel_url, final_path=final_path)
 
     def _do_download():
@@ -1252,9 +1328,18 @@ def api_music_videos_download():
             artist_final_path = os.path.join(final_path, artist_folder)
             os.makedirs(artist_final_path, exist_ok=True)
             print(f"DEBUG: Directories created/ensured: download_path='{download_path}', artist_final_path='{artist_final_path}'")
-            # Download locally, then download_video copies to artist_final_path
+            # Download locally, then download_video copies to artist_final_path.
+            #
+            # _download_options was missing here and only here — the other four
+            # download_video call sites all passed it. That meant music videos
+            # got no cookies, so every age-restricted one failed with a bare
+            # yt-dlp error and no indication why, and the quality cap silently
+            # didn't apply. The synthetic channel_url ("music_video_<Artist>")
+            # matches no channel, so this correctly resolves to the global cap.
             download_video(video_id, download_path, artist_final_path,
-                          title=title, channel_url=channel_url, download_id=download_id)
+                          title=title, channel_url=channel_url, download_id=download_id,
+                          music_artist=artist,
+                          **_download_options(channel_url))
             mark_video_downloaded(video_id, channel_url)
             print(f"DEBUG: Music video download completed successfully for video_id={video_id} into artist folder '{artist_folder}'")
 
@@ -1286,33 +1371,47 @@ def api_music_videos_download():
 
 
 @app.route('/api/music-video-path', methods=['GET', 'POST'])
+@require_auth
 def api_music_video_path():
     """Get or set the music video Plex path in config."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
-    
+
+    # Reads and writes artwork_sync.root_path now. The response key is
+    # unchanged so the Settings page and any existing script keep working —
+    # what changed is that editing this field finally affects where music
+    # videos are downloaded, which it never did before v1.8.0.
     if request.method == 'GET':
-        current_path = config.get('music_video_plex_path', './downloads/music_videos')
-        return jsonify({'music_video_plex_path': current_path})
-    
+        return jsonify({
+            'music_video_plex_path': _music_root(config),
+            'conflict': config.get('_music_path_conflict'),
+        })
+
     elif request.method == 'POST':
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         new_path = data.get('music_video_plex_path', '').strip()
         if not new_path:
             return jsonify({'error': 'Music video Plex path is required'}), 400
-        config['music_video_plex_path'] = new_path
-        _write_raw_config(config)
-        return jsonify({'success': True, 'message': f'Music video Plex path set to {new_path}'})
+
+        def _merge(current):
+            artwork = dict(current.get('artwork_sync') or {})
+            artwork['root_path'] = new_path
+            merged = dict(current)
+            merged['artwork_sync'] = artwork
+            # Setting the path explicitly resolves the migration warning.
+            merged.pop('_music_path_conflict', None)
+            return merged
+
+        _update_config(_merge)
+        return jsonify({'success': True,
+                        'message': f'Music video path set to {new_path}'})
 
 
 # ---------- Folder Browser ----------
 
 @app.route('/api/browse-folder', methods=['POST'])
+@require_auth
 def api_browse_folder():
     """List subdirectories of a given path for the folder browser modal."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     path = data.get('path', '').strip()
 
@@ -1360,14 +1459,12 @@ def api_browse_folder():
 # ---------- Settings Endpoints ----------
 
 @app.route('/api/artists')
+@require_auth
 def api_artists():
     """Return a list of artists for which videos have been downloaded (based on artwork folder names)."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-
     config = load_config()
     artwork_cfg = config.get('artwork_sync', {})
-    root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+    root_path = _music_root(config)
 
     if not os.path.isdir(root_path):
         return jsonify({'error': f'Root path does not exist: {root_path}'}), 400
@@ -1382,14 +1479,11 @@ def api_artists():
 
 
 @app.route('/api/artists/summary')
+@require_auth
 def api_artists_summary():
     """Return each artist folder with its video count and artwork status, for the Artists page."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-
     config = load_config()
-    artwork_cfg = config.get('artwork_sync', {})
-    root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+    root_path = _music_root(config)
 
     if not os.path.isdir(root_path):
         return jsonify({'error': f'Root path does not exist: {root_path}'}), 400
@@ -1414,18 +1508,15 @@ def api_artists_summary():
 
 
 @app.route('/api/artists/videos')
+@require_auth
 def api_artist_videos():
     """List the video files for one artist, for the Artists page's expandable detail view."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-
     artist = request.args.get('artist', '').strip()
     if not artist:
         return jsonify({'error': 'Artist name is required'}), 400
 
     config = load_config()
-    artwork_cfg = config.get('artwork_sync', {})
-    root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+    root_path = _music_root(config)
     artist_folder = _sanitize_folder_name(artist)
     artist_path = os.path.join(root_path, artist_folder)
 
@@ -1458,6 +1549,7 @@ def api_artist_videos():
 # authenticated page), so requiring a session breaks no known consumer.
 @app.route('/api/artwork/search', methods=['GET'])
 @app.route('/api/artwork/search_noauth', methods=['GET'])
+@require_auth
 def api_artwork_search():
     """Search for artwork images for a given artist.
 
@@ -1466,11 +1558,11 @@ def api_artwork_search():
     _ARTWORK_SEARCH_CACHE_TTL seconds so clicking "Load More" (page=2, 3, ...)
     slices the cached list instead of re-querying every external API again.
     """
-    # Before the parameter check, not after: returning 400 to an anonymous
-    # caller leaks that the endpoint exists and, worse, made this route look
-    # compliant to the route-level auth sweep, which only flagged a 200.
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
+    # The auth check is @require_auth now. It used to be inline here, below a
+    # comment insisting it stay above the parameter validation — v1.7.0 found
+    # this route answering anonymous probes with 400 (because it validated
+    # first) and so looking compliant to a sweep that only flagged 200s. The
+    # decorator makes the ordering structural instead of a comment.
     artist = request.args.get('artist', '').strip()
     if not artist:
         return jsonify({'error': 'Artist name is required'}), 400
@@ -1502,17 +1594,15 @@ def api_artwork_search():
 
 
 @app.route('/api/artwork/current_image', methods=['GET'])
+@require_auth
 def api_artwork_current_image():
     """Serve an artist's current folder.jpg so the swap-art UI can preview
     the existing artwork before swapping it out."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     artist = request.args.get('artist', '').strip()
     if not artist:
         return jsonify({'error': 'Artist name is required'}), 400
     config = load_config()
-    artwork_cfg = config.get('artwork_sync', {})
-    root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+    root_path = _music_root(config)
     folder_name = _sanitize_folder_name(artist)
     image_path = os.path.join(root_path, folder_name, 'folder.jpg')
     if not os.path.isfile(image_path):
@@ -1527,10 +1617,9 @@ def api_artwork_current_image():
 # dashboard, which is authenticated. See the `search` alias note above.
 @app.route('/api/artwork/swap', methods=['POST'])
 @app.route('/api/artwork/swap_noauth', methods=['POST'])
+@require_auth
 def api_artwork_swap():
     """Swap artwork for a Plex collection."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
     artist_name = data.get('artist_name', '').strip()
     new_image_url = data.get('new_image_url', '').strip()
@@ -1542,19 +1631,16 @@ def api_artwork_swap():
 
 
 @app.route('/api/plex/collections/create', methods=['POST'])
+@require_auth
 def api_plex_collection_create():
     """Create a Plex collection for a single artist on demand."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-
     data = request.get_json()
     artist = data.get('artist', '').strip()
     if not artist:
         return jsonify({'error': 'Artist name is required'}), 400
 
     config = load_config()
-    artwork_cfg = config.get('artwork_sync', {})
-    root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+    root_path = _music_root(config)
 
     artist_folder = _sanitize_folder_name(artist)
     artist_path = os.path.join(root_path, artist_folder)
@@ -1568,9 +1654,8 @@ def api_plex_collection_create():
 
 
 @app.route('/api/password', methods=['POST'])
+@require_auth
 def api_password():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     global _ADMIN_PASSWORD_HASH
     data = request.get_json()
     current = data.get('current_password', '')
@@ -1588,10 +1673,9 @@ def api_password():
     return jsonify({'success': True, 'message': 'Password updated successfully'})
 
 @app.route('/api/downloads/clear', methods=['POST'])
+@require_auth
 def api_downloads_clear():
     """Clear the download history tracker and active download progress entries."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     try:
         # Clear the download history tracker
         state.write_json(TRACKER_FILE, {}, indent=2)
@@ -1605,10 +1689,9 @@ def api_downloads_clear():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/plex-base-path', methods=['GET', 'POST'])
+@require_auth
 def api_plex_base_path():
     """Get or set the global Plex media base path. Each channel's plex_media_path is relative to this."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     if request.method == 'GET':
         return jsonify({'plex_base_path': config.get('plex_base_path', './downloads')})
@@ -1622,9 +1705,8 @@ def api_plex_base_path():
         return jsonify({'success': True, 'message': f'Plex base path set to {new_base}'})
 
 @app.route('/api/system/info')
+@require_auth
 def api_system_info():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     import platform
 
     config = load_config()
@@ -1653,13 +1735,12 @@ def api_system_info():
 
 
 @app.route('/api/system/health')
+@require_auth
 def api_system_health():
     """Dependency check for the Settings page's System Health panel.
     Most useful for the local (non-Docker) install path — the Docker image
     always bakes in ffmpeg/Pillow/fonts, but even there this catches a
     misconfigured FFMPEG_PATH."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     binaries = transcode.check_dependencies()
     title_card_deps = check_title_card_dependencies()
     # Cookies are optional, but their absence used to be invisible: a
@@ -1684,6 +1765,7 @@ def api_system_health():
 
 
 @app.route('/api/system/version')
+@require_auth
 def api_system_version():
     """Current version plus, if enabled, whether a newer release exists.
 
@@ -1691,8 +1773,6 @@ def api_system_version():
     answer and refreshes in the background, so a slow or unreachable GitHub
     can't stall the sidebar this feeds.
     """
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     # Opt-out, defaulting to on: the check is a single request per day, but
     # it is an outbound call that reveals an install exists, so it has to be
@@ -1812,6 +1892,7 @@ _CHANNEL_MONITOR = scheduler.ChannelMonitor(
 
 
 @app.route('/api/channels/quality', methods=['POST'])
+@require_auth
 def api_channels_quality():
     """Cap the resolution downloaded from one channel. 0 clears the cap.
 
@@ -1819,8 +1900,6 @@ def api_channels_quality():
     specific channel publishing 4K — capping everything to protect against that
     would needlessly downgrade the rest.
     """
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
     url = (data.get('url') or '').strip()
     try:
@@ -1848,6 +1927,7 @@ def api_channels_quality():
 
 
 @app.route('/api/downloads/<download_id>/cancel', methods=['POST'])
+@require_auth
 def api_download_cancel(download_id):
     """Cancel a queued or running download.
 
@@ -1856,13 +1936,12 @@ def api_download_cancel(download_id):
     the worker thread instead would risk leaving a half-written file on a network
     share, which is a failure mode this project has paid for before.
     """
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     ok, detail = request_cancel(download_id)
     return jsonify({'success': ok, 'detail': detail}), (200 if ok else 409)
 
 
 @app.route('/api/downloads/<download_id>/retry', methods=['POST'])
+@require_auth
 def api_download_retry(download_id):
     """Re-queue a failed or cancelled download.
 
@@ -1870,9 +1949,6 @@ def api_download_retry(download_id):
     Downloads list keeps an honest record of the attempt that failed instead of
     rewriting history.
     """
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-
     entry = next((d for d in (get_active_downloads() or [])
                   if d.get('download_id') == download_id), None)
     if not entry:
@@ -1887,12 +1963,25 @@ def api_download_retry(download_id):
 
     config = load_config()
     download_path = './downloads'
-    plex_media_path = _resolve_plex_path('./downloads')
+    # Fall back to where the original attempt was actually headed, not to the
+    # generic downloads folder. This loop matches on ch['url'], and a music
+    # video's channel_url is the synthetic "music_video_<Artist>" key, which
+    # matches no channel — so a retried music video used to land outside its
+    # artist folder: no artwork, no collection, invisible to the Artists page.
+    # The correct destination was recorded on the entry all along.
+    plex_media_path = entry.get('final_path') or _resolve_plex_path('./downloads')
     for ch in config.get('channels', []):
         if ch['url'] == channel_url:
+            # A real channel still wins, so retrying an old failure after
+            # editing that channel's path uses the new one.
             download_path = ch.get('download_path', './downloads')
             plex_media_path = _resolve_plex_path(ch.get('plex_media_path', './downloads'))
             break
+
+    # Recover the artist from the synthetic key so a retried music video is
+    # named the same way the original attempt would have been.
+    music_artist = _artist_from_music_key(channel_url)
+    plex_media_path = _music_retry_destination(plex_media_path, music_artist)
 
     new_id = queue_download(video_id, title, channel_url, final_path=plex_media_path)
 
@@ -1901,6 +1990,7 @@ def api_download_retry(download_id):
             os.makedirs(plex_media_path, exist_ok=True)
             download_video(video_id, download_path, plex_media_path, title=title,
                            channel_url=channel_url, download_id=new_id,
+                           music_artist=music_artist,
                            **_download_options(channel_url))
             mark_video_downloaded(video_id, channel_url)
             _notify_download('complete', title, channel_url)
@@ -1917,17 +2007,15 @@ def api_download_retry(download_id):
 
 
 @app.route('/api/monitor/status')
+@require_auth
 def api_monitor_status():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     return jsonify(_CHANNEL_MONITOR.status())
 
 
 @app.route('/api/monitor/config', methods=['POST'])
+@require_auth
 def api_monitor_config():
     """Enable/disable monitoring and set its interval."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
 
     def _set(config):
@@ -1957,14 +2045,13 @@ def api_monitor_config():
 
 
 @app.route('/api/monitor/run', methods=['POST'])
+@require_auth
 def api_monitor_run():
     """Run one monitoring pass immediately, regardless of the enabled flag.
 
     Synchronous on purpose: it's the "Check now" button, and the user is waiting
     to see what it found. Downloads themselves still go to the worker pool.
     """
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     try:
         results = _CHANNEL_MONITOR.run_once()
     except Exception as exc:  # noqa: BLE001
@@ -1978,9 +2065,8 @@ def api_monitor_run():
 # --------------------------------------------------------------------------
 
 @app.route('/api/retention/config', methods=['POST'])
+@require_auth
 def api_retention_config():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
 
     def _set(config):
@@ -2004,10 +2090,9 @@ def api_retention_config():
 
 
 @app.route('/api/retention/plan')
+@require_auth
 def api_retention_plan():
     """Dry run — what a sweep would delete. Never deletes anything."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     cfg = load_config()
     result = retention.sweep(cfg, roots=_gather_media_roots(cfg), dry_run=True)
     plan = result['plan']
@@ -2031,6 +2116,7 @@ def api_retention_plan():
 
 
 @app.route('/api/retention/apply', methods=['POST'])
+@require_auth
 def api_retention_apply():
     """Actually delete. Requires an explicit confirm, and honours the enabled flag.
 
@@ -2039,8 +2125,6 @@ def api_retention_apply():
     mis-wired button, which for the one destructive endpoint in the app is worth
     the friction.
     """
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
     if data.get('confirm') != 'DELETE':
         return jsonify({'error': "Refusing to delete without {\"confirm\": \"DELETE\"}"}), 400
@@ -2063,9 +2147,8 @@ def api_retention_apply():
 # --------------------------------------------------------------------------
 
 @app.route('/api/notifications/config', methods=['POST'])
+@require_auth
 def api_notifications_config():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
 
     def _set(config):
@@ -2098,18 +2181,16 @@ def api_notifications_config():
 
 
 @app.route('/api/notifications/test', methods=['POST'])
+@require_auth
 def api_notifications_test():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     ok, detail = notify.send_test(load_config())
     return jsonify({'success': ok, 'detail': detail})
 
 
 @app.route('/api/system/update-check', methods=['POST'])
+@require_auth
 def api_system_update_check_toggle():
     """Turn the update check on or off."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
     if 'enabled' not in data:
         return jsonify({'error': 'enabled is required'}), 400
@@ -2124,11 +2205,9 @@ def api_system_update_check_toggle():
 # ---------- Download Verification ----------
 
 @app.route('/api/downloads/verify', methods=['POST'])
+@require_auth
 def api_downloads_verify():
     """Verify that downloaded files exist at their final destination paths."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     downloads = get_active_downloads()
     results = []
     
@@ -2166,11 +2245,9 @@ def api_downloads_verify():
 
 
 @app.route('/api/downloads/<download_id>/verify', methods=['GET'])
+@require_auth
 def api_download_verify_single(download_id):
     """Verify a single download's file at its final destination."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     downloads = get_active_downloads()
     target = None
     for d in downloads:
@@ -2211,17 +2288,16 @@ def api_download_verify_single(download_id):
 # ---------- Artwork Sync API Endpoints ----------
 
 @app.route('/api/artwork/sync', methods=['POST'])
+@require_auth
 def api_artwork_sync():
     """Trigger artwork sync for all artist folders or a specific one."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json() or {}
     force = data.get('force', False)
     artist = data.get('artist', '').strip()
     
     config = load_config()
     artwork_cfg = config.get('artwork_sync', {})
-    root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+    root_path = _music_root(config)
     
     if artist:
         # Sync a specific artist folder
@@ -2256,13 +2332,11 @@ def api_artwork_sync():
 
 
 @app.route('/api/artwork/status', methods=['GET'])
+@require_auth
 def api_artwork_status():
     """Get artwork sync status — which folders have artwork and which don't."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
-    artwork_cfg = config.get('artwork_sync', {})
-    root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+    root_path = _music_root(config)
     
     if not os.path.isdir(root_path):
         return jsonify({'error': 'Root path does not exist', 'root_path': root_path}), 400
@@ -2293,15 +2367,13 @@ def api_artwork_status():
 
 
 @app.route('/api/plex/collections/sync', methods=['POST'])
+@require_auth
 def api_plex_collections_sync():
     """Sync Plex collections for all artist folders or a specific one."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json() or {}
     artist = data.get('artist', '').strip()
     config = load_config()
-    artwork_cfg = config.get('artwork_sync', {})
-    root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+    root_path = _music_root(config)
     if not os.path.isdir(root_path):
         return jsonify({'error': f'Root path does not exist: {root_path}'}), 400
     if artist:
@@ -2335,10 +2407,9 @@ def api_plex_collections_sync():
 
 
 @app.route('/api/plex/collections/status', methods=['GET'])
+@require_auth
 def api_plex_collections_status():
     """Get Plex collection status — which artists have collections and which don't."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     plex_config = config.get('plex', {})
     if not plex_config.get('server_url') or not plex_config.get('token'):
@@ -2363,8 +2434,7 @@ def api_plex_collections_status():
             child_count = col.get('childCount', 0)
             collection_names.add(title.lower())
             collection_list.append({'title': title, 'key': key, 'child_count': child_count})
-        artwork_cfg = config.get('artwork_sync', {})
-        root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+        root_path = _music_root(config)
         folders = []
         if os.path.isdir(root_path):
             for entry in sorted(os.listdir(root_path)):
@@ -2388,38 +2458,35 @@ def api_plex_collections_status():
 
 
 @app.route('/api/plex/collections/duplicates', methods=['GET'])
+@require_auth
 def api_plex_collections_duplicates():
     """Report any same-title collections in the music-video library — a
     symptom of the check-then-create race in plex_ensure_smart_collection()
     that's now fixed with a lock, but pre-existing duplicates from before
     the fix don't clean themselves up."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     duplicates = plex_find_duplicate_collections(config)
     return jsonify({'duplicate_groups': duplicates, 'total_groups': len(duplicates)})
 
 
 @app.route('/api/plex/collections/dedupe', methods=['POST'])
+@require_auth
 def api_plex_collections_dedupe():
     """Delete duplicate same-title collections, keeping the one with the
     highest childCount from each group. Safe because every duplicate in a
     group shares the identical smart filter — there's no item list to
     reconcile, just extra collection objects to remove."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     result = plex_dedupe_collections(config)
     return jsonify(result)
 
 
 @app.route('/api/conversion/scan', methods=['POST'])
+@require_auth
 def api_conversion_scan():
     """Dry run: report which downloaded video files aren't already
     Plex-direct-play-compatible (MP4/H.264/AAC), without converting
     anything."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     candidates = _scan_conversion_candidates(config)
     return jsonify({
@@ -2430,11 +2497,10 @@ def api_conversion_scan():
 
 
 @app.route('/api/conversion/start', methods=['POST'])
+@require_auth
 def api_conversion_start():
     """Kick off the batch conversion job in a background thread. Refuses to
     start a second job if one is already running."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     with _CONVERSION_LOCK:
         if _CONVERSION_STATE['running']:
             return jsonify({'error': 'A conversion job is already running'}), 409
@@ -2445,37 +2511,33 @@ def api_conversion_start():
 
 
 @app.route('/api/conversion/status', methods=['GET'])
+@require_auth
 def api_conversion_status():
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     with _CONVERSION_LOCK:
         return jsonify(dict(_CONVERSION_STATE))
 
 
 @app.route('/api/plex/titles/clean', methods=['POST'])
+@require_auth
 def api_plex_titles_clean():
     """Clean up video titles in the music-video library (strips YouTube ID,
     embedded promo URLs, and generic "Official Video" boilerplate)."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     result = plex_clean_video_titles(config)
     return jsonify(result)
 
 
 @app.route('/api/plex/title-cards/generate', methods=['POST'])
+@require_auth
 def api_plex_title_cards_generate():
     """Generate + upload a designed title-card poster (artist + song title
     over the artist's own art) for every video in the music-video library
     that doesn't already have one, replacing Plex's auto-extracted
     video-frame thumbnail."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
     force = data.get('force', False)
     config = load_config()
-    artwork_cfg = config.get('artwork_sync', {})
-    root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+    root_path = _music_root(config)
     results = plex_generate_title_cards_for_all(config, root_path, force=force)
     return jsonify({
         'results': results,
@@ -2486,10 +2548,9 @@ def api_plex_title_cards_generate():
 
 
 @app.route('/api/plex/config', methods=['GET', 'POST'])
+@require_auth
 def api_plex_config():
     """Get or update Plex configuration."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     
     if request.method == 'GET':
@@ -2511,6 +2572,7 @@ def api_plex_config():
 
 
 @app.route('/api/plex/discover-library', methods=['POST'])
+@require_auth
 def api_plex_discover_library():
     """Auto-discover the music video library key from Plex.
 
@@ -2521,8 +2583,6 @@ def api_plex_discover_library():
     before (see REFERENCE.md). The UI now uses GET /api/plex/libraries to
     show every library with the auto-discovered one pre-selected, and only
     saves once the user confirms via POST /api/plex/config."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
 
     library_key = plex_find_library_key(config)
@@ -2542,23 +2602,20 @@ def api_plex_discover_library():
 
 
 @app.route('/api/plex/libraries', methods=['GET'])
+@require_auth
 def api_plex_libraries():
     """List every library on the connected Plex server, flagging which one
     auto-discovery would pick — lets the UI show a confirm/pick step
     instead of trusting the guess blindly."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
     config = load_config()
     libraries = plex_list_libraries(config)
     return jsonify({'libraries': libraries})
 
 
 @app.route('/api/plex/oauth/start', methods=['POST'])
+@require_auth
 def api_plex_oauth_start():
     """Initiate Plex OAuth flow."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     config = load_config()
     pin_id, code, auth_url = plex_oauth_start(config)
     
@@ -2582,11 +2639,9 @@ def api_plex_oauth_start():
 
 
 @app.route('/api/plex/oauth/check', methods=['POST'])
+@require_auth
 def api_plex_oauth_check():
     """Check if Plex OAuth PIN has been authenticated."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     pin_id = session.get('plex_oauth_pin_id')
     if not pin_id:
         return jsonify({'error': 'No active Plex OAuth session'}), 400
@@ -2622,11 +2677,9 @@ def api_plex_oauth_check():
 
 
 @app.route('/api/plex/oauth/servers', methods=['POST'])
+@require_auth
 def api_plex_oauth_servers():
     """Get Plex servers associated with the authenticated account."""
-    if 'username' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     config = load_config()
     token = config.get('plex', {}).get('token', '')
     if not token:
@@ -2651,7 +2704,7 @@ def start_artwork_watcher():
     try:
         config = load_config()
         artwork_cfg = config.get('artwork_sync', {})
-        root_path = artwork_cfg.get('root_path', '/app/music_videos_final')
+        root_path = _music_root(config)
         interval = artwork_cfg.get('watch_interval', 120)
         
         if not os.path.isdir(root_path):
@@ -2673,9 +2726,10 @@ if __name__ == '__main__':
             cfg = load_config()
             if 'plex_base_path' not in cfg:
                 cfg['plex_base_path'] = './downloads'
-            if 'music_video_plex_path' not in cfg:
-                cfg['music_video_plex_path'] = './downloads/music_videos'
-            _write_raw_config(cfg)
+                _write_raw_config(cfg)
+            # music_video_plex_path is deliberately NOT seeded any more — it was
+            # removed in v1.8.0 and re-adding it here would resurrect the key
+            # state.migrate_music_video_path() had just deleted, on every start.
         except Exception:
             pass
     

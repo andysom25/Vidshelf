@@ -793,12 +793,35 @@
             try {
                 const resp = await fetch('/api/music-video-path');
                 const data = await resp.json();
-                const path = data.music_video_plex_path || './downloads/music_videos';
+                const path = data.music_video_plex_path || '/app/music_videos_final';
                 input.value = path;
                 display.textContent = path;
+                renderMusicPathConflict(data.conflict);
             } catch (e) {
                 display.textContent = 'Error loading';
             }
+        }
+
+        // v1.8.0 folded two settings for this directory into one. If the old
+        // key held a real path that disagreed, say so rather than picking for
+        // them — the old value may point at a second share, and silently
+        // adopting or relocating a library is not a call to make for someone.
+        function renderMusicPathConflict(conflict) {
+            const host = document.getElementById('music-path-conflict');
+            if (!host) return;
+            if (!conflict) { host.style.display = 'none'; host.innerHTML = ''; return; }
+            host.style.display = 'block';
+            host.innerHTML =
+                '<div style="margin-top:10px;padding:10px 12px;border-radius:6px;'
+                + 'background:rgba(233,196,106,0.10);border:1px solid rgba(233,196,106,0.35);'
+                + 'color:#e9c46a;font-size:0.85em;">'
+                + '⚠ Two settings used to point at your music-video folder, and they '
+                + 'disagreed. The one below is what Vidshelf has actually been using.'
+                + '<div style="margin-top:6px;color:#c0c0d0;">Old, unused setting: <code>'
+                + escapeHtml(conflict.was) + '</code><br>In use now: <code>'
+                + escapeHtml(conflict.now) + '</code></div>'
+                + '<div style="margin-top:6px;color:#9090a0;">Nothing was moved. Saving a '
+                + 'path here dismisses this notice.</div></div>';
         }
 
         async function saveMusicVideoPath() {

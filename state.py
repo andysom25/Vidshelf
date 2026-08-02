@@ -247,6 +247,60 @@ def migrate_legacy_state():
     return moved
 
 
+DEFAULT_MUSIC_ROOT = '/app/music_videos_final'
+_LEGACY_MUSIC_PATH_DEFAULT = './downloads/music_videos'
+
+
+def migrate_music_video_path():
+    """v1.8.0: fold `music_video_plex_path` into `artwork_sync.root_path`.
+
+    There were two settings for one directory. `artwork_sync.root_path` had
+    twelve readers; `music_video_plex_path` had none in any download path — the
+    download route hardcoded its destination and ignored the setting entirely,
+    so editing it in Settings did nothing at all.
+
+    Three cases, and the middle one is why this isn't just a delete:
+
+    - key absent, or still the never-used default -> drop it silently. It
+      cannot have been doing anything.
+    - key set to something real that *disagrees* with root_path -> drop it, but
+      record the disagreement in `_music_path_conflict` so Settings can show it.
+      Deliberately no automatic relocation and no automatic adoption: the user
+      may have pointed it at a second NAS share, and moving or re-rooting a
+      library on their behalf is not a call to make unilaterally. They see both
+      paths and choose.
+    - key agrees with root_path -> drop it, nothing to warn about.
+
+    Underscore-prefixed so the raw-config editor round-trips it (app.py's POST
+    merge preserves `_`-prefixed keys). Cleared when the user saves the path.
+    Returns a human-readable note, or None.
+    """
+    config = read_json(CONFIG_FILE, default=None)
+    if not isinstance(config, dict) or 'music_video_plex_path' not in config:
+        return None
+
+    legacy = (config.get('music_video_plex_path') or '').strip()
+    current = ((config.get('artwork_sync') or {}).get('root_path')
+               or DEFAULT_MUSIC_ROOT).strip()
+
+    note = 'removed unused music_video_plex_path'
+    conflict = None
+    if legacy and legacy != _LEGACY_MUSIC_PATH_DEFAULT and legacy != current:
+        conflict = {'was': legacy, 'now': current}
+        note = 'music_video_plex_path ({}) differed from the active music root ({})'.format(
+            legacy, current)
+
+    def _merge(doc):
+        merged = dict(doc)
+        merged.pop('music_video_plex_path', None)
+        if conflict:
+            merged['_music_path_conflict'] = conflict
+        return merged
+
+    update_json(CONFIG_FILE, _merge, default={}, indent=4)
+    return note
+
+
 # Run at import, deliberately. Both app.py and artwork_sync.py read config at
 # *import* time (app.secret_key and PLEX_CLIENT_ID are module-level), so there
 # is no "startup" hook early enough to migrate from — and on an upgraded
@@ -256,3 +310,9 @@ def migrate_legacy_state():
 # module imports state first triggers this, so the ordering holds regardless
 # of how imports get rearranged later. It's idempotent and a no-op once done.
 MIGRATIONS_PERFORMED = migrate_legacy_state()
+
+# Must follow the file relocation above: on an upgraded install config.json is
+# only at its new path once migrate_legacy_state() has moved it.
+_music_path_note = migrate_music_video_path()
+if _music_path_note:
+    MIGRATIONS_PERFORMED.append(_music_path_note)

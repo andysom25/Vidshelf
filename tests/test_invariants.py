@@ -21,7 +21,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY_FILES = ['app.py', 'downloader.py', 'transcode.py', 'artwork_swap.py',
             'artwork_sync.py', 'state.py', 'updates.py', 'scheduler.py',
-            'retention.py', 'notify.py']
+            'retention.py', 'notify.py', 'titles.py']
 
 
 def _read(name):
@@ -355,6 +355,107 @@ def test_encoded_handler_arguments_are_decoded_by_their_handler():
         'encodeURIComponent at a call site without a matching decodeURIComponent '
         'in the handler. Both halves, for every argument, or neither.\n  '
         + '\n  '.join(offenders))
+
+
+def test_every_download_call_site_passes_download_options():
+    """v1.8.0 regression guard, and the bug that motivated the release.
+
+    `_download_options()` supplies two things: the resolved quality cap and the
+    cookies file. One of the five `download_video(...)` call sites was missing
+    it — the music-video path — so every age-restricted music video failed with
+    a bare yt-dlp error and no indication why, and the quality cap silently did
+    not apply. It went unnoticed because the other four were correct and nothing
+    compared them.
+
+    Fails loudly rather than adding a default inside download_video(): a default
+    there would resolve config deep in a worker thread and hide exactly this
+    class of omission again.
+    """
+    src = _read('app.py')
+    # Each call spans several lines; look at a window after the opening paren.
+    offenders = []
+    for match in re.finditer(r'\bdownload_video\(', src):
+        window = src[match.start(): match.start() + 400]
+        # Cut the window at the end of the statement to avoid bleeding into the
+        # next one and passing on its options.
+        depth, end = 0, len(window)
+        for idx, ch in enumerate(window):
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    end = idx
+                    break
+        if '_download_options' not in window[:end]:
+            line = src[:match.start()].count('\n') + 1
+            offenders.append(f'app.py:{line}: download_video(...) without _download_options')
+
+    assert not offenders, (
+        'A download_video() call site is not passing _download_options(), so it '
+        'gets no cookies (age-restricted videos fail) and no quality cap.\n  '
+        + '\n  '.join(offenders))
+
+
+def test_there_is_one_music_root_setting():
+    """v1.8.0 folded two config keys into one.
+
+    `music_video_plex_path` was editable in Settings, persisted, seeded into
+    config.json.example and documented in the README — and read by nothing in
+    any download path, which hardcoded its destination instead. A setting that
+    lies is worse than no setting.
+
+    Guards both halves: the key must not come back, and the destination must not
+    be hardcoded again.
+    """
+    # The *response* key `'music_video_plex_path'` and the request field
+    # `data.get('music_video_plex_path')` are deliberately unchanged, so the
+    # Settings page and any existing script keep working. What must not come
+    # back is reading or writing it on a config document.
+    config_access = re.compile(
+        r"""(?:config|cfg|doc|merged|current)\s*(?:\[\s*|\.get\(\s*|\.pop\(\s*|
+            \.setdefault\(\s*)['"]music_video_plex_path['"]""",
+        re.VERBOSE)
+    for name in ('app.py', 'artwork_sync.py', 'retention.py', 'scheduler.py'):
+        for line in _code_lines(_read(name)):
+            assert not config_access.search(line), (
+                f'{name}: music_video_plex_path is being read from or written to '
+                'config again — artwork_sync.root_path is the single source of '
+                f'truth. {line.strip()}')
+
+    app_src = _read('app.py')
+    literals = [ln.strip() for ln in _code_lines(app_src)
+                if "'/app/music_videos_final'" in ln
+                and 'DEFAULT_MUSIC_ROOT' not in ln]
+    assert not literals, (
+        'The music root is hardcoded again instead of going through '
+        '_music_root(). That is how the download path came to ignore the '
+        'configured value.\n  ' + '\n  '.join(literals))
+
+
+def test_api_routes_are_guarded_by_the_decorator_not_by_hand():
+    """v1.8.0 replaced 58 hand-written session checks with @require_auth.
+
+    Two consecutive releases were, in part, "an endpoint was missing the
+    check" — and v1.7.0 found one that ran its parameter validation first, so it
+    answered anonymous probes with 400 and looked guarded. The decorator makes
+    both impossible: you cannot forget half of it, and it cannot run after
+    anything else.
+
+    `dashboard()` is the one legitimate exception — it flashes and redirects to
+    the login page rather than returning JSON.
+    """
+    src = _read('app.py')
+    inline = [ln for ln in src.split('\n') if "if 'username' not in session:" in ln]
+    # One in dashboard(), one inside require_auth itself.
+    assert len(inline) <= 2, (
+        f'{len(inline)} hand-written session checks found; expected at most 2 '
+        '(dashboard() and require_auth itself). New routes should use '
+        '@require_auth.')
+    assert 'def require_auth(view):' in src, 'the require_auth decorator is gone'
+    assert '@functools.wraps(view)' in src, (
+        'require_auth must use functools.wraps — Flask derives the endpoint name '
+        'from __name__, and tests/test_routes.py keys its allowlist off those.')
 
 
 def test_state_files_are_written_owner_only():

@@ -1733,6 +1733,14 @@ there's no enforcement or rewriting of the artist-prefix format at download
 time. Most uploads do follow it (hence 10 of 11 artists' collections having
 correct non-zero counts after the dedupe above); these 2 don't.
 
+> **Partly superseded by v1.8.0 — see "the music-video path was second-class"
+> at the end of this file.** The "deliberately not auto-fixed" conclusion below
+> is correct for `plex_clean_video_titles()`, which reverse-engineers from a
+> Plex item after the fact, and wrong for the *download* path, where the artist
+> is a user-supplied input. Music videos downloaded from v1.8.0 onward are named
+> "Artist - Song" at write time. Files already on disk still need what's
+> described below.
+
 **Deliberately not auto-fixed**: rewriting these 2 titles to force an
 "ArtistName - Song" shape would require guessing what the actual song title
 is from a title with no separator to split on (`_clean_video_title()` and
@@ -4482,3 +4490,187 @@ a `400` from JSON parsing.
 `python tests/test_routes.py`. If a new endpoint trips
 `test_protected_routes_reject_anonymous_callers` with a `400`, the fix is to move
 its session check above its parameter validation — not to relax the allowed set.
+
+## v1.8.0 — the music-video path was second-class in four separate ways
+
+Scoped as "features for a 2.0". Investigating that turned up three live bugs and
+one badly-mispriced fix instead, all on the same code path, so this became a
+release about making that path work rather than adding to it. Nothing here is a
+new feature; three of the four items are things that were already supposed to
+work.
+
+### 1. Music videos never got cookies or a quality cap
+
+`app.py`'s music-video route was the only one of **five** `download_video(...)`
+call sites that didn't pass `**_download_options(channel_url)`. The other four
+— manual download, bulk channel download, the scheduler, and retry — all did.
+
+Consequences, both silent:
+
+- **No cookies.** Age-restricted music videos failed with a bare yt-dlp error and
+  no indication why. The cookies file has existed (gitignored) since v1.6.0, the
+  Settings page reports whether it was found, and this path simply never handed
+  it to yt-dlp.
+- **No quality cap.** The global `max_height` didn't apply, so a 4K publisher
+  bypassed the setting entirely.
+
+The synthetic `music_video_<Artist>` key matches no channel, so
+`_download_options` correctly falls through to the global cap — the fix really
+is just passing the kwargs.
+
+Guarded by `test_every_download_call_site_passes_download_options`, which parses
+each call's argument list. Deliberately *not* fixed by defaulting inside
+`download_video()`: a default there would resolve config deep in a worker thread
+and hide exactly this class of omission again.
+
+### 2. Retried music videos landed in the wrong folder
+
+`api_download_retry` rebuilds the destination by scanning `config['channels']`
+for `ch['url'] == channel_url`. A music video's `channel_url` is the synthetic
+`music_video_<Artist>` key, which matches nothing, so it fell through to
+`_resolve_plex_path('./downloads')` — the generic downloads folder.
+
+A retried music video therefore landed outside its artist folder: no artwork, no
+Plex collection, invisible to the Artists page, and no error anywhere. The
+correct destination was on the entry the whole time (`final_path`, recorded when
+the download was queued) and the route ignored it.
+
+Now `entry.get('final_path')` is the fallback, with a real channel match still
+winning so that editing a channel's path and then retrying an old failure uses
+the new path.
+
+The synthetic-key round-trip is now `_music_key_for_artist()` /
+`_artist_from_music_key()` rather than string surgery at each site — the retry
+path needs to read the artist back out, and getting that subtly wrong is
+invisible until a file lands somewhere unexpected. Still lossy by construction
+("A B" and "A_B" collapse), left that way deliberately since changing it would
+orphan existing tracker history.
+
+### 3. A Settings field that did nothing
+
+`music_video_plex_path` was editable in Settings, persisted, seeded into
+`config.json.example`, documented in the README — and **read by no code in any
+download path**. The download route hardcoded `/app/music_videos_final` and
+ignored it. `get_music_video_plex_path()` existed and was never called; that dead
+helper was already flagged earlier in this file.
+
+Meanwhile `artwork_sync.root_path` had twelve readers: the Artists page, artwork
+sync, retention, collections, title cards. That is the real setting, so it won.
+
+- `_music_root(config)` replaces all twelve inline
+  `artwork_cfg.get('root_path', '/app/music_videos_final')` reads, and the
+  download route now calls it instead of hardcoding.
+- `state.migrate_music_video_path()` folds the key away at import, after the file
+  relocation (on an upgraded install `config.json` is only at its new path once
+  `migrate_legacy_state()` has moved it).
+- **No automatic relocation and no automatic adoption.** If the old key held a
+  real path that disagreed, the migration records `_music_path_conflict` and
+  Settings shows both paths. The old value may point at a second share, and
+  moving or re-rooting someone's library for them is not a call to make
+  unilaterally. Saving a path dismisses the notice.
+- Underscore-prefixed so the raw-config editor round-trips it (`app.py`'s POST
+  merge preserves `_`-prefixed keys — the same mechanism v1.6.1 needed for
+  `plex.token`).
+- The `__main__` block no longer seeds the key. Left in place it would have
+  resurrected, on every single start, the key the migration had just deleted.
+
+`test_there_is_one_music_root_setting` guards both halves: the config key must
+not come back, and the root must not be hardcoded again. The *response* key
+`music_video_plex_path` is deliberately unchanged so the Settings page and any
+existing script keep working — what changed is that editing the field finally
+affects where music videos go.
+
+### 4. Download-time title normalisation — this file said it was impossible
+
+Earlier in this document, under the "Artist - Song" assumption, the conclusion
+was that rewriting titles like the two Nine Inch Nails videos "would require
+guessing what the actual song title is from a title with no separator to split
+on… the information literally isn't present in a parseable form."
+
+**That is true of `plex_clean_video_titles()` and false of the download path**,
+and the distinction cost three separate incidents recorded above. Plex-side
+cleanup reverse-engineers from an item after the fact. On the music-video
+download path the artist is a *user-supplied input* that
+`_resolve_existing_artist()` has already snapped to the canonical folder name.
+The information isn't missing; it was sitting in `request.json['artist']` and
+being thrown away.
+
+New `titles.py` (extracted from `artwork_sync.py`, which re-exports the old
+private names so nothing else had to move) resolves a name in three tiers:
+
+1. yt-dlp's parsed music metadata (`artist` + `track`) — present for VEVO and
+   topic uploads, and free because the download already pre-extracts.
+2. The title already has a " - " whose prefix matches the known artist → clean
+   and casing-normalise it with the existing battle-tested helpers.
+3. No usable separator → prepend the known artist, first stripping a bare leading
+   copy so "Closer" doesn't become "Nine Inch Nails - Nine Inch Nails Closer".
+   Splitting the song title perfectly is not the goal; matching the collection
+   filter `title contains "Nine Inch Nails -"` is.
+
+A separator that *isn't* the artist ("Wonderwall - Live at Wembley") falls
+through to tier 3 rather than being trusted, so the video isn't filed under an
+artist named after the song.
+
+**Two implementation details that bite:**
+
+- `download_video()` used to pre-extract and download on the *same* `YoutubeDL`
+  instance, whose `outtmpl` is fixed at construction. A name computed from the
+  probe therefore needs two instances — probe first, then build the real one.
+  Mutating `ydl.params` in place is the shorter route and is not supported.
+- The probe needs the cookies too. Without them an age-restricted video won't
+  even extract, so the probe would fail before the download ever ran — which
+  would have turned fix #1 into a no-op for exactly the videos it was for.
+
+`-%(id)s` stays in every template: the post-download file match looks for
+`video_id in filename`. A `%` in a title is escaped to `%%` so it isn't read as a
+yt-dlp field, and `sanitize_filename()` strips characters Windows/SMB reject plus
+trailing dots and spaces (Windows silently drops those, which would make the
+written name differ from the recorded one).
+
+Channel downloads are untouched: `music_artist` defaults to `None` and the
+default template is byte-identical.
+
+### 5. 58 hand-written session checks became @require_auth
+
+`if 'username' not in session: return jsonify(...), 401` appeared 58 times.
+Both v1.6.1 and v1.7.0 were, in part, "an endpoint was missing it" — and v1.7.0
+found `/api/artwork/search_noauth` running its *parameter validation first*, so
+it answered anonymous probes with 400 and looked guarded to a sweep that only
+flagged 200s.
+
+A decorator makes both failures structural: you cannot forget half of it, and it
+cannot run after anything else. `app.py` lost 45 lines. `functools.wraps` is
+load-bearing rather than tidy — Flask derives the endpoint name from `__name__`,
+and `tests/test_routes.py` keys its public-endpoint allowlist off those names.
+
+`dashboard()` keeps its inline check: it flashes and redirects to the login page
+rather than returning JSON.
+
+### Verification actually performed
+
+Not on paper — this is the download path, which this file records as having
+"looked fixed twice before it actually was".
+
+- **A/B on the same video through both paths**, which is the cleanest possible
+  check that channel naming didn't move:
+  - channel path → `Nirvana - Smells Like Teen Spirit (Official Music Video)-hTWKbfoikeg.mp4`
+  - music path → `Nirvana - Smells Like Teen Spirit-hTWKbfoikeg.mp4`, in the
+    `Nirvana/` folder, with the log line confirming tier 1 fired once and only
+    for the music path.
+- **Upgrade drill** from a seeded v1.7.0 config carrying the legacy key pointed
+  at a real UNC path: key removed, conflict recorded, and — the one that matters
+  — `_secret_key` preserved, so the upgrade doesn't log everyone out.
+- **Auth sweep inside the running container**: 63 route/method pairs, zero
+  violations.
+- `_download_options('music_video_Nirvana')` resolved to the global cap and
+  `/app/data/cookies.txt`.
+- 171 Python tests across nine files, plus 23 JS. All five new invariant
+  mutations proven to fire.
+
+### What to check first if this regresses
+
+`python tests/test_titles.py` for naming, and
+`python tests/test_invariants.py` for the four structural guards. If a music
+video lands somewhere unexpected, check `_music_root()` and the
+`_music_path_conflict` key before suspecting the download code — the destination
+is config-driven now, and the notice in Settings names both paths.
