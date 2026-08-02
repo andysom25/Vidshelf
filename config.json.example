@@ -8,7 +8,6 @@
         }
     ],
     "plex_base_path": "./downloads",
-    "music_video_plex_path": "./downloads/music_videos",
     "artwork_sync": {
         "root_path": "/app/music_videos_final",
         "watch_interval": 120,

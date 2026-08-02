@@ -61,7 +61,7 @@ jobs:
           python tests/test_state.py
           python tests/test_updates.py
           python tests/test_routes.py
-          python -c "import state, transcode, downloader, artwork_swap, artwork_sync, updates, app"
+          python -c "import state, titles, transcode, downloader, artwork_swap, artwork_sync, updates, scheduler, retention, notify, app"
 
       - name: Open a PR
         if: steps.latest.outputs.changed == 'true'

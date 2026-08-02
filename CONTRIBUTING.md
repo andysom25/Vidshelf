@@ -44,10 +44,16 @@ arbitrary code.
 ## Tests
 
 ```bash
-python tests/test_state.py          # atomic writes, locking, migration
-python tests/test_updates.py        # version comparison, update-check caching
-python tests/test_routes.py         # every route: registered, no 500s, auth enforced
-node tests/test_artists_filter.js   # Artists page search/filter/sort
+python tests/test_state.py         # atomic writes, locking, migration
+python tests/test_updates.py       # version comparison, update-check caching
+python tests/test_routes.py        # every route: registered, no 500s, auth enforced
+python tests/test_scheduler.py     # monitoring logic + retention safety guards
+python tests/test_notify.py        # notification targets, payloads, gating
+python tests/test_media.py         # transcode decisions, SSRF guard, title/folder helpers
+python tests/test_downloads.py     # format selector, cancellation
+python tests/test_titles.py        # download-time "Artist - Song" naming
+python tests/test_invariants.py    # source-level rules for bugs CI can't reproduce
+node tests/test_artists_filter.js   # Artists page search/filter/sort logic
 ```
 
 Plain assertions, no pytest and no `npm install` — so they run identically on

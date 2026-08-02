@@ -64,6 +64,8 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 - **Quality ranking** — results are scored on official-channel match, title quality keywords ("official", "music video", "HD", "4K", "lyric video"), view count, upload recency, and penalized for covers/karaoke/remixes/live versions/Shorts/trailers
 - **Quality labels** — each result shows the best available resolution (4K, 1440p, 1080p, 720p)
 - **Automatic artist matching** — searching "Artist + Song" to narrow results won't fork a duplicate artist folder/collection if that artist is already tracked
+- **"Artist - Song" filenames** — music videos are named from the artist you searched for, not from whatever the uploader called the file. A video titled just "Closer" is saved as "Nine Inch Nails - Closer", which is what makes the Plex smart collection pick it up. Uses YouTube's own music metadata when it's available, and handles en-dashes and stylized quote characters
+- **Cookies and the quality cap apply here too** — as of v1.8.0. Age-restricted music videos previously failed with no explanation, and the resolution cap was ignored
 
 ### Download Control
 - **Cancel** a queued or running download, and **retry** anything that failed or was cancelled — from the Downloads page
@@ -263,7 +265,6 @@ scratch), and is fully editable from the Settings page. Set
     }
   ],
   "plex_base_path": "./downloads",
-  "music_video_plex_path": "./downloads/music_videos",
   "artwork_sync": {
     "root_path": "/app/music_videos_final",
     "watch_interval": 120,
@@ -277,6 +278,16 @@ scratch), and is fully editable from the Settings page. Set
   }
 }
 ```
+
+`artwork_sync.root_path` is where music videos are downloaded to **and** the
+folder watched for artist artwork and Plex collections. It's the same value as
+Settings → "Music Video Plex Path".
+
+> **Upgrading from v1.7.0 or earlier:** there used to be a second key,
+> `music_video_plex_path`, which the Settings page wrote and nothing read — the
+> download destination was hardcoded. v1.8.0 removes it automatically on first
+> start. If your two values disagreed, Settings shows both and asks you to pick;
+> nothing is moved or adopted for you.
 
 ### Automation settings
 
@@ -590,7 +601,7 @@ data/config.json, data/downloaded_videos.json, data/active_downloads.json
   a single-admin app on a trusted network — but it terminates plain HTTP with no
   TLS, so put it behind a reverse proxy if you expose it beyond your LAN
 - Music Video search relies on YouTube search (no dedicated data API)
-- Plex library titles/collections assume an "Artist - Song" convention in the source video's title; a handful of stylistic variants are normalized automatically, but an artist whose uploads never include the artist name in a recognizable form won't be matched
+- Plex collections match on an "Artist - Song" title. Music videos are named that way at download time (v1.8.0+), so this mostly affects **channel** downloads, which keep the uploader's own title — and files downloaded before v1.8.0, for which the Settings → "Clean Up Titles" tool is the fix
 - This is a personal project — it has tagged releases, CI and published
   images, but no support commitment behind it
 
@@ -600,12 +611,15 @@ data/config.json, data/downloaded_videos.json, data/active_downloads.json
 
 ```bash
 # Tests — no pytest or npm install required
-python tests/test_state.py          # atomic writes, locking, migration
-python tests/test_updates.py        # version comparison, update-check caching
-python tests/test_routes.py         # every route: registered, no 500s, auth enforced
-python tests/test_scheduler.py      # monitoring logic + retention safety guards
-python tests/test_notify.py         # notification targets, payloads, gating
-python tests/test_invariants.py     # source-level rules for bugs CI can't reproduce
+python tests/test_state.py         # atomic writes, locking, migration
+python tests/test_updates.py       # version comparison, update-check caching
+python tests/test_routes.py        # every route: registered, no 500s, auth enforced
+python tests/test_scheduler.py     # monitoring logic + retention safety guards
+python tests/test_notify.py        # notification targets, payloads, gating
+python tests/test_media.py         # transcode decisions, SSRF guard, title/folder helpers
+python tests/test_downloads.py     # format selector, cancellation
+python tests/test_titles.py        # download-time "Artist - Song" naming
+python tests/test_invariants.py    # source-level rules for bugs CI can't reproduce
 node tests/test_artists_filter.js   # Artists page search/filter/sort logic
 ```
 

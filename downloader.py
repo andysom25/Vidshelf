@@ -6,6 +6,7 @@ import time
 import yt_dlp
 import transcode
 import state
+import titles
 
 DOWNLOAD_TRACKER_FILE = state.ACTIVE_DOWNLOADS_FILE
 _lock = threading.Lock()
@@ -167,8 +168,15 @@ def build_format_selector(max_height=None):
     )
 
 
-def download_video(video_id, download_path, plex_media_path, title='Unknown', channel_url='', download_id=None, max_height=None, cookies_file=None):
-    """Download a video with progress tracking. Runs synchronously but updates progress file."""
+def download_video(video_id, download_path, plex_media_path, title='Unknown', channel_url='', download_id=None, max_height=None, cookies_file=None, music_artist=None):
+    """Download a video with progress tracking. Runs synchronously but updates progress file.
+
+    music_artist, when given, switches on download-time naming: the file is
+    written as "Artist - Song-<id>.ext" instead of whatever the uploader called
+    it. Only the music-video path passes it, so channel downloads are byte-for-
+    byte unaffected. See titles.build_music_video_title() for why this can be
+    done here but not in the Plex-side cleanup.
+    """
     if download_id is None:
         download_id = f"{video_id}_{int(time.time())}"
 
@@ -178,31 +186,61 @@ def download_video(video_id, download_path, plex_media_path, title='Unknown', ch
     # Use ffmpeg from PATH by default; override via env var if needed
     ffmpeg_bin = os.environ.get('FFMPEG_PATH')
 
-    ydl_opts = {
-        'outtmpl': os.path.join(download_path, '%(title)s-%(id)s.%(ext)s'),
-        'format': build_format_selector(max_height),
-        'merge_output_format': 'mp4',
-        'quiet': False, # Set quiet to False for debugging
-        'no_warnings': False, # Set no_warnings to False for debugging
-        'progress_hooks': [_progress_hook(download_id)]
-    }
-    if ffmpeg_bin:
-        ydl_opts['ffmpeg_location'] = ffmpeg_bin
-
     # Cookies unlock age-restricted and members-only content. The file existed
     # in this repo (gitignored) since long before this, but nothing ever passed
     # it to yt-dlp — so those downloads simply failed with no indication why.
-    if cookies_file and os.path.isfile(cookies_file):
-        ydl_opts['cookiefile'] = cookies_file
+    # They're needed on the *probe* too: without them an age-restricted video
+    # won't even extract, so the probe would fail before the download ever ran.
+    use_cookies = bool(cookies_file and os.path.isfile(cookies_file))
+
+    def _base_opts():
+        opts = {
+            'format': build_format_selector(max_height),
+            'merge_output_format': 'mp4',
+            'quiet': False, # Set quiet to False for debugging
+            'no_warnings': False, # Set no_warnings to False for debugging
+        }
+        if ffmpeg_bin:
+            opts['ffmpeg_location'] = ffmpeg_bin
+        if use_cookies:
+            opts['cookiefile'] = cookies_file
+        return opts
+
+    if use_cookies:
         print(f'DEBUG: using cookies from {cookies_file}')
     try:
         print(f"DEBUG: download_video called with download_path='{download_path}', plex_media_path='{plex_media_path}'")
+
+        # Probe first, on a throwaway instance. The output template has to be
+        # decided *before* the downloading instance is constructed, and for a
+        # music video that decision depends on metadata only the probe returns.
+        # Mutating ydl.params on a live instance would be the shorter route and
+        # is not supported — hence two instances.
+        with yt_dlp.YoutubeDL({**_base_opts(), 'skip_download': True}) as probe:
+            info = probe.extract_info(f'https://www.youtube.com/watch?v={video_id}',
+                                      download=False)
+        real_title = info.get('title', title)
+
+        if music_artist:
+            resolved = titles.build_music_video_title(music_artist, real_title, info)
+            stem = titles.sanitize_filename(resolved, fallback=video_id)
+            # Escape % so a title containing one isn't read as a yt-dlp field.
+            # -%(id)s stays: the post-download file match below finds the output
+            # by looking for video_id in the filename.
+            name_template = stem.replace('%', '%%') + '-%(id)s.%(ext)s'
+            print(f'DEBUG: music-video naming "{real_title}" -> "{stem}"')
+            real_title = resolved
+        else:
+            name_template = '%(title)s-%(id)s.%(ext)s'
+
+        _update_progress(download_id, title=real_title)
+
+        ydl_opts = {
+            **_base_opts(),
+            'outtmpl': os.path.join(download_path, name_template),
+            'progress_hooks': [_progress_hook(download_id)],
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Pre-extract to get the real title
-            info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
-            real_title = info.get('title', title)
-            _update_progress(download_id, title=real_title)
-            # Now download
             ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
 
         # Find the file yt-dlp just wrote to download_path
