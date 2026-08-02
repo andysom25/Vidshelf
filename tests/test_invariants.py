@@ -458,6 +458,63 @@ def test_api_routes_are_guarded_by_the_decorator_not_by_hand():
         'from __name__, and tests/test_routes.py keys its allowlist off those.')
 
 
+def test_copystat_is_never_allowed_to_fail_a_transfer():
+    """v1.8.1. CLAUDE.md always called copystat "optional, cosmetic — drop it if
+    the server rejects chmod". transcode.py wrapped it in try/except for exactly
+    that reason; downloader.py did not, and that asymmetry cost real downloads.
+
+    The container runs as root while the CIFS mount forces uid=1000, and
+    utime/chmod on a file you don't own needs CAP_FOWNER, which v1.6.1's
+    `cap_drop: ALL` removed. copystat therefore raised PermissionError *after*
+    the file was fully copied: the download was reported as failed, the
+    `os.remove(src)` on the next line was skipped so local copies leaked (2.6 GB
+    of them), and the video was never recorded, so it would download again.
+
+    Nothing in CI has a CIFS mount, so this can only be a source-level rule:
+    every copystat call must be guarded.
+    """
+    offenders = []
+    for name in PY_FILES:
+        lines = _read(name).split('\n')
+        for i, line in enumerate(lines):
+            if 'copystat' not in line or line.strip().startswith('#'):
+                continue
+            if 'def _copystat_best_effort' in line:
+                continue
+            # Guarded either by a helper whose name says so, or by a try: within
+            # the few lines above.
+            if '_copystat_best_effort' in line:
+                continue
+            window = '\n'.join(lines[max(0, i - 4):i])
+            if 'try:' in window:
+                continue
+            offenders.append(f'{name}:{i + 1}: {line.strip()}')
+
+    assert not offenders, (
+        'Unguarded shutil.copystat(). It raises PermissionError on the CIFS '
+        'mount (root vs uid=1000, no CAP_FOWNER) *after* the copy has already '
+        'succeeded — failing a finished transfer over a cosmetic timestamp. '
+        'Use downloader._copystat_best_effort() or wrap it in try/except.\n  '
+        + '\n  '.join(offenders))
+
+
+def test_queue_depth_and_reconcile_share_one_status_list():
+    """The monitor's queue brake counts in-flight downloads; reconcile clears
+    them. If the two lists ever disagreed, a status counted by one and not
+    cleared by the other would throttle channel monitoring forever — which is
+    the v1.8.1 bug, in a new disguise."""
+    app_src = _read('app.py')
+    assert 'downloader_module.IN_FLIGHT_STATUSES' in app_src, (
+        '_monitor_queue_depth no longer uses downloader.IN_FLIGHT_STATUSES; it '
+        'must not keep its own copy of the status list')
+    dl_src = _read('downloader.py')
+    assert 'IN_FLIGHT_STATUSES = ' in dl_src, 'IN_FLIGHT_STATUSES is gone'
+    assert 'reconcile_interrupted' in dl_src, 'reconcile_interrupted is gone'
+    assert 'reconcile_interrupted()' in app_src, (
+        'nothing calls reconcile_interrupted() — interrupted downloads will '
+        'accumulate and silently disable channel monitoring again')
+
+
 def test_state_files_are_written_owner_only():
     """config.json holds the Plex token, the admin password hash and the session
     signing key, in a bind-mounted directory — 0644 meant any local user on the

@@ -52,6 +52,7 @@ python tests/test_notify.py        # notification targets, payloads, gating
 python tests/test_media.py         # transcode decisions, SSRF guard, title/folder helpers
 python tests/test_downloads.py     # format selector, cancellation
 python tests/test_titles.py        # download-time "Artist - Song" naming
+python tests/test_download_state.py# interrupted downloads, history pruning, copystat
 python tests/test_invariants.py    # source-level rules for bugs CI can't reproduce
 node tests/test_artists_filter.js   # Artists page search/filter/sort logic
 ```

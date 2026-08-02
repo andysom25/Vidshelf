@@ -1,5 +1,6 @@
 import os
 import shutil
+import itertools
 import json
 import threading
 import time
@@ -10,6 +11,47 @@ import titles
 
 DOWNLOAD_TRACKER_FILE = state.ACTIVE_DOWNLOADS_FILE
 _lock = threading.Lock()
+
+# Statuses a download can still move on from. Anything else is finished, one way
+# or another, and is only kept around for the history list.
+IN_FLIGHT_STATUSES = ('queued', 'downloading', 'converting')
+TERMINAL_STATUSES = ('completed', 'error', 'cancelled', 'interrupted')
+
+# How much finished history to keep. Nothing ever pruned this file before
+# v1.8.1, so it grew for the life of the install and was returned *in full* on
+# a 2-second poll while the Downloads tab was open.
+MAX_TERMINAL_ENTRIES = 200
+
+_id_counter = itertools.count()
+
+def _copystat_best_effort(src, dst):
+    """Copy mtime/mode across, but never fail the download over it.
+
+    CLAUDE.md always described this as "optional, cosmetic — drop it if the
+    server rejects chmod". It rejects it, and until v1.8.1 the exception took
+    the whole download down with it.
+
+    Why the server rejects it: the container runs as **root (uid 0)** while the
+    CIFS mount forces every file to **uid 1000** (`uid=1000,gid=1000` in the
+    volume options). `utime()` and `chmod()` on a file you do not own require
+    CAP_FOWNER — and v1.6.1's `cap_drop: ALL`, added because SYS_ADMIN was being
+    granted for nothing, removed it. Proven rather than guessed: the same image
+    against the same mount succeeds with `--cap-add FOWNER` and raises
+    PermissionError without it.
+
+    The copy itself has already completed by the time this runs, so the file on
+    the NAS is whole and correct. Losing the source timestamp is invisible to
+    Plex, which reads its own metadata. Failing here was strictly worse: it
+    reported a finished download as an error, skipped the `os.remove(src)` on
+    the next line so the local copy leaked, and left the video out of the
+    tracker so it would be downloaded again.
+    """
+    try:
+        shutil.copystat(src, dst)
+    except OSError as exc:
+        print(f'DEBUG: could not copy timestamps/mode to {dst} '
+              f'(harmless, see _copystat_best_effort): {exc}')
+
 
 def _load_active():
     return state.read_json(DOWNLOAD_TRACKER_FILE)
@@ -55,9 +97,68 @@ def queue_download(video_id, title, channel_url, final_path=None):
     at a small number of concurrent downloads, that could otherwise be a
     long wait for anything past the first few. Returns the download_id to
     pass through to download_video()."""
-    download_id = f"{video_id}_{int(time.time())}"
+    # The counter is what makes this unique. Second resolution alone collided:
+    # queueing the same video twice within one second produced the same id, and
+    # the second _init_download silently overwrote the first's entry — which is
+    # exactly what a retry does, since it reuses the failed download's video_id.
+    download_id = f"{video_id}_{int(time.time())}_{next(_id_counter)}"
     _init_download(download_id, video_id, title, channel_url, final_path=final_path)
     return download_id
+
+
+def reconcile_interrupted(now=None):
+    """Close out downloads that a restart left mid-flight, and trim history.
+
+    Nothing reconciled this file before v1.8.1, and the consequence was much
+    worse than a stale row in the UI. `_monitor_queue_depth()` counts entries in
+    IN_FLIGHT_STATUSES to decide whether the download queue is backed up, and
+    the scheduler skips a check entirely when that count reaches
+    `max_queue_depth` (default 20). Since an interrupted download stayed
+    'downloading' forever, twenty container restarts mid-download were enough to
+    disable channel monitoring **permanently and silently** — no error, no log
+    line, checks simply stopped happening.
+
+    Also prunes finished entries beyond MAX_TERMINAL_ENTRIES, newest first. The
+    file is served whole to the dashboard every two seconds, so unbounded growth
+    is a real cost, not just disk.
+
+    Safe to call at startup only: it must not run while downloads are live, or
+    it would mark a genuinely running download as interrupted.
+
+    Returns (interrupted_count, pruned_count).
+    """
+    stamp = now if now is not None else time.time()
+    interrupted = 0
+    pruned = 0
+    with _lock:
+        data = _load_active()
+
+        # Snapshot what was *already* finished before anything is re-flagged.
+        # Pruning the post-interruption set instead would let an entry be marked
+        # interrupted and deleted in the same pass — the user would never see
+        # that the download had been cut off, only that it vanished. It also
+        # meant that calling this while downloads were live (which the contract
+        # forbids, but which is one mistake away) deleted them outright.
+        already_finished = [(e.get('started_at') or 0, k) for k, e in data.items()
+                            if e.get('status') in TERMINAL_STATUSES]
+
+        for entry in data.values():
+            if entry.get('status') in IN_FLIGHT_STATUSES:
+                entry['status'] = 'interrupted'
+                entry['error'] = 'Vidshelf restarted while this was in progress'
+                entry['completed_at'] = stamp
+                interrupted += 1
+
+        finished = already_finished
+        if len(finished) > MAX_TERMINAL_ENTRIES:
+            finished.sort(reverse=True)          # newest first; drop the tail
+            for _, key in finished[MAX_TERMINAL_ENTRIES:]:
+                del data[key]
+                pruned += 1
+
+        if interrupted or pruned:
+            _save_active(data)
+    return interrupted, pruned
 
 def _update_progress(download_id, **kwargs):
     with _lock:
@@ -287,7 +388,7 @@ def download_video(video_id, download_path, plex_media_path, title='Unknown', ch
             # already confirmed to work on this mount.
             with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
                 shutil.copyfileobj(fsrc, fdst)
-            shutil.copystat(src, dst)
+            _copystat_best_effort(src, dst)
             os.remove(src) # Remove from source after successful copy
             _update_progress(download_id, filename=downloaded_file)
             # Verify the file exists at the final destination
