@@ -304,6 +304,29 @@ def _artist_from_music_key(channel_url):
     return channel_url[len(MUSIC_KEY_PREFIX):].replace('_', ' ').strip() or None
 
 
+def _music_retry_destination(recorded_path, music_artist):
+    """Where a retried music video should land.
+
+    The path recorded on a download entry is only the artist folder once the job
+    has actually *started*: the music route queues it with the music root, and
+    download_video re-inits the entry with root/Artist when a worker picks it
+    up. A download cancelled while still queued never got that far — so
+    retrying one would drop the file loose in the root. Inside the library, but
+    with no artist folder, so no artwork, no collection, and nothing on the
+    Artists page.
+
+    No-op for channel downloads, and idempotent: a path that already ends in the
+    artist folder is returned unchanged, so the normal failed-mid-download case
+    doesn't get a second folder nested inside the first.
+    """
+    if not music_artist:
+        return recorded_path
+    folder = _sanitize_folder_name(music_artist)
+    if os.path.basename(os.path.normpath(recorded_path)) == folder:
+        return recorded_path
+    return os.path.join(recorded_path, folder)
+
+
 def _download_options(channel_url=None):
     """Resolve per-download yt-dlp options: quality cap and cookies.
 
@@ -1955,10 +1978,12 @@ def api_download_retry(download_id):
             plex_media_path = _resolve_plex_path(ch.get('plex_media_path', './downloads'))
             break
 
-    new_id = queue_download(video_id, title, channel_url, final_path=plex_media_path)
     # Recover the artist from the synthetic key so a retried music video is
     # named the same way the original attempt would have been.
     music_artist = _artist_from_music_key(channel_url)
+    plex_media_path = _music_retry_destination(plex_media_path, music_artist)
+
+    new_id = queue_download(video_id, title, channel_url, final_path=plex_media_path)
 
     def _run():
         try:

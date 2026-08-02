@@ -453,6 +453,48 @@ def test_config_round_trip_from_a_disconnected_install_persists_no_marker():
     assert 'token' not in after['plex'], 'an empty token should not be invented'
 
 
+def test_retried_music_video_lands_in_its_artist_folder():
+    """v1.8.0 review finding — a gap in the v1.8.0 retry fix itself.
+
+    The retry route falls back to the destination recorded on the entry, which
+    fixed music videos going to ./downloads. But that recorded path is only the
+    artist folder once a worker has *started* the job: the music route queues it
+    with the music root, and download_video re-inits the entry with root/Artist
+    later. A download cancelled while still queued keeps the root — so the
+    original fix still mislaid that case, just less badly.
+
+    Both shapes are pinned here because the connected one passed throughout.
+    """
+    root = '/app/music_videos_final'
+    artist = 'Nine Inch Nails'
+    expected = os.path.basename(
+        app_module._sanitize_folder_name(artist))
+
+    # Cancelled while queued: only the root was ever recorded.
+    got = app_module._music_retry_destination(root, artist)
+    assert os.path.basename(os.path.normpath(got)) == expected, got
+
+    # Failed mid-download: already the artist folder — must not nest a second.
+    already = os.path.join(root, expected)
+    assert app_module._music_retry_destination(already, artist) == already
+
+    # A real channel download is untouched.
+    assert app_module._music_retry_destination('./downloads', None) == './downloads'
+
+
+def test_music_key_round_trips_through_both_helpers():
+    """The retry path reads the artist back out of the synthetic tracker key.
+    Getting that transform subtly wrong is invisible until a file lands in the
+    wrong folder, so it gets a test rather than trust."""
+    for artist in ('Nirvana', 'Nine Inch Nails', 'AC/DC'):
+        key = app_module._music_key_for_artist(artist)
+        assert key.startswith('music_video_'), key
+        assert app_module._artist_from_music_key(key) == artist, key
+    # A real channel URL is not a music key.
+    assert app_module._artist_from_music_key('https://www.youtube.com/@x') is None
+    assert app_module._artist_from_music_key('') is None
+
+
 def test_notification_config_never_echoes_the_url_back():
     """The webhook URL usually embeds a secret; the response must not carry it.
 
