@@ -179,6 +179,92 @@ def test_two_downloads_of_one_video_in_the_same_second_get_distinct_ids():
     assert len(state.read_json(state.ACTIVE_DOWNLOADS_FILE)) == 5
 
 
+# --------------------------------------------------------------------------
+# Staging sweep — the one that must never delete a library
+# --------------------------------------------------------------------------
+
+def _staging_fixture():
+    """./downloads doubling as both staging and a channel's final destination —
+    the default layout, and the one that makes a blind sweep dangerous."""
+    base = tempfile.mkdtemp(prefix='sweep-', dir=_WORK)
+    old = time.time() - 10 * 3600
+    paths = {}
+
+    def add(subdir, name, age=old):
+        d = os.path.join(base, *subdir)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, name)
+        with open(p, 'wb') as fh:
+            fh.write(b'x' * 1024)
+        os.utime(p, (age, age))
+        return p
+
+    paths['downloads'] = os.path.join(base, 'downloads')
+    paths['music'] = os.path.join(base, 'downloads', 'music_videos')
+    os.makedirs(paths['music'], exist_ok=True)
+    paths['library'] = add(['downloads'], 'Final Channel Video-abc12345678.mp4')
+    paths['frag'] = add(['downloads'], 'Half Done-abc12345678.f251.webm')
+    paths['part'] = add(['downloads'], 'Interrupted-xyz.mp4.part')
+    paths['leak'] = add(['downloads', 'music_videos'], 'Artist - Song-vid1.mp4')
+    paths['mfrag'] = add(['downloads', 'music_videos'], 'Artist - Song-vid1.f137.mp4')
+    paths['fresh'] = add(['downloads', 'music_videos'], 'Downloading Now-vid2.mp4',
+                         age=time.time())
+    return paths
+
+
+def test_sweep_never_removes_complete_files_from_an_unvouched_directory():
+    """The regression test for a library I actually deleted.
+
+    The first version of this sweep computed "pure staging" as "not among the
+    destinations resolved from the current config". On an install whose
+    plex_base_path had since been repointed at another share, ./downloads was not
+    in that set — so four finished videos left there by an *earlier* config were
+    classified as leftovers and removed. 640 MB, unrecoverable.
+
+    The config says where files go now; it says nothing about where existing
+    files came from. Orphans live precisely in the directory that is no longer a
+    destination. So complete files are only removed from directories a caller
+    explicitly vouches for, and everything else fails closed.
+    """
+    p = _staging_fixture()
+    # ./downloads passed for intermediates only, and vouched for by nobody.
+    downloader.sweep_staging([p['downloads']], pure_staging_dirs=[])
+    assert os.path.exists(p['library']),         'a finished video was deleted from a directory nobody vouched for'
+    assert not os.path.exists(p['frag']), 'a merge fragment survived'
+    assert not os.path.exists(p['part']), 'a .part file survived'
+
+
+def test_sweep_clears_complete_files_only_where_vouched_for():
+    """./downloads/music_videos is staging by construction — the music route
+    always copies out of it — so leaked complete copies there are removable."""
+    p = _staging_fixture()
+    downloader.sweep_staging([p['downloads']], pure_staging_dirs=[p['music']])
+    assert not os.path.exists(p['leak']), 'a leaked complete copy survived'
+    assert not os.path.exists(p['mfrag'])
+    assert os.path.exists(p['library']), 'the sibling library file was touched'
+
+
+def test_sweep_leaves_recent_files_alone():
+    """Belt-and-braces: the sweep only runs at startup, but a file being written
+    right now must never be removed."""
+    p = _staging_fixture()
+    downloader.sweep_staging([p['downloads']], pure_staging_dirs=[p['music']])
+    assert os.path.exists(p['fresh']), 'an in-progress download was swept'
+
+
+def test_sweep_tolerates_a_missing_directory():
+    assert downloader.sweep_staging(['/nonexistent/staging']) == (0, 0)
+
+
+def test_intermediate_detection():
+    for name in ('x.f251.webm', 'x.f137.mp4', 'a.f140.m4a', 'y.mp4.part',
+                 'z.ytdl', 'q.temp'):
+        assert downloader._is_intermediate(name), name
+    for name in ('Artist - Song-vid1.mp4', 'video.mkv', 'f251.webm',
+                 'The Strokes - 12_51-LPAVDHo1Elc.mp4'):
+        assert not downloader._is_intermediate(name), name
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failures = 0

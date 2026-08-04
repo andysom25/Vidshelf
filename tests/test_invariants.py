@@ -475,20 +475,20 @@ def test_copystat_is_never_allowed_to_fail_a_transfer():
     """
     offenders = []
     for name in PY_FILES:
-        lines = _read(name).split('\n')
+        # _code_lines strips comments *and* docstring bodies. Matching raw text
+        # instead flagged this rule's own explanation of the bug, which is the
+        # same trap the helper was written for in the first place.
+        lines = _code_lines(_read(name))
         for i, line in enumerate(lines):
-            if 'copystat' not in line or line.strip().startswith('#'):
+            if 'copystat' not in line:
                 continue
-            if 'def _copystat_best_effort' in line:
-                continue
-            # Guarded either by a helper whose name says so, or by a try: within
-            # the few lines above.
+            # The guarded helper itself, and any call to it, are the fix.
             if '_copystat_best_effort' in line:
                 continue
             window = '\n'.join(lines[max(0, i - 4):i])
             if 'try:' in window:
                 continue
-            offenders.append(f'{name}:{i + 1}: {line.strip()}')
+            offenders.append(f'{name}: {line.strip()}')
 
     assert not offenders, (
         'Unguarded shutil.copystat(). It raises PermissionError on the CIFS '

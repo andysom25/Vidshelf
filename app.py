@@ -831,6 +831,51 @@ def _resolve_plex_path(per_channel_plex_path):
     return resolved
 
 
+def _sweep_staging_dirs():
+    """Clean local staging leftovers at startup.
+
+    Only ONE directory is vouched for as pure staging: `./downloads/music_videos`.
+    The music-video route always writes there and always copies out to
+    `<music root>/<Artist>/`, so nothing in it is ever a finished location. That
+    is a property of the code, not of the current configuration.
+
+    `./downloads` gets intermediates-only treatment, permanently. It is the
+    historical default `plex_media_path`, which means it can hold finished media
+    from *any* past configuration — and a config that no longer points at it is
+    exactly when it holds orphans. Deriving safety from today's config deleted
+    four finished videos on the first install this ran against; see
+    sweep_staging's docstring.
+    """
+    config = load_config()
+
+    intermediates_only = ['./downloads']
+    for ch in config.get('channels', []):
+        intermediates_only.append(ch.get('download_path', './downloads'))
+
+    pure_staging = ['./downloads/music_videos']
+
+    # A channel whose download path is not also its Plex path is staging by the
+    # same argument as music_videos: the file is always copied out of it.
+    for ch in config.get('channels', []):
+        dl = ch.get('download_path', './downloads')
+        dest = _resolve_plex_path(ch.get('plex_media_path', './downloads'))
+        if os.path.normpath(os.path.abspath(dl)) != os.path.normpath(os.path.abspath(dest)):
+            pure_staging.append(dl)
+    # ...but never if some other channel treats it as a destination.
+    finals = {os.path.normpath(os.path.abspath(p)) for p in _gather_media_roots(config)}
+    finals.add(os.path.normpath(os.path.abspath(_music_root(config))))
+    for ch in config.get('channels', []):
+        finals.add(os.path.normpath(os.path.abspath(
+            _resolve_plex_path(ch.get('plex_media_path', './downloads')))))
+    pure_staging = [p for p in pure_staging
+                    if os.path.normpath(os.path.abspath(p)) not in finals]
+
+    removed, freed = downloader_module.sweep_staging(intermediates_only, pure_staging)
+    if removed:
+        print(f"[downloads] swept {removed} leftover file(s), "
+              f"freed {freed / (1024 * 1024):.0f} MB")
+
+
 def _gather_media_roots(config):
     """Every directory this app might have downloaded videos into: the
     music-video root plus every configured channel's resolved
@@ -2798,6 +2843,11 @@ if __name__ == '__main__':
     except Exception as exc:  # noqa: BLE001
         # Never let housekeeping stop the app from starting.
         print(f"[downloads] could not reconcile download history: {exc}")
+
+    try:
+        _sweep_staging_dirs()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[downloads] could not sweep staging directories: {exc}")
 
     # Start the artwork background watcher
     start_artwork_watcher()

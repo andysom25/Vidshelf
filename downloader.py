@@ -1,6 +1,7 @@
 import os
 import shutil
 import itertools
+import re
 import json
 import threading
 import time
@@ -104,6 +105,105 @@ def queue_download(video_id, title, channel_url, final_path=None):
     download_id = f"{video_id}_{int(time.time())}_{next(_id_counter)}"
     _init_download(download_id, video_id, title, channel_url, final_path=final_path)
     return download_id
+
+
+# yt-dlp intermediates. A fragment is "<name>.f<format-id>.<ext>" — the separate
+# video/audio streams it merges — plus its own partial/resume markers. None of
+# these is ever a finished file, anywhere, so they are safe to remove from any
+# directory. Everything else needs the pure-staging proof below.
+_FRAGMENT_RE = re.compile(r'\.f\d+\.[A-Za-z0-9]+$')
+_INTERMEDIATE_SUFFIXES = ('.part', '.ytdl', '.temp', '.tmp')
+
+# Nothing younger than this is touched. The sweep only runs at startup, when no
+# download of ours is live, so this is belt-and-braces against a second instance
+# or a hand-run script sharing the volume.
+STAGING_MIN_AGE_SECONDS = 3 * 3600
+
+
+def _is_intermediate(name):
+    return bool(_FRAGMENT_RE.search(name)) or name.endswith(_INTERMEDIATE_SUFFIXES)
+
+
+def sweep_staging(intermediate_dirs, pure_staging_dirs=(), now=None, min_age=None):
+    """Delete leftovers from the local staging directories.
+
+    Why this is needed: a download is fetched to local disk and then copied to
+    the media path, and `os.remove(src)` only runs if that copy returns cleanly.
+    Any failure in between — the copystat bug fixed in v1.8.1, a full disk, a
+    container stop — leaves the local copy behind forever. Nothing cleaned those
+    up; 2.6 GB had accumulated on the first machine checked, 852 MB of it merge
+    fragments.
+
+    **Two separate permissions, because getting this wrong destroys a library.**
+
+    - `intermediate_dirs`: only yt-dlp intermediates are removed — merge
+      fragments, `.part`, `.ytdl`. Those are never a finished file, anywhere.
+    - `pure_staging_dirs`: complete files are removed too. A caller may only
+      pass a directory here that is a staging area **by construction**, not one
+      that merely fails to match today's configured destinations.
+
+    That distinction is the whole safety argument, and it is written this way
+    because the first version got it backwards. It computed "pure staging" as
+    "not in the set of destinations resolved from the current config", and on an
+    install whose `plex_base_path` had since been repointed at a different share
+    that set did not include `./downloads` — so four finished videos left there
+    by an *earlier* configuration were classified as leftovers and deleted.
+
+    The config says where files go **now**. It says nothing about where existing
+    files came from, and orphans from a previous configuration live precisely in
+    the directory that is no longer a destination. So the rule is an allowlist
+    of provably-staging directories, and it fails closed: a directory nobody
+    vouches for keeps its complete files forever.
+
+    Both paths are age-gated. Returns (removed_count, freed_bytes).
+    """
+    stamp = now if now is not None else time.time()
+    cutoff = stamp - (min_age if min_age is not None else STAGING_MIN_AGE_SECONDS)
+
+    def _norm(p):
+        return os.path.normpath(os.path.abspath(p))
+
+    pure = {_norm(p) for p in pure_staging_dirs if p}
+    removed = 0
+    freed = 0
+
+    seen = set()
+    for raw_dir in list(intermediate_dirs) + list(pure_staging_dirs):
+        if not raw_dir or not os.path.isdir(raw_dir):
+            continue
+        staging = _norm(raw_dir)
+        if staging in seen:
+            continue
+        seen.add(staging)
+        complete_ok = staging in pure
+
+        for name in os.listdir(staging):
+            path = os.path.join(staging, name)
+            if not os.path.isfile(path):
+                continue
+            if not (complete_ok or _is_intermediate(name)):
+                continue
+            try:
+                stat = os.stat(path)
+                if stat.st_mtime > cutoff:
+                    continue
+                os.remove(path)
+            except OSError as exc:
+                print(f'[downloads] could not remove leftover {path}: {exc}')
+                continue
+            removed += 1
+            freed += stat.st_size
+
+    return removed, freed
+
+
+def _is_within(child, parent):
+    """True if child is inside parent. Compares path components, so /a/bc is
+    not treated as living inside /a/b."""
+    try:
+        return os.path.commonpath([child, parent]) == parent and child != parent
+    except ValueError:      # different drives on Windows
+        return False
 
 
 def reconcile_interrupted(now=None):

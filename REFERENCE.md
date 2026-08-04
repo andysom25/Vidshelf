@@ -4822,3 +4822,44 @@ If it is `PermissionError` on a NAS path, check
 owned by uid 1000 can create, write and delete, but cannot `utime` or `chmod`
 without CAP_FOWNER. And per CLAUDE.md gotcha #1, run `df -h` first to confirm the
 mount is real CIFS and not a decoy.
+
+### Postscript: the automated sweep deleted a library on its first run
+
+Automating the cleanup was the obvious follow-up and it was got wrong, on the
+live install, in a way worth recording because the mistake is seductive.
+
+`sweep_staging()` decided which directories were safe to clear complete files
+from by resolving the destinations out of the **current** config and treating
+anything not in that set as staging. `./downloads` was not in it — this install's
+`plex_base_path` had since been repointed at a different share — so four finished
+videos sitting there from an earlier configuration were classified as leftovers
+and removed. 640 MB, and not recoverable: no shadow copies on the volume, and
+the current destination share was not reachable to check for duplicates.
+
+**The reasoning error, stated plainly: the config tells you where files go now.
+It tells you nothing about where existing files came from — and orphans live
+precisely in the directory that is no longer a destination.** A "not currently a
+destination" test is therefore at its most confident exactly when it is most
+wrong.
+
+Rewritten as an allowlist that fails closed. A caller passes
+`pure_staging_dirs` only for directories that are staging **by construction**,
+and today that is one: `./downloads/music_videos`, because the music-video route
+always copies out of it to `<music root>/<Artist>/`. That is a property of the
+code, not of settings. Everything else, `./downloads` permanently included, gets
+intermediates-only treatment — merge fragments, `.part`, `.ytdl` — which are
+never a finished file anywhere.
+
+`test_sweep_never_removes_complete_files_from_an_unvouched_directory` is the
+regression test, and it is named after what actually happened rather than after
+the API.
+
+Two further notes for whoever touches this next:
+
+- The four lost videos were public YouTube uploads, so re-downloadable by id
+  (`cGtLXdFT41o`, `jNQXAC9IVRw`, `f2JvlUiHPLI`, `_KwWcPBB7yk`). That is luck, not
+  mitigation. Nothing in the design guaranteed recoverability.
+- A destructive sweep should have been dry-run first — report what it *would*
+  delete, on a real install, before wiring it into startup. The unit tests all
+  passed; they encoded the author's model of the layout, and the live install did
+  not match that model.
