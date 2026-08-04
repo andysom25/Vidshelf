@@ -1071,6 +1071,13 @@ on the commit that removed it has the original content.
   (calling it periodically, e.g. from the existing `ArtworkWatcher` poll
   loop or a new timer) is the fix, not writing new pruning logic from
   scratch.
+
+  > **Corrected in v1.8.1: `clear_completed_downloads()` does not exist.**
+  > `grep -rn clear_completed_downloads --include=*.py .` returns nothing — it
+  > was either removed or never landed, and this entry sent a reader looking for
+  > a function to revive that isn't there. The prediction was right, though: the
+  > file did grow unbounded, and the pruning had to be written from scratch after
+  > all. It now lives in `reconcile_interrupted()`.
 - Stale `# TODO: replace with your Plex client identifier` / `# TODO:
   replace with your Plex product name` comments on `artwork_sync.py`'s
   `PLEX_CLIENT_ID`/`PLEX_PRODUCT` constants — these are the real, working,
@@ -4674,3 +4681,185 @@ Not on paper — this is the download path, which this file records as having
 video lands somewhere unexpected, check `_music_root()` and the
 `_music_path_conflict` key before suspecting the download code — the destination
 is config-driven now, and the notice in Settings names both paths.
+
+## v1.8.1 — every download to the NAS had been failing since v1.6.1
+
+Reported as "downloads seem to be failing on this version", which pointed at
+v1.8.0. It wasn't. **v1.6.1 broke it, and nobody noticed for two releases because
+no download ran on this deployment in between.** That gap is the real lesson
+here; the fix itself is four lines.
+
+### The failure
+
+```
+File "/app/downloader.py", line 290, in download_video
+    shutil.copystat(src, dst)
+File "/usr/local/lib/python3.12/shutil.py", line 384, in copystat
+    lookup("utime")(dst, ns=(st.st_atime_ns, st.st_mtime_ns),
+PermissionError: [Errno 1] Operation not permitted
+```
+
+### Root cause: cap_drop: ALL took CAP_FOWNER with it
+
+The container runs as **root (uid 0)**. The CIFS volume options force every file
+to **uid 1000** (`uid=1000,gid=1000,file_mode=0777`). Calling `utime()` or
+`chmod()` on a file you do not own requires **CAP_FOWNER** — root normally has
+it, and v1.6.1's `cap_drop: ALL` removed it.
+
+**Proven, not inferred.** Same image, same mount, one variable:
+
+| Container | `os.utime` on a uid-1000 file |
+| --- | --- |
+| live, `cap_drop: ALL` | `PermissionError: [Errno 1]` |
+| same image `+ --cap-add FOWNER` | OK |
+
+### Why it was so much worse than "a timestamp didn't copy"
+
+`copystat` runs *after* `copyfileobj` has finished, so the file on the NAS was
+already whole and correct. The exception then took out everything downstream:
+
+1. the download was reported as **failed**, though it had succeeded;
+2. `os.remove(src)` on the very next line never ran, so the local copy leaked —
+   **2.6 GB** across 35 files by the time this was found, including `.f251.webm`
+   / `.f397.mp4` fragments from older attempts;
+3. `mark_video_downloaded()` never ran, so the video stayed absent from the
+   tracker and would be downloaded again on the next check.
+
+Seven of The Strokes' videos were sitting complete and correctly named on the
+NAS while the UI showed seven failures.
+
+### The fix
+
+`downloader._copystat_best_effort()` — try, log, continue. That is exactly what
+CLAUDE.md has said all along: *"`shutil.copystat(src, dst)  # optional, cosmetic
+— drop it if the server rejects chmod`"*.
+
+**`transcode.py` already did this.** Its call has been wrapped in try/except with
+the comment "cosmetic — some NAS filesystems reject utime/chmod, not fatal" for
+ages. `downloader.py` never got the same treatment. One module knew and the
+other didn't, and nothing made them agree — so
+`test_copystat_is_never_allowed_to_fail_a_transfer` now requires every
+`copystat` call in the codebase to be guarded.
+
+Deliberately **not** fixed by adding `cap_add: FOWNER`. The capability is not
+needed for anything except a cosmetic timestamp, and re-granting it to work
+around a line the docs already say to drop would undo v1.6.1 for no gain.
+
+### Why two releases missed it
+
+The v1.6.1 verification did test the mount with zero capabilities — it listed 28
+artist directories and wrote a file successfully. What it did not test was
+`utime`/`chmod` **on a file owned by a different uid**, which is the one
+operation the missing capability governs. Read and write were the obvious things
+to check, and they were both fine.
+
+The honest generalisation: *a capability change needs the failing operation
+tested, not the feature tested.* Dropping a capability that "isn't used" is only
+safe if you know which syscalls it actually gates.
+
+---
+
+## Also in v1.8.1: interrupted downloads silently disabled channel monitoring
+
+Separate bug, found while hunting rather than reported, and the most severe of
+the batch.
+
+Nothing ever reconciled `active_downloads.json`. A download interrupted by a
+container restart stayed `downloading` **forever**. `_monitor_queue_depth()`
+counts entries in that state, and `ChannelMonitor` skips a check entirely once
+the count reaches `max_queue_depth` (default 20).
+
+So twenty interrupted downloads — accumulated over months of ordinary restarts —
+**permanently and silently stopped channel monitoring**. No error, no log line,
+no UI indication. Checks just stopped happening.
+
+Measured, with the cliff exactly where the setting says:
+
+| stale in-flight entries | channels checked per tick |
+| --- | --- |
+| 0 | 1 |
+| 19 | 1 |
+| **20** | **0** |
+
+`downloader.reconcile_interrupted()` now runs once at startup, before
+`_CHANNEL_MONITOR.start()`, marking anything still in flight as `interrupted`.
+
+**A subtlety the tests caught in the fix itself:** the first version marked
+in-flight entries as interrupted and *then* pruned terminal entries — so a
+just-interrupted download could be marked and deleted in the same pass, and the
+user would never see that it had been cut off. Pruning now works from a snapshot
+of what was already finished before the pass began.
+
+`app.py` no longer keeps its own copy of the status list; both sides read
+`downloader.IN_FLIGHT_STATUSES`, guarded by an invariant, because a status
+counted by one and not cleared by the other reintroduces exactly this bug.
+
+## And four smaller ones
+
+- **`active_downloads.json` was never pruned.** 500 finished downloads is 255 KB,
+  and the whole file is returned on a 2-second poll while the Downloads tab is
+  open. Capped at 200 finished entries, newest kept. `REFERENCE.md` previously
+  claimed `clear_completed_downloads()` existed and reviving it was the fix —
+  that function does not exist anywhere in the codebase. Stale docs, now corrected.
+- **`download_id` collided.** It was `{video_id}_{whole seconds}`. Queue the same
+  video twice inside one second and the second entry overwrote the first — which
+  is precisely what a retry does, since it reuses the failed download's video_id.
+  Now carries a process-wide counter.
+- **`KeyError` → HTTP 500** on `/api/download` when a channel entry lacked
+  `download_path`, reachable through the raw-config editor. Every other reader
+  already used `.get()` with a default; this one site used a bracket read.
+- **Two unbounded in-memory tables.** `_LOGIN_FAILURES` kept one record per source
+  IP for the life of the process — growth driven entirely by unauthenticated
+  requests, on the one endpoint reachable without a session. The two search
+  caches never evicted either, and were mutated from waitress' 8 threads without
+  a lock. All three are now bounded; the caches go through `_cache_put()`.
+
+### What to check first if downloads start failing again
+
+Read the traceback before anything else — this one named its own cause on line 2.
+If it is `PermissionError` on a NAS path, check
+`docker exec vidshelf id` against `ls -ln` on the mount: root writing to files
+owned by uid 1000 can create, write and delete, but cannot `utime` or `chmod`
+without CAP_FOWNER. And per CLAUDE.md gotcha #1, run `df -h` first to confirm the
+mount is real CIFS and not a decoy.
+
+### Postscript: the automated sweep deleted a library on its first run
+
+Automating the cleanup was the obvious follow-up and it was got wrong, on the
+live install, in a way worth recording because the mistake is seductive.
+
+`sweep_staging()` decided which directories were safe to clear complete files
+from by resolving the destinations out of the **current** config and treating
+anything not in that set as staging. `./downloads` was not in it — this install's
+`plex_base_path` had since been repointed at a different share — so four finished
+videos sitting there from an earlier configuration were classified as leftovers
+and removed. 640 MB, and not recoverable: no shadow copies on the volume, and
+the current destination share was not reachable to check for duplicates.
+
+**The reasoning error, stated plainly: the config tells you where files go now.
+It tells you nothing about where existing files came from — and orphans live
+precisely in the directory that is no longer a destination.** A "not currently a
+destination" test is therefore at its most confident exactly when it is most
+wrong.
+
+Rewritten as an allowlist that fails closed. A caller passes
+`pure_staging_dirs` only for directories that are staging **by construction**,
+and today that is one: `./downloads/music_videos`, because the music-video route
+always copies out of it to `<music root>/<Artist>/`. That is a property of the
+code, not of settings. Everything else, `./downloads` permanently included, gets
+intermediates-only treatment — merge fragments, `.part`, `.ytdl` — which are
+never a finished file anywhere.
+
+`test_sweep_never_removes_complete_files_from_an_unvouched_directory` is the
+regression test, and it is named after what actually happened rather than after
+the API.
+
+Two further notes for whoever touches this next:
+
+- The four lost videos were public YouTube uploads, so re-downloadable by id
+  (`cGtLXdFT41o`, `jNQXAC9IVRw`, `f2JvlUiHPLI`, `_KwWcPBB7yk`). That is luck, not
+  mitigation. Nothing in the design guaranteed recoverability.
+- A destructive sweep should have been dry-run first — report what it *would*
+  delete, on a real install, before wiring it into startup. The unit tests all
+  passed; they encoded the author's model of the layout, and the live install did
+  not match that model.

@@ -42,7 +42,8 @@ jobs:
           # Source-level invariants for bugs that only manifest against a real
           # CIFS mount or container restart, so nothing else can catch them.
           python tests/test_invariants.py
-          python tests/test_titles.py
+          python tests/test_titles.py
+          python tests/test_download_state.py
 
       # The Artists page's filter/sort logic is client-side, so it's tested by
       # running the real static/js/dashboard.js under node (already present on

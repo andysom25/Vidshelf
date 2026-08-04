@@ -16,8 +16,10 @@ import retention
 import scheduler
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
+import downloader as downloader_module
 from downloader import (download_video, get_active_downloads, queue_download,
-                        request_cancel, DownloadCancelled, build_format_selector)
+                        request_cancel, DownloadCancelled, build_format_selector,
+                        reconcile_interrupted)
 from artwork_sync import (
     ArtworkWatcher, sync_artist_artwork, sync_all_artists,
     trigger_plex_refresh, setup_logging, folder_to_artist,
@@ -72,6 +74,31 @@ logging.getLogger('werkzeug').addFilter(_SuppressNoisyPollingEndpoints())
 # fetched instead of re-hitting TheAudioDB/Fanart.tv/MusicBrainz/Wikimedia
 # on every click. {artist_lower: (fetched_at, [urls])}
 _ARTWORK_SEARCH_CACHE = {}
+# These two caches are mutated from waitress' 8 request threads and were
+# never evicted: one entry per artist ever searched, held for the life of the
+# process, each holding a full result list. _cache_put bounds them and takes a
+# lock -- plain dict writes are atomic under the GIL, but read-modify-write
+# eviction is not.
+_SEARCH_CACHE_LOCK = threading.Lock()
+_SEARCH_CACHE_MAX_ENTRIES = 128
+
+
+def _cache_put(cache, key, value, ttl):
+    """Store a (timestamp, value) entry, dropping expired and excess ones.
+
+    Bounded by count as well as TTL: an expired entry is only overwritten if
+    that exact key is searched again, so TTL alone never reclaims anything for
+    a one-off search. Evicts oldest-first once over the cap.
+    """
+    now = time.time()
+    with _SEARCH_CACHE_LOCK:
+        cache[key] = (now, value)
+        for stale in [k for k, (ts, _) in cache.items() if now - ts >= ttl]:
+            del cache[stale]
+        if len(cache) > _SEARCH_CACHE_MAX_ENTRIES:
+            for oldest, _ in sorted(cache.items(), key=lambda kv: kv[1][0])[
+                    :len(cache) - _SEARCH_CACHE_MAX_ENTRIES]:
+                del cache[oldest]
 _ARTWORK_SEARCH_CACHE_TTL = 600  # seconds
 ARTWORK_SEARCH_PAGE_SIZE = 5
 
@@ -248,16 +275,31 @@ _ADMIN_USERNAME, _ADMIN_PASSWORD_HASH = _get_or_create_admin_credentials()
 _LOGIN_FAILURES = {}  # ip -> (fail_count, locked_until_epoch)
 _LOGIN_MAX_ATTEMPTS = 5
 _LOGIN_LOCKOUT_SECONDS = 300
+# Above this many tracked IPs, expired records are swept on the next failed
+# login. Not a hard cap -- currently-locked IPs are never dropped, since
+# forgetting one would hand an attacker a free reset.
+_LOGIN_FAILURES_SOFT_CAP = 512
 
 def _login_is_locked(ip):
     count, locked_until = _LOGIN_FAILURES.get(ip, (0, 0))
     return count >= _LOGIN_MAX_ATTEMPTS and time.time() < locked_until
 
 def _record_login_failure(ip):
+    now = time.time()
+    # Evict records that can no longer lock anyone out. Without this the dict
+    # kept one entry per source IP for the life of the process — unbounded
+    # growth driven entirely by unauthenticated requests, which is a poor
+    # property for the one endpoint that is reachable without a session.
+    # Cheap: this runs only on a *failed* login, which is already rate-limited.
+    if len(_LOGIN_FAILURES) > _LOGIN_FAILURES_SOFT_CAP:
+        for stale_ip, (_, until) in list(_LOGIN_FAILURES.items()):
+            if until < now and stale_ip != ip:
+                del _LOGIN_FAILURES[stale_ip]
+
     count, locked_until = _LOGIN_FAILURES.get(ip, (0, 0))
     count += 1
     if count >= _LOGIN_MAX_ATTEMPTS:
-        locked_until = time.time() + _LOGIN_LOCKOUT_SECONDS
+        locked_until = now + _LOGIN_LOCKOUT_SECONDS
     _LOGIN_FAILURES[ip] = (count, locked_until)
 
 def _clear_login_failures(ip):
@@ -789,6 +831,51 @@ def _resolve_plex_path(per_channel_plex_path):
     return resolved
 
 
+def _sweep_staging_dirs():
+    """Clean local staging leftovers at startup.
+
+    Only ONE directory is vouched for as pure staging: `./downloads/music_videos`.
+    The music-video route always writes there and always copies out to
+    `<music root>/<Artist>/`, so nothing in it is ever a finished location. That
+    is a property of the code, not of the current configuration.
+
+    `./downloads` gets intermediates-only treatment, permanently. It is the
+    historical default `plex_media_path`, which means it can hold finished media
+    from *any* past configuration — and a config that no longer points at it is
+    exactly when it holds orphans. Deriving safety from today's config deleted
+    four finished videos on the first install this ran against; see
+    sweep_staging's docstring.
+    """
+    config = load_config()
+
+    intermediates_only = ['./downloads']
+    for ch in config.get('channels', []):
+        intermediates_only.append(ch.get('download_path', './downloads'))
+
+    pure_staging = ['./downloads/music_videos']
+
+    # A channel whose download path is not also its Plex path is staging by the
+    # same argument as music_videos: the file is always copied out of it.
+    for ch in config.get('channels', []):
+        dl = ch.get('download_path', './downloads')
+        dest = _resolve_plex_path(ch.get('plex_media_path', './downloads'))
+        if os.path.normpath(os.path.abspath(dl)) != os.path.normpath(os.path.abspath(dest)):
+            pure_staging.append(dl)
+    # ...but never if some other channel treats it as a destination.
+    finals = {os.path.normpath(os.path.abspath(p)) for p in _gather_media_roots(config)}
+    finals.add(os.path.normpath(os.path.abspath(_music_root(config))))
+    for ch in config.get('channels', []):
+        finals.add(os.path.normpath(os.path.abspath(
+            _resolve_plex_path(ch.get('plex_media_path', './downloads')))))
+    pure_staging = [p for p in pure_staging
+                    if os.path.normpath(os.path.abspath(p)) not in finals]
+
+    removed, freed = downloader_module.sweep_staging(intermediates_only, pure_staging)
+    if removed:
+        print(f"[downloads] swept {removed} leftover file(s), "
+              f"freed {freed / (1024 * 1024):.0f} MB")
+
+
 def _gather_media_roots(config):
     """Every directory this app might have downloaded videos into: the
     music-video root plus every configured channel's resolved
@@ -904,8 +991,12 @@ def api_download():
     plex_media_path = './downloads'
 
     for ch in config.get('channels', []):
-        if ch['url'] == channel_url:
-            download_path = ch['download_path']
+        # .get, not [] — a channel entry hand-edited through the raw-config
+        # editor can legitimately lack these keys, and a bracket read turned
+        # that into an unhandled KeyError and an HTTP 500. Every other reader
+        # of download_path already defaulted; this one was the odd one out.
+        if ch.get('url') == channel_url:
+            download_path = ch.get('download_path', './downloads')
             plex_media_path = _resolve_plex_path(ch.get('plex_media_path', './downloads'))
             break
 
@@ -1267,7 +1358,8 @@ def api_music_videos_search():
             videos = cached[1]
         else:
             videos = search_music_videos(artist)
-            _MUSIC_VIDEO_SEARCH_CACHE[cache_key] = (time.time(), videos)
+            _cache_put(_MUSIC_VIDEO_SEARCH_CACHE, cache_key, videos,
+                       _MUSIC_VIDEO_SEARCH_CACHE_TTL)
 
         start = (page - 1) * MUSIC_VIDEO_SEARCH_PAGE_SIZE
         end = start + MUSIC_VIDEO_SEARCH_PAGE_SIZE
@@ -1579,7 +1671,8 @@ def api_artwork_search():
         config = load_config()
         api_key = config.get('artwork_sync', {}).get('fanarttv_api_key', '')
         images = search_artist_images(artist, api_key)
-        _ARTWORK_SEARCH_CACHE[cache_key] = (time.time(), images)
+        _cache_put(_ARTWORK_SEARCH_CACHE, cache_key, images,
+                   _ARTWORK_SEARCH_CACHE_TTL)
 
     start = (page - 1) * ARTWORK_SEARCH_PAGE_SIZE
     end = start + ARTWORK_SEARCH_PAGE_SIZE
@@ -1851,8 +1944,11 @@ def _monitor_queue_depth():
         active = get_active_downloads() or []
     except Exception:  # noqa: BLE001
         return 0
+    # The status list lives in downloader so this and reconcile_interrupted()
+    # can't drift apart — if they ever disagreed, a status counted here but not
+    # cleared there would throttle the monitor forever.
     return sum(1 for d in active
-               if d.get('status') in ('queued', 'downloading', 'converting'))
+               if d.get('status') in downloader_module.IN_FLIGHT_STATUSES)
 
 
 def _monitor_free_space(path):
@@ -2733,6 +2829,26 @@ if __name__ == '__main__':
         except Exception:
             pass
     
+    # Close out anything a previous run left mid-flight, before the monitor
+    # starts. Must happen here and not at import: at import time under the test
+    # client, or a `python -c "import app"` check, there is no previous run to
+    # reconcile — and it must happen before _CHANNEL_MONITOR.start(), because
+    # stale in-flight rows are what used to make the queue-depth brake disable
+    # monitoring permanently.
+    try:
+        _interrupted, _pruned = reconcile_interrupted()
+        if _interrupted or _pruned:
+            print(f"[downloads] reconciled {_interrupted} interrupted, "
+                  f"pruned {_pruned} old history entries")
+    except Exception as exc:  # noqa: BLE001
+        # Never let housekeeping stop the app from starting.
+        print(f"[downloads] could not reconcile download history: {exc}")
+
+    try:
+        _sweep_staging_dirs()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[downloads] could not sweep staging directories: {exc}")
+
     # Start the artwork background watcher
     start_artwork_watcher()
 
