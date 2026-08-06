@@ -516,6 +516,40 @@ def test_a_real_channel_url_is_not_mistaken_for_a_music_key():
     assert app_module._music_key_for_artist('Nirvana').startswith('music_video_')
 
 
+def test_stats_disk_usage_measures_the_media_library():
+    """v1.8.2. It used to walk ./downloads — the *staging* directory.
+
+    That looked plausible only because failed downloads leaked copies there: on
+    the install where this was found it was reporting 2.6 GB of orphaned temp
+    files, and dropped to 0.0 KB the moment those were cleaned up, while ~197
+    videos sat on the NAS uncounted. Staging is the one directory whose size
+    tells you nothing about your library.
+    """
+    work = tempfile.mkdtemp(prefix='vidshelf-libsize-')
+    try:
+        root = os.path.join(work, 'media', 'Nirvana')
+        os.makedirs(root)
+        for name, size in (('a.mp4', 5_000_000), ('b.mkv', 3_000_000),
+                           ('folder.jpg', 50_000)):
+            with open(os.path.join(root, name), 'wb') as fh:
+                fh.write(b'\0' * size)
+
+        state.write_json(app_module.CONFIG_FILE, {
+            'artwork_sync': {'root_path': os.path.join(work, 'media')},
+            'plex_base_path': os.path.join(work, 'media'),
+            '_secret_key': 'k'}, indent=4)
+        app_module._LIBRARY_SIZE_CACHE['at'] = 0     # defeat the TTL cache
+
+        stats = _client(authenticated=True).get('/api/stats').get_json()
+        assert stats['disk_usage'] == 8_000_000, (
+            f"expected the two video files (8 MB), got {stats['disk_usage']} — "
+            'artwork must not be counted, and staging must not be measured')
+        assert stats['library_videos'] == 2, stats['library_videos']
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        app_module._LIBRARY_SIZE_CACHE['at'] = 0
+
+
 def test_notification_config_never_echoes_the_url_back():
     """The webhook URL usually embeds a secret; the response must not carry it.
 

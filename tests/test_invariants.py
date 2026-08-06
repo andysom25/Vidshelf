@@ -515,6 +515,63 @@ def test_queue_depth_and_reconcile_share_one_status_list():
         'accumulate and silently disable channel monitoring again')
 
 
+def test_dashboard_helpers_are_not_defined_twice():
+    """v1.8.2. dashboard.js is one flat global scope — four formerly-inline
+    <script> blocks concatenated — so two functions with the same name silently
+    shadow each other, later definition winning for *every* caller.
+
+    Nearly shipped exactly that: a second `formatBytes` was added ~480 lines
+    below a correct one that already existed, which would have quietly changed
+    the output of five unrelated call sites. Nothing would have failed; the
+    numbers would just have been different.
+    """
+    src = _read(os.path.join('static', 'js', 'dashboard.js'))
+    names = re.findall(r'^\s*(?:async\s+)?function\s+(\w+)\s*\(', src, re.MULTILINE)
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    assert not dupes, (
+        'Duplicate top-level function names in dashboard.js. The file is a '
+        'single global scope, so the later definition silently wins for every '
+        f'caller of the earlier one: {", ".join(dupes)}')
+
+
+def test_disk_usage_is_measured_from_the_media_roots():
+    """v1.8.2 regression guard, for a number that was wrong in two ways at once.
+
+    It walked `./downloads` (staging, not the library), and the JS then
+    formatted the byte count as if it were kilobytes — so every reading was also
+    1024x too large. The pair hid each other: staging is usually near-empty, and
+    "0.0 KB" looks correct however you divide it.
+    """
+    src = _read('app.py')
+    assert "os.walk('./downloads')" not in src, (
+        'disk usage is walking the staging directory again — it must measure '
+        '_gather_media_roots(), which is the actual library')
+    assert 'def _library_size(' in src, '_library_size() is gone'
+    assert 'retention.VIDEO_EXTENSIONS' in src, (
+        '_library_size must reuse retention.VIDEO_EXTENSIONS rather than '
+        'defining a third copy of the extension list')
+
+    js = _read(os.path.join('static', 'js', 'dashboard.js'))
+    assert "disk.toFixed(1) + ' KB'" not in js, (
+        'the inline byte formatter is back. It labels raw bytes as KB, so every '
+        'reading is 1024x out; use formatBytes()')
+    assert 'formatBytes(statsData.disk_usage)' in js, \
+        'the Disk Usage card no longer goes through formatBytes()'
+
+
+def test_the_sidebar_version_refreshes_with_the_dashboard():
+    """v1.8.2. loadVersionBadge() ran once per page load and never again, so a
+    tab left open across an upgrade reported the old version indefinitely — next
+    to stats that were refreshing correctly — and the "update available" pill
+    kept nagging after the update was installed."""
+    js = _read(os.path.join('static', 'js', 'dashboard.js'))
+    handler = js[js.index("if (page === 'dashboard')"):]
+    handler = handler[:handler.index("if (page === 'swap-art')")]
+    assert 'loadVersionBadge()' in handler, (
+        'the dashboard page-switch handler no longer refreshes the version '
+        'badge; a long-lived tab will show a stale version again')
+
+
 def test_state_files_are_written_owner_only():
     """config.json holds the Plex token, the admin password hash and the session
     signing key, in a bind-mounted directory — 0644 meant any local user on the

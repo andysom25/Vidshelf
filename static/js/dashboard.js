@@ -37,7 +37,16 @@
                     loadNotifyConfig();
                     loadRetentionConfig();
                 }
-                if (page === 'dashboard') loadDashboardStats();
+                if (page === 'dashboard') {
+                    loadDashboardStats();
+                    // Refresh the sidebar version too. It used to be fetched
+                    // once, at page load, and never again — so a tab left open
+                    // across an upgrade reported the old version indefinitely,
+                    // right next to stats that were refreshing correctly. It
+                    // also meant the "update available" pill kept nagging after
+                    // you had already installed the update.
+                    loadVersionBadge();
+                }
                 if (page === 'swap-art') loadSwapArtArtists();
                 if (page === 'artists') loadArtistsPage();
                 if (page === 'downloads') {
@@ -105,11 +114,19 @@
         }
 
         // Formats a raw byte count (e.g. a file size) as KB/MB/GB.
+        // Takes bytes. The Disk Usage card used to inline its own copy of this
+        // and got it wrong by exactly one unit — labelling raw bytes as KB, so
+        // every reading was 1024x too large. It went unnoticed because the value
+        // it formatted came from walking the near-empty staging directory, and
+        // "0.0 KB" looks correct however you divide it.
         function formatBytes(b) {
             if (!b) return 'N/A';
             if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
             if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + ' MB';
-            return (b / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+            // TB matters now that this measures the media library and not a
+            // staging folder — a multi-terabyte NAS would otherwise read '3072.00 GB'.
+            if (b < 1024 ** 4) return (b / (1024 ** 3)).toFixed(2) + ' GB';
+            return (b / (1024 ** 4)).toFixed(2) + ' TB';
         }
 
         // ---------- Toast Notifications ----------
@@ -182,16 +199,8 @@
                     document.getElementById('stat-downloads').textContent = downloadsCount;
                 }
                 if (statsData.disk_usage !== undefined) {
-                    const disk = statsData.disk_usage;
-                    let display;
-                    if (disk < 1024) {
-                        display = disk.toFixed(1) + ' KB';
-                    } else if (disk < 1024 * 1024) {
-                        display = (disk / 1024).toFixed(1) + ' MB';
-                    } else {
-                        display = (disk / (1024 * 1024)).toFixed(1) + ' GB';
-                    }
-                    document.getElementById('stat-disk').textContent = display;
+                    document.getElementById('stat-disk').textContent =
+                        formatBytes(statsData.disk_usage);
                 }
             } catch (e) {
                 console.error('Failed to load stats:', e);

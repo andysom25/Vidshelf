@@ -876,6 +876,52 @@ def _sweep_staging_dirs():
               f"freed {freed / (1024 * 1024):.0f} MB")
 
 
+_LIBRARY_SIZE_CACHE = {'at': 0.0, 'bytes': 0, 'videos': 0}
+_LIBRARY_SIZE_TTL = 300  # seconds
+_LIBRARY_SIZE_LOCK = threading.Lock()
+
+
+def _library_size(force=False):
+    """Total bytes and video count across the configured media roots.
+
+    The Disk Usage card used to walk `./downloads` — the *staging* directory —
+    so it never measured the library at all. It looked plausible only because
+    failed downloads leaked copies there: on the install where this was found it
+    was reporting 2.6 GB of orphaned temp files, and dropped to 0.0 KB the
+    moment that was cleaned up, while ~195 videos sat on the NAS uncounted.
+
+    Cached for _LIBRARY_SIZE_TTL because the media root is usually a CIFS mount
+    and /api/stats is called on every visit to the Dashboard tab. A stat() per
+    file over SMB is cheap for a few hundred videos and decidedly not for tens of
+    thousands, and the number moves slowly enough that five minutes stale is
+    fine.
+    """
+    now = time.time()
+    with _LIBRARY_SIZE_LOCK:
+        fresh = (now - _LIBRARY_SIZE_CACHE['at']) < _LIBRARY_SIZE_TTL
+        if fresh and not force:
+            return _LIBRARY_SIZE_CACHE['bytes'], _LIBRARY_SIZE_CACHE['videos']
+
+    total = 0
+    videos = 0
+    for root in _gather_media_roots(load_config()):
+        for dirpath, _, filenames in os.walk(root):
+            for name in filenames:
+                if not name.lower().endswith(retention.VIDEO_EXTENSIONS):
+                    continue
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, name))
+                    videos += 1
+                except OSError:
+                    # A file can vanish mid-walk (retention sweep, a move on the
+                    # NAS). Skip it rather than failing the whole dashboard.
+                    pass
+
+    with _LIBRARY_SIZE_LOCK:
+        _LIBRARY_SIZE_CACHE.update({'at': now, 'bytes': total, 'videos': videos})
+    return total, videos
+
+
 def _gather_media_roots(config):
     """Every directory this app might have downloaded videos into: the
     music-video root plus every configured channel's resolved
@@ -1175,14 +1221,7 @@ def api_stats():
     # None until a check has run rather than pretending to be 0.
     new_available = _CHANNEL_MONITOR.pending_count()
 
-    disk_usage = 0
-    for dirpath, _, filenames in os.walk('./downloads'):
-        for f in filenames:
-            try:
-                fp = os.path.join(dirpath, f)
-                disk_usage += os.path.getsize(fp)
-            except OSError:
-                pass
+    disk_usage, library_videos = _library_size()
 
     return jsonify({
         # Kept for backwards compatibility with any existing client; the
@@ -1190,7 +1229,8 @@ def api_stats():
         'videos_count': new_available,
         'new_available': new_available,
         'downloads_count': downloads_count,
-        'disk_usage': disk_usage
+        'disk_usage': disk_usage,
+        'library_videos': library_videos,
     })
 
 @app.route('/api/config', methods=['GET', 'POST'])

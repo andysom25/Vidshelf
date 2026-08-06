@@ -4863,3 +4863,120 @@ Two further notes for whoever touches this next:
   delete, on a real install, before wiring it into startup. The unit tests all
   passed; they encoded the author's model of the layout, and the live install did
   not match that model.
+
+## v1.8.2 — three dashboard bugs, found in a screenshot
+
+Not reported as bugs. The user shared a dashboard screenshot to start a
+conversation about *redesigning* it around music videos, and the screenshot
+turned out to be evidence: four stat cards reading `0`, `--`, `1`, `0.0 KB`
+against a library of 197 videos.
+
+Worth recording that the screenshot was the diagnostic. None of these three
+would have surfaced from reading the code with no reason to suspect it, and none
+of them throws.
+
+### 1. Disk Usage never measured the library
+
+`api_stats()` computed it by walking `./downloads` — the **staging** directory,
+the one place whose size says nothing about the library.
+
+It had always looked plausible, because failed downloads were leaking copies
+into staging (see the v1.8.1 copystat entry): the card was reporting the size of
+orphaned temp files. When that leak was cleaned up the card dropped to `0.0 KB`,
+which is what made the bug visible at all. Fixing the leak is what exposed it.
+
+Now `_library_size()` walks `_gather_media_roots()` — the music root plus every
+channel's resolved Plex path — and counts video files only, so artwork and
+sidecars are excluded. Measured on the real install: **24.10 GB across 197
+videos**, where the card had been showing `0.0 KB`.
+
+Cached for five minutes. The media root is usually CIFS and `/api/stats` fires on
+every visit to the Dashboard tab; a `stat()` per file over SMB is cheap for a few
+hundred videos and decidedly not for tens of thousands. Library size moves slowly
+enough that stale-by-five-minutes is the right trade.
+
+Reuses `retention.VIDEO_EXTENSIONS` rather than defining a third copy of the
+extension list — `retention.py` and `transcode.py` already disagree about what
+counts as a video, and a third opinion is how the `copystat` asymmetry happened.
+
+### 2. The byte formatter was off by exactly 1024x
+
+The Disk Usage card inlined its own formatting, and the smallest branch labelled
+raw **bytes** as KB:
+
+```js
+if (disk < 1024)  display = disk.toFixed(1) + ' KB';       // 500 bytes -> "500.0 KB"
+else if (...)     display = (disk / 1024).toFixed(1) + ' MB';
+else              display = (disk / (1024*1024)).toFixed(1) + ' GB';
+```
+
+Every reading at every scale was 1024x too large. **The two bugs concealed each
+other**: the value being formatted came from a near-empty staging directory, and
+`0.0 KB` is correct-looking however you divide it. Fixing bug 1 alone would have
+made the card read `102400.0 GB`.
+
+There was already a correct `formatBytes()` 480 lines further up. The card now
+uses it, extended with a TB tier so a multi-terabyte NAS doesn't read
+`3072.00 GB`.
+
+**A near-miss worth recording.** The first attempt at this fix added a *second*
+`formatBytes()` next to the other format helpers, ~480 lines below the existing
+one. `dashboard.js` is a single flat global scope — four formerly-inline
+`<script>` blocks concatenated — so the later definition silently wins for every
+caller, and five unrelated call sites (system health, conversion candidates,
+artist video sizes) would have quietly changed behaviour. Nothing would have
+failed; the numbers would just have been different. Caught because a test
+harness `eval`'d the wrong function and printed output that didn't match the
+code that had just been written.
+`test_dashboard_helpers_are_not_defined_twice` now rejects any duplicate
+top-level function name in that file.
+
+### 3. The sidebar version never refreshed
+
+`loadVersionBadge()` was called exactly twice: once at page load, and once after
+toggling the update-check setting. `loadDashboardStats()`, by contrast, runs on
+every visit to the Dashboard tab.
+
+So a browser tab left open across an upgrade showed the old version forever,
+sitting next to stats that were refreshing correctly — which is precisely what
+the screenshot showed: `v1.6.1` in the sidebar beside a disk figure that could
+only have been produced by v1.8.1. The same staleness meant the "update
+available" pill kept nagging after the update had been installed.
+
+Server side was correct throughout: `/api/system/version` reported `1.8.1` when
+queried directly. Confirming that mattered — it ruled out `APP_VERSION`, the
+24-hour update cache, and `get_status()` (which takes `current` as a parameter
+and never reads it from the cache) before touching anything.
+
+The dashboard page-switch handler now refreshes the badge alongside the stats.
+
+### Not a bug: the floating "Close" button
+
+The screenshot showed a small `Close` control floating in the middle of the page.
+No such string exists in `templates/dashboard.html` or `static/js/dashboard.js` —
+grep returns nothing for `>Close<`, `'Close'`, `aria-label="Close"` or
+`title="Close"`. It is a browser extension or a native tooltip, not Vidshelf.
+Recorded so the next person who sees it doesn't go looking.
+
+### The general lesson
+
+All three bugs were **silent and plausible**. Nothing threw, nothing logged, and
+every number rendered without complaint. Two of them were actively hidden by a
+third problem, and the one that eventually exposed the pair was an unrelated
+cleanup. A stat card that is wrong looks exactly like a stat card that is right.
+
+The invariants added here (`test_disk_usage_is_measured_from_the_media_roots`,
+`test_dashboard_helpers_are_not_defined_twice`,
+`test_the_sidebar_version_refreshes_with_the_dashboard`) exist because none of
+these has a natural functional test: they are all "the displayed number is
+wrong", which only a human looking at the page can normally catch.
+
+### Still open, deliberately
+
+The dashboard remains channel-shaped: four cards about channels and downloads,
+and nothing about the music-video library that is the whole content of this
+install. Ideas were discussed — library totals, Plex collection health, recently
+added, artists needing attention — and deliberately deferred in favour of fixing
+the numbers first. Several of the good ones (added-this-week, downloads over
+time) need download *dates*, which the tracker does not record; that is the v2.0
+data-model item.
