@@ -86,6 +86,12 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 - **Duplicate-collection cleanup** — detects and merges same-artist collections that can occur from race conditions, keeping one and removing the rest
 
 ### Dashboard
+- **Library at a glance** — artists, videos, total size and how much you've added in the last 30 days
+- **Added over time** — a 12-month chart of when videos arrived, drawn as inline SVG (no charting library, no build step)
+- **Plex health** — how many artists have a collection and artwork, with a jump to the ones that don't
+- **Top artists** and **Recently added** — where your space goes, and what landed most recently
+- **Adaptive** — channel-monitoring cards only appear if you actually have channels, so a music-video-only install isn't shown a screen of zeroes
+- Refreshes itself every 60s while open, without redrawing panels whose data hasn't changed
 - Single-page web dashboard with a dark theme, responsive down to mobile
 - Real-time download and conversion progress (polling-based, no WebSockets needed)
 - Artists page — browse tracked artists and their downloaded videos, with search, filtering (missing artwork, empty folders) and sorting by name or video count
@@ -595,6 +601,53 @@ data/config.json, data/downloaded_videos.json, data/active_downloads.json
 
 ---
 
+## Troubleshooting
+
+### The page hangs for ~30 seconds and assets show as "(failed)" (Windows)
+
+If the dashboard sits on "Loading…", browser DevTools shows scripts `(failed)`
+after about 30 seconds, and `docker logs vidshelf` is clean — this is almost
+certainly **WSL**, not Vidshelf.
+
+WSL's `wslrelay.exe` claims the IPv6 loopback address for whatever port Docker
+publishes, and Windows resolves `localhost` to IPv6 before IPv4. Your browser
+reaches WSL instead of Vidshelf; it accepts the connection and never answers,
+which is why you get a hang rather than a connection error.
+
+Confirm it in ten seconds:
+
+```bash
+curl http://127.0.0.1:5000/login    # works
+curl http://localhost:5000/login    # hangs
+netstat -ano | findstr :5000        # two different PIDs listening
+```
+
+If IPv4 works and `localhost` doesn't, add this to `%UserProfile%\.wslconfig`
+and run `wsl --shutdown`:
+
+```ini
+[wsl2]
+localhostForwarding=false
+```
+
+Docker publishes on all interfaces independently, so your containers stay
+reachable. The trade-off is that services running *inside* a WSL distro are no
+longer reachable from Windows via `localhost` — use the distro's IP for those.
+
+**Changing Vidshelf's port does not help** — WSL rebinds whatever port Docker
+publishes, and will follow it.
+
+### A feature disappears after working (watchtower)
+
+If you run [watchtower](https://containrrr.dev/watchtower/) and build Vidshelf
+locally, tag your build something other than `ghcr.io/andysom25/vidshelf:latest`.
+Watchtower watches that tag and will replace your local image with the published
+release on its next scan, stopping and recreating the container — so a locally
+built feature silently reverts. A tag that doesn't exist in the registry can't
+be pulled over it.
+
+---
+
 ## Known Limitations
 
 - Served by [waitress](https://github.com/Pylons/waitress), which is fine for
@@ -620,6 +673,7 @@ python tests/test_media.py         # transcode decisions, SSRF guard, title/fold
 python tests/test_downloads.py     # format selector, cancellation
 python tests/test_titles.py        # download-time "Artist - Song" naming
 python tests/test_download_state.py# interrupted downloads, history pruning, copystat
+python tests/test_library.py       # library scan, caching, chart series
 python tests/test_invariants.py    # source-level rules for bugs CI can't reproduce
 node tests/test_artists_filter.js   # Artists page search/filter/sort logic
 ```

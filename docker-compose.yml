@@ -7,6 +7,28 @@ services:
     restart: unless-stopped
     ports:
       - "5000:5000"
+      # If the page hangs for ~30s on Windows and assets show as "(failed)" in
+      # DevTools while the container itself is healthy, it is almost certainly
+      # NOT this app — it is WSL's wslrelay.exe holding IPv6 loopback for the
+      # published port. `localhost` resolves to ::1 before 127.0.0.1, so the
+      # browser reaches wslrelay, which accepts the connection and never
+      # answers. Hence a hang rather than a connection refused, which reads
+      # exactly like an application bug.
+      #
+      # Changing the host port does NOT help — verified: wslrelay rebinds
+      # whatever port Docker publishes, and followed a move from 5000 to 5001
+      # immediately. The fix is on the host, in %UserProfile%\.wslconfig:
+      #
+      #     [wsl2]
+      #     localhostForwarding=false
+      #
+      # followed by `wsl --shutdown`. See README "Troubleshooting".
+      #
+      # To confirm the diagnosis in ten seconds:
+      #     netstat -ano | findstr :5000     -> two different PIDs listening
+      #     curl http://127.0.0.1:5000/login -> works
+      #     curl http://localhost:5000/login -> hangs
+      # If IPv4 works and localhost doesn't, it is this.
     volumes:
       # Mount a persistent downloads directory so files survive container rebuilds
       - ./downloads:/app/downloads

@@ -46,6 +46,9 @@
                     // also meant the "update available" pill kept nagging after
                     // you had already installed the update.
                     loadVersionBadge();
+                    startDashboardRefresh();
+                } else {
+                    stopDashboardRefresh();
                 }
                 if (page === 'swap-art') loadSwapArtArtists();
                 if (page === 'artists') loadArtistsPage();
@@ -173,7 +176,7 @@
         }
 
         // ---------- Dashboard Stats ----------
-        async function loadDashboardStats() {
+        async function loadDashboardStats(refresh) {
             let channelCount = 0;
             let downloadsCount = 0;
             try {
@@ -186,6 +189,13 @@
                 if (chData.channels) {
                     channelCount = chData.channels.length;
                     document.getElementById('stat-channels').textContent = channelCount;
+                }
+                // The channel cards are hidden entirely with no channels. An
+                // install used only for music videos was otherwise shown three
+                // numbers that all read 0 or "--" and meant nothing to it.
+                const chanSection = document.getElementById('channel-stats-section');
+                if (chanSection) {
+                    chanSection.style.display = channelCount > 0 ? '' : 'none';
                 }
                 if (statsData.videos_count !== undefined) {
                     // null means no automatic check has run yet, which is not
@@ -205,11 +215,276 @@
             } catch (e) {
                 console.error('Failed to load stats:', e);
             }
+            loadLibraryPanels(refresh === true);
             loadGettingStarted(channelCount, downloadsCount);
         }
 
         // ---------- Getting Started checklist ----------
         const GETTING_STARTED_DISMISSED_KEY = 'vidshelf_getting_started_dismissed';
+
+        // Keeps a long-open dashboard current without hammering anything.
+        //
+        // 60s is a deliberate pairing with the server side: the scan is cached
+        // for five minutes AND invalidated the moment a download completes, so
+        // almost every one of these ticks is a cache hit costing ~1ms, and the
+        // one that isn't happens because something actually changed. Polling
+        // faster would not surface data any sooner; the invalidation is what
+        // does that.
+        //
+        // Stopped on navigating away, like the downloads poller — a timer left
+        // running against a hidden page is just background load.
+        let dashboardRefreshInterval = null;
+        const DASHBOARD_REFRESH_MS = 60000;
+
+        function startDashboardRefresh() {
+            stopDashboardRefresh();
+            dashboardRefreshInterval = setInterval(() => {
+                // Don't poll a tab nobody is looking at.
+                if (document.hidden) return;
+                loadDashboardStats();
+            }, DASHBOARD_REFRESH_MS);
+        }
+
+        function stopDashboardRefresh() {
+            if (dashboardRefreshInterval) {
+                clearInterval(dashboardRefreshInterval);
+                dashboardRefreshInterval = null;
+            }
+        }
+
+        // Assign only when the markup actually differs.
+        //
+        // The dashboard re-renders every 60 seconds, and on a quiet library
+        // almost every tick produces byte-identical HTML. Assigning innerHTML
+        // anyway tears down and rebuilds the subtree each time, which the
+        // browser paints — so the panels visibly flashed once a minute and the
+        // refresh looked like a page reload. Comparing first makes the common
+        // case a no-op, and it also preserves things a rebuild would destroy:
+        // text selection, :hover state, and an open SVG <title> tooltip.
+        function setHtmlIfChanged(el, html) {
+            if (!el || el.innerHTML === html) return false;
+            el.innerHTML = html;
+            return true;
+        }
+
+        // True until the first successful render, so placeholders like
+        // "Loading…" and "Checking…" appear on first paint and never again.
+        // Showing them on a background refresh is what made an unchanged panel
+        // blink through an empty state for no reason.
+        let dashboardFirstPaint = true;
+
+        // ---------- Library panels (v1.9.0) ----------
+        //
+        // Everything below renders from ONE request. /api/library/stats does a
+        // single walk of the media roots and derives every panel from it,
+        // because that walk is usually over CIFS and doing it once per panel
+        // would be four times the cost for the same bytes.
+        //
+        // On dates: the download tracker records video ids and nothing else —
+        // no timestamps at all — so "added" comes from file modification time.
+        // That is accurate for files Vidshelf wrote and wrong for anything
+        // moved by hand on the NAS, which is why every label here says "added"
+        // rather than "downloaded". Real download dates need the v2.0 data
+        // model.
+        async function loadLibraryPanels(refresh) {
+            const chart = document.getElementById('added-chart');
+            if (!chart) return;   // dashboard markup not present
+            try {
+                const resp = await fetch('/api/library/stats' + (refresh ? '?refresh=1' : ''));
+                const data = await resp.json();
+                if (data.error) {
+                    chart.innerHTML = `<p class="text-muted">${escapeHtml(data.error)}</p>`;
+                    return;
+                }
+                renderLibrarySummary(data);
+                renderAddedChart(data.months || []);
+                renderTopArtists(data.top_artists || []);
+                renderRecentlyAdded(data.recent || []);
+                // Artwork counts ride along on the same scan, so this panel
+                // no longer needs its own request. Plex is the only thing
+                // still fetched separately, and it's deliberately last: it
+                // talks to another server over the network, and the library
+                // panels must not wait on it.
+                loadPlexHealth(data);
+                dashboardFirstPaint = false;
+            } catch (e) {
+                chart.innerHTML = `<p class="text-muted">Could not load library stats: ${escapeHtml(e.message)}</p>`;
+            }
+        }
+
+        function renderLibrarySummary(d) {
+            const set = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = value;
+            };
+            set('stat-artists', d.artists);
+            set('stat-library-videos', d.videos);
+            set('stat-added-30d', d.added_30d);
+            // Library Size shares an element with the old Disk Usage card, and
+            // /api/stats already filled it from the same underlying scan.
+            set('stat-disk', formatBytes(d.bytes));
+        }
+
+        // A hand-rolled column chart. No chart library: this project has no
+        // build step and no npm by design, so an inline SVG built from a
+        // template string is the honest option. viewBox does the scaling, so it
+        // stays crisp and responsive without any resize handling.
+        function renderAddedChart(months) {
+            const host = document.getElementById('added-chart');
+            const note = document.getElementById('chart-note');
+            if (!host) return;
+
+            const counts = months.map(m => m.count || 0);
+            const total = counts.reduce((a, b) => a + b, 0);
+            if (note) {
+                note.textContent = total
+                    ? `${total} in the last ${months.length} months`
+                    : '';
+            }
+            if (!months.length || !total) {
+                setHtmlIfChanged(host, '<p class="text-muted">Nothing added yet.</p>');
+                return;
+            }
+
+            const W = 320, H = 120, PAD_B = 16, PAD_L = 18;
+            const max = Math.max.apply(null, counts);
+            const usableH = H - PAD_B;
+            const slot = (W - PAD_L) / months.length;
+            const barW = Math.max(3, slot * 0.62);
+
+            // Two faint gridlines (max and half) give the bars a scale to be
+            // read against; more than that is noise at this size.
+            let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"`
+                    + ` aria-label="Videos added per month">`;
+            [0, 0.5, 1].forEach(frac => {
+                const y = usableH - (usableH * frac);
+                svg += `<line class="dash-gridline" x1="${PAD_L}" y1="${y}" x2="${W}" y2="${y}"/>`;
+            });
+            svg += `<text class="dash-axis" x="0" y="9">${max}</text>`;
+
+            months.forEach((m, i) => {
+                const h = max ? (m.count / max) * usableH : 0;
+                const x = PAD_L + (i * slot) + ((slot - barW) / 2);
+                const y = usableH - h;
+                // A month with zero gets a 1px stub so the axis stays legible
+                // and the gap is visibly a gap rather than a missing column.
+                const drawn = Math.max(h, m.count ? 2 : 1);
+                svg += `<rect class="dash-bar" x="${x.toFixed(1)}" y="${(usableH - drawn).toFixed(1)}"`
+                     + ` width="${barW.toFixed(1)}" height="${drawn.toFixed(1)}" rx="1">`
+                     + `<title>${escapeHtml(m.month)}: ${m.count}</title></rect>`;
+                // Label every other month so they never collide.
+                if (i % 2 === months.length % 2) {
+                    const label = escapeHtml(m.month.slice(5));   // "MM"
+                    svg += `<text class="dash-axis" x="${(x + barW / 2).toFixed(1)}"`
+                         + ` y="${H - 4}" text-anchor="middle">${label}</text>`;
+                }
+            });
+            svg += '</svg>';
+            setHtmlIfChanged(host, svg);
+        }
+
+        function renderTopArtists(artists) {
+            const host = document.getElementById('top-artists');
+            if (!host) return;
+            if (!artists.length) {
+                setHtmlIfChanged(host, '<p class="text-muted">No artists yet.</p>');
+                return;
+            }
+            const max = Math.max.apply(null, artists.map(a => a.bytes || 0)) || 1;
+            setHtmlIfChanged(host, artists.map(a => {
+                const pct = Math.max(2, ((a.bytes || 0) / max) * 100);
+                return '<div class="dash-row">'
+                     + `<span class="dash-row-label" title="${escapeHtml(a.artist)}">${escapeHtml(a.artist)}</span>`
+                     + `<span class="dash-row-track"><span class="dash-row-fill" style="width:${pct.toFixed(1)}%"></span></span>`
+                     + `<span class="dash-row-value">${formatBytes(a.bytes)}</span>`
+                     + '</div>';
+            }).join(''));
+        }
+
+        function renderRecentlyAdded(items) {
+            const host = document.getElementById('recently-added');
+            if (!host) return;
+            if (!items.length) {
+                setHtmlIfChanged(host, '<p class="text-muted">Nothing added yet.</p>');
+                return;
+            }
+            setHtmlIfChanged(host, items.map(v =>
+                '<div class="dash-recent">'
+                + `<span class="dash-recent-title" title="${escapeHtml(v.title)}">${escapeHtml(v.title)}</span>`
+                + `<span class="dash-recent-when">${escapeHtml(formatAgo(v.added_at))}</span>`
+                + '</div>').join(''));
+        }
+
+        function formatAgo(epochSeconds) {
+            if (!epochSeconds) return '';
+            const secs = Math.max(0, (Date.now() / 1000) - epochSeconds);
+            if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+            if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+            const days = Math.floor(secs / 86400);
+            if (days < 30) return days + 'd ago';
+            if (days < 365) return Math.floor(days / 30) + 'mo ago';
+            return Math.floor(days / 365) + 'y ago';
+        }
+
+        // Plex is optional, so this panel degrades rather than errors: a
+        // non-OK response here means "not configured", which is a normal state.
+        //
+        // Takes the library scan as an argument instead of re-fetching. It used
+        // to call /api/artists/summary, which walks the media root all over
+        // again — 0.75s every single time, against 0.00s for the cached scan
+        // that had just produced the same numbers. That duplicate traversal was
+        // the whole reason the dashboard felt slow.
+        async function loadPlexHealth(scan) {
+            const host = document.getElementById('plex-health');
+            if (!host) return;
+            const total = (scan && scan.artists) || 0;
+            const missingArt = (scan && scan.missing_artwork) || 0;
+
+            // Paint what we already know immediately, so the panel isn't blank
+            // while a request to another server is in flight.
+            const artworkRow = healthRow('Artist artwork', total - missingArt, total);
+            if (dashboardFirstPaint) {
+                setHtmlIfChanged(host,
+                    '<div class="dash-health"><span>Plex collections</span>'
+                    + '<span class="text-muted">Checking…</span></div>' + artworkRow);
+            }
+
+            let collectionsRow;
+            try {
+                const resp = await fetch('/api/plex/collections/status');
+                if (resp.ok) {
+                    const col = await resp.json();
+                    const list = col.artists || col.results || [];
+                    const withCol = list.filter(a => a.has_collection).length;
+                    collectionsRow = healthRow('Plex collections', withCol,
+                                               list.length || total);
+                } else {
+                    collectionsRow = '<div class="dash-health"><span>Plex collections</span>'
+                                   + '<span class="text-muted">Not connected</span></div>';
+                }
+            } catch (e) {
+                collectionsRow = '<div class="dash-health"><span>Plex collections</span>'
+                               + `<span class="text-muted">${escapeHtml(e.message)}</span></div>`;
+            }
+
+            let rows = collectionsRow + artworkRow;
+            if (missingArt > 0) {
+                rows += '<div style="margin-top:12px;">'
+                      + `<button class="btn btn-sm btn-primary" onclick="navigateTo('artists')">`
+                      + `Review ${missingArt} artist${missingArt === 1 ? '' : 's'} →</button></div>`;
+            }
+            setHtmlIfChanged(host, rows);
+        }
+
+        function healthRow(label, done, total) {
+            const ok = total > 0 && done >= total;
+            const cls = ok ? 'dash-health-ok' : 'dash-health-warn';
+            const mark = ok ? '✅' : '⚠';
+            return '<div class="dash-health">'
+                 + `<span>${escapeHtml(label)}</span>`
+                 + `<span class="${cls}">${mark} ${done} / ${total}</span>`
+                 + '</div>';
+        }
 
         async function loadGettingStarted(channelCount, downloadsCount) {
             const card = document.getElementById('getting-started-card');
@@ -2335,6 +2610,10 @@ async function findPlexLibraries() {
         // ---------- Initial Load ----------
         loadDashboardStats();
         loadVersionBadge();
+        // The dashboard is the page you land on, so the auto-refresh has to
+        // start here too — the page-switch handler only fires on navigation,
+        // which means a tab opened and left alone would never refresh at all.
+        startDashboardRefresh();
 
 /* ---- block 2 of 4 (was inline in dashboard.html) ---- */
 document.getElementById('create-collection-link').addEventListener('click', function(e) {
