@@ -201,6 +201,22 @@ docker compose up -d --build                     # building from source
 Your `data/` directory carries config and history across upgrades, so nothing
 needs migrating.
 
+### `update.ps1` (Windows)
+
+A one-shot wrapper around the above that also checks the things worth checking:
+
+```powershell
+.\update.ps1                    # latest release
+.\update.ps1 -Recreate          # full down/up, for compose changes
+.\update.ps1 -Version 1.8.2     # pin, or roll back
+```
+
+Beyond running `pull` and `up`, it verifies the container reports the version it
+just pulled (a locally-built image sharing the same tag will otherwise shadow the
+release), waits until the app actually answers rather than assuming, confirms the
+media mounts are real CIFS rather than Docker's silent decoy volume, and prints
+what the startup housekeeping did.
+
 ### Coming from v1.0.0 (one-time)
 
 v1.0.0 kept state as three individual bind-mounted JSON files. **v1.1.0 moved
