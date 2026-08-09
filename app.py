@@ -13,6 +13,7 @@ import state
 import updates
 import notify
 import retention
+import titles
 import scheduler
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -431,6 +432,10 @@ def mark_video_downloaded(video_id, channel_url):
             tracker[channel_url].append(video_id)
 
     state.update_json(TRACKER_FILE, _add, indent=2)
+    # A new file exists on disk now, so the cached library scan is stale.
+    # Every successful download funnels through here, which makes it the one
+    # place that reliably knows the library changed.
+    _invalidate_library_scan()
 
 def is_video_downloaded(video_id, channel_url):
     tracker = load_downloaded_tracker()
@@ -876,50 +881,236 @@ def _sweep_staging_dirs():
               f"freed {freed / (1024 * 1024):.0f} MB")
 
 
-_LIBRARY_SIZE_CACHE = {'at': 0.0, 'bytes': 0, 'videos': 0}
-_LIBRARY_SIZE_TTL = 300  # seconds
-_LIBRARY_SIZE_LOCK = threading.Lock()
+_LIBRARY_SCAN_CACHE = {'at': 0.0, 'data': None}
+_LIBRARY_SCAN_TTL = 300  # seconds
+_LIBRARY_SCAN_LOCK = threading.Lock()
+
+# How far back the "added over time" chart looks.
+LIBRARY_HISTORY_MONTHS = 12
+RECENTLY_ADDED_LIMIT = 10
+TOP_ARTISTS_LIMIT = 8
 
 
-def _library_size(force=False):
-    """Total bytes and video count across the configured media roots.
+def _library_scan(force=False):
+    """One walk of the media roots, feeding every dashboard panel.
 
-    The Disk Usage card used to walk `./downloads` — the *staging* directory —
-    so it never measured the library at all. It looked plausible only because
-    failed downloads leaked copies there: on the install where this was found it
-    was reporting 2.6 GB of orphaned temp files, and dropped to 0.0 KB the
-    moment that was cleaned up, while ~195 videos sat on the NAS uncounted.
+    Deliberately a single scan rather than an endpoint per panel. The media root
+    is normally a CIFS mount, so each traversal is the expensive part and doing
+    it four times to fill four cards would be four times the cost for the same
+    bytes. Everything the dashboard shows is derived from this one pass.
 
-    Cached for _LIBRARY_SIZE_TTL because the media root is usually a CIFS mount
-    and /api/stats is called on every visit to the Dashboard tab. A stat() per
-    file over SMB is cheap for a few hundred videos and decidedly not for tens of
-    thousands, and the number moves slowly enough that five minutes stale is
-    fine.
+    On dates: st_mtime is the closest thing to a download date that exists
+    today. The tracker records only video ids — no timestamps at all — so
+    "added over time" and "recently added" come from the filesystem. That is
+    accurate for files Vidshelf wrote and wrong for anything moved or re-copied
+    on the NAS by hand, which is why the UI labels it "added" rather than
+    "downloaded". Real download dates need the v2.0 data model.
+
+    Cached for _LIBRARY_SCAN_TTL: the dashboard asks on every visit, and a
+    stat() per file over SMB is cheap for hundreds of videos and decidedly not
+    for tens of thousands.
     """
     now = time.time()
-    with _LIBRARY_SIZE_LOCK:
-        fresh = (now - _LIBRARY_SIZE_CACHE['at']) < _LIBRARY_SIZE_TTL
-        if fresh and not force:
-            return _LIBRARY_SIZE_CACHE['bytes'], _LIBRARY_SIZE_CACHE['videos']
+    serve_stale = False
+    with _LIBRARY_SCAN_LOCK:
+        cached = _LIBRARY_SCAN_CACHE['data']
+        fresh = cached is not None and (now - _LIBRARY_SCAN_CACHE['at']) < _LIBRARY_SCAN_TTL
+        if cached is not None and not force:
+            if fresh:
+                return cached
+            serve_stale = True
 
-    total = 0
-    videos = 0
-    for root in _gather_media_roots(load_config()):
+    if serve_stale:
+        # Stale, but usable. Serve it and refresh behind the request rather than
+        # making someone wait for a CIFS walk — measured at 2.1s on a 197-video
+        # library, and it is the *user* who pays it every time the TTL lapses.
+        # Mirrors updates.get_status(), which returns what it knows and refreshes
+        # in the background for exactly this reason.
+        #
+        # The numbers are minutes-stale at worst, and a completed download
+        # invalidates the cache outright, so the case this covers is "nobody has
+        # looked at the dashboard in a while" — where a slightly old count beats
+        # a spinner.
+        #
+        # Deliberately called *outside* the lock above: _maybe_rescan_async
+        # acquires the same non-reentrant lock, so calling it from within would
+        # deadlock every request the moment the cache went stale.
+        _maybe_rescan_async()
+        return cached
+
+    config = load_config()
+    music_root = os.path.normpath(os.path.abspath(_music_root(config)))
+
+    total_bytes = 0
+    video_count = 0
+    per_artist = {}          # artist -> {'videos': n, 'bytes': n}
+    per_month = {}           # 'YYYY-MM' -> n
+    recent = []              # (mtime, artist, title, bytes)
+
+    for root in _gather_media_roots(config):
+        root_abs = os.path.normpath(os.path.abspath(root))
         for dirpath, _, filenames in os.walk(root):
             for name in filenames:
                 if not name.lower().endswith(retention.VIDEO_EXTENSIONS):
                     continue
                 try:
-                    total += os.path.getsize(os.path.join(dirpath, name))
-                    videos += 1
+                    stat = os.stat(os.path.join(dirpath, name))
                 except OSError:
                     # A file can vanish mid-walk (retention sweep, a move on the
                     # NAS). Skip it rather than failing the whole dashboard.
-                    pass
+                    continue
 
-    with _LIBRARY_SIZE_LOCK:
-        _LIBRARY_SIZE_CACHE.update({'at': now, 'bytes': total, 'videos': videos})
-    return total, videos
+                total_bytes += stat.st_size
+                video_count += 1
+
+                # Artist is the folder directly under the music root. Files
+                # elsewhere (channel destinations) still count toward totals but
+                # have no artist to attribute them to.
+                artist = None
+                here = os.path.normpath(os.path.abspath(dirpath))
+                if here != music_root and _is_under(here, music_root):
+                    artist = titles.folder_to_artist(
+                        os.path.basename(here.rstrip(os.sep)))
+                elif here != root_abs:
+                    artist = os.path.basename(here.rstrip(os.sep))
+
+                if artist:
+                    bucket = per_artist.setdefault(
+                        artist, {'videos': 0, 'bytes': 0, 'dir': here})
+                    bucket['videos'] += 1
+                    bucket['bytes'] += stat.st_size
+
+                month = time.strftime('%Y-%m', time.localtime(stat.st_mtime))
+                per_month[month] = per_month.get(month, 0) + 1
+                recent.append((stat.st_mtime, artist or '', name, stat.st_size))
+
+    recent.sort(reverse=True)
+    cutoff_30d = now - (30 * 86400)
+
+    # Artwork status is folded in here rather than left to
+    # /api/artists/summary. The dashboard's Plex-health panel originally called
+    # that endpoint, which walks the media root all over again — measured at
+    # 0.75s per call, every call, against 0.00s for this cache. That second
+    # traversal was exactly the duplication a single scan exists to avoid, and
+    # it was the whole reason the dashboard felt slow. One extra isdir/isfile
+    # check per artist folder is nothing next to a second full walk.
+    missing_artwork = 0
+    for info in per_artist.values():
+        info['has_artwork'] = has_artwork(info['dir'])
+        if not info['has_artwork']:
+            missing_artwork += 1
+
+    data = {
+        'artists': len(per_artist),
+        'videos': video_count,
+        'bytes': total_bytes,
+        'added_30d': sum(1 for r in recent if r[0] >= cutoff_30d),
+        'missing_artwork': missing_artwork,
+        'largest_artist_bytes': max((a['bytes'] for a in per_artist.values()),
+                                    default=0),
+        'months': _month_series(per_month, LIBRARY_HISTORY_MONTHS, now),
+        'top_artists': sorted(
+            ({'artist': a, 'videos': v['videos'], 'bytes': v['bytes']}
+             for a, v in per_artist.items()),
+            key=lambda a: (-a['bytes'], a['artist']))[:TOP_ARTISTS_LIMIT],
+        'recent': [{'artist': a, 'title': titles.clean_video_title(
+                        os.path.splitext(t)[0]),
+                    'bytes': b, 'added_at': m}
+                   for m, a, t, b in recent[:RECENTLY_ADDED_LIMIT]],
+        'scanned_at': now,
+        # The UI says "added", not "downloaded", and this is why.
+        'dates_from': 'file modification time',
+    }
+
+    with _LIBRARY_SCAN_LOCK:
+        _LIBRARY_SCAN_CACHE.update({'at': now, 'data': data})
+    return data
+
+
+_library_rescanning = False
+
+
+def _maybe_rescan_async():
+    """Refresh the library scan in the background, one at a time.
+
+    The guard matters: /api/stats and /api/library/stats are requested together
+    on every dashboard load, so without it a stale cache would start two
+    concurrent CIFS walks for the same data — and the 60-second auto-refresh
+    would keep doing it.
+    """
+    global _library_rescanning
+    with _LIBRARY_SCAN_LOCK:
+        if _library_rescanning:
+            return
+        _library_rescanning = True
+
+    def _run():
+        global _library_rescanning
+        try:
+            _library_scan(force=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f'[library] background rescan failed: {exc}')
+        finally:
+            with _LIBRARY_SCAN_LOCK:
+                _library_rescanning = False
+
+    threading.Thread(target=_run, name='library-scan', daemon=True).start()
+
+
+def _invalidate_library_scan():
+    """Drop the cached scan so the next dashboard load reflects a new file.
+
+    Called when a download completes. Without this the five-minute TTL means
+    you download something, look at the dashboard, and it isn't there — which
+    reads as a bug rather than as caching. Invalidating on the event is far
+    better than shortening the TTL: it costs one rescan when something actually
+    changed, instead of a CIFS walk every minute forever.
+
+    Drops the *data*, not just the timestamp. Expiring the timestamp alone is
+    not enough now that a stale entry is served while it refreshes: the next
+    read would hand back the pre-download counts and only correct itself once
+    the background scan landed, so the download still appeared to do nothing.
+    With no cached value there is nothing stale to serve, so the next read
+    blocks and returns the truth — which is the right trade for an event that
+    happens once per completed download.
+    """
+    with _LIBRARY_SCAN_LOCK:
+        _LIBRARY_SCAN_CACHE['at'] = 0.0
+        _LIBRARY_SCAN_CACHE['data'] = None
+
+
+def _is_under(child, parent):
+    """True if child is inside parent, comparing whole path components."""
+    try:
+        return os.path.commonpath([child, parent]) == parent
+    except ValueError:      # different drives on Windows
+        return False
+
+
+def _month_series(counts, months, now):
+    """A dense, chronologically ordered month series ending at the current month.
+
+    Dense on purpose: a month with no downloads has to appear as a zero, or the
+    chart silently closes the gap and a quiet spell reads as continuous
+    activity. Sorting the dict keys alone would do exactly that.
+    """
+    series = []
+    year, month = time.localtime(now).tm_year, time.localtime(now).tm_mon
+    for offset in range(months - 1, -1, -1):
+        m = month - offset
+        y = year
+        while m <= 0:
+            m += 12
+            y -= 1
+        key = '%04d-%02d' % (y, m)
+        series.append({'month': key, 'count': counts.get(key, 0)})
+    return series
+
+
+def _library_size(force=False):
+    """Back-compat shim: (bytes, videos) from the shared scan."""
+    scan = _library_scan(force=force)
+    return scan['bytes'], scan['videos']
 
 
 def _gather_media_roots(config):
@@ -1231,7 +1422,23 @@ def api_stats():
         'downloads_count': downloads_count,
         'disk_usage': disk_usage,
         'library_videos': library_videos,
+        # The dashboard hides the channel cards entirely when there are none,
+        # so it needs to know that without a second request.
+        'channels_count': len(load_config().get('channels', [])),
     })
+
+
+@app.route('/api/library/stats')
+@require_auth
+def api_library_stats():
+    """Everything the music-video dashboard renders, from one cached walk.
+
+    `?refresh=1` forces a rescan, for the "just downloaded something and want to
+    see it" case — otherwise the five-minute cache would make the dashboard look
+    broken right after a download finishes.
+    """
+    force = request.args.get('refresh') in ('1', 'true', 'yes')
+    return jsonify(_library_scan(force=force))
 
 @app.route('/api/config', methods=['GET', 'POST'])
 @require_auth

@@ -4980,3 +4980,180 @@ added, artists needing attention — and deliberately deferred in favour of fixi
 the numbers first. Several of the good ones (added-this-week, downloads over
 time) need download *dates*, which the tracker does not record; that is the v2.0
 data-model item.
+
+## v1.9.0 — a dashboard about the library, and two host-level traps that cost hours
+
+The dashboard was four cards about channel monitoring. On an install used purely
+for music videos — 0 channels, 197 videos — it read `0`, `--`, `1`, `0.0 KB` and
+then 700px of nothing. v1.9.0 makes it about the library that is actually there.
+
+### One scan, not one per panel
+
+`_library_scan()` walks the media roots once and derives everything from that
+pass: totals, the added-over-time series, top artists, recently added, and
+artwork status. `/api/library/stats` serves it; `/api/stats` reads the same
+cache for Disk Usage.
+
+That consolidation is the whole design, and it is worth stating why, because the
+first version of the Plex-health panel broke it. That panel called
+`/api/artists/summary`, which walks the media root **again** — measured at 0.75s
+on every single request, never cached, re-deriving numbers the scan had just
+produced. It was the entire reason the dashboard felt slow. Artwork status now
+rides along on the shared scan.
+
+| | before | after |
+| --- | --- | --- |
+| cold load | 1.58s | 0.83s |
+| warm load | 0.75s+ every time | 0.05s |
+| after TTL lapses | 2.12s, paid by the user | 0.06s |
+
+### Caching: three mechanisms, each for a different failure
+
+1. **TTL, 5 minutes.** The media root is CIFS; a stat() per file is cheap for
+   hundreds of videos and not for tens of thousands.
+2. **Stale-while-revalidate.** When the TTL lapses the cached copy is served
+   *immediately* and the rescan happens behind the request. Without this,
+   whoever arrived first after expiry paid the full 2.1s walk — the cache
+   worked, it just handed the bill to a user. This mirrors
+   `updates.get_status()`, which already returns what it knows and refreshes in
+   the background for the same reason.
+3. **Event invalidation.** A completed download drops the cache outright, so the
+   new file shows up on the next load rather than up to five minutes later.
+
+Two bugs were found in that machinery, both worth recording:
+
+**A deadlock, caught before shipping.** `_maybe_rescan_async()` takes
+`_LIBRARY_SCAN_LOCK`, and the first version called it from *inside* that same
+lock. `threading.Lock` is not reentrant, so every request would have hung the
+moment the cache went stale — a fault that appears minutes after startup, not at
+startup, which is the worst kind. The call now happens after the lock is
+released, and `test_stale_cache_is_served_immediately...` fails if it moves back.
+
+**Invalidation that didn't invalidate.** `_invalidate_library_scan()` originally
+only zeroed the timestamp. Once stale entries became servable, that meant the
+first read after a download got the *pre-download* counts — the download
+appeared to do nothing. It now drops the cached data, so there is nothing stale
+to serve and the next read blocks and returns the truth. Caught by
+`test_cache_is_used_and_invalidated_on_download`, not by inspection.
+
+### Charts without a chart library
+
+No build step and no npm, deliberately, so the added-over-time chart is an inline
+SVG built from a template string: a `viewBox` handles scaling, `<title>` gives
+hover values, and two faint gridlines provide a scale. About 30 lines.
+
+The month series is **dense** — every month in the window appears, including
+zeros. Sorting the observed months alone would silently close the gaps, and a
+quiet spell would render as continuous activity: a chart that lies rather than
+one that is merely sparse.
+
+Dates come from `st_mtime`, because the tracker records video ids and **no
+timestamps at all**. That is accurate for files Vidshelf wrote and wrong for
+anything moved by hand on the NAS, which is why every label says "added" rather
+than "downloaded". Real download dates need the v2.0 data model.
+
+### The 60-second refresh, and why it looked like a page reload
+
+A dashboard left open refreshes every 60s. Cheap by design: almost every tick is
+a cache hit costing ~1ms, and the tick that isn't happens because something
+actually changed.
+
+The first version re-assigned `innerHTML` on every tick even when the data was
+byte-identical, so the browser tore down and rebuilt each subtree and the panels
+visibly flashed once a minute — reported, accurately, as "it seems to do a full
+reload". `setHtmlIfChanged()` compares first: **0 DOM writes across 5 refreshes**
+with unchanged data, exactly 1 when something changes. It also preserves text
+selection, `:hover`, and any open SVG tooltip, all of which a rebuild destroys.
+Placeholders ("Loading…", "Checking…") now appear on first paint only.
+
+---
+
+## The two host-level traps
+
+Neither was a Vidshelf bug. Both presented exactly like one, and between them
+they consumed more time than the feature did.
+
+### 1. wslrelay.exe on IPv6 loopback — a 30s hang, not a refusal
+
+Symptom: the page loads, then assets show `(failed)` in DevTools after ~30s and
+the dashboard sits on "Loading…". The container is healthy, the log is clean,
+and the same file fetched *inside* the container returns in 0.01s.
+
+Cause: WSL's `wslrelay.exe` binds IPv6 loopback for every port Docker publishes.
+Windows resolves `localhost` to `::1` before `127.0.0.1`, so the browser reaches
+wslrelay — which **accepts the connection and never answers**. Accepting is what
+makes this so misleading: a refusal would have pointed at the network in
+seconds, whereas a hang points at the application.
+
+```
+0.0.0.0:5000   LISTENING  49900   <- Docker      (works)
+[::]:5000      LISTENING  49900   <- Docker      (works)
+[::1]:5000     LISTENING  29944   <- wslrelay    (hangs)
+```
+
+It also appeared intermittent, because which address a client tried first varied.
+
+**Changing the host port does not fix it** — that was tried, and wslrelay
+rebound the new port immediately. The fix is `localhostForwarding=false` in
+`%UserProfile%\.wslconfig` followed by `wsl --shutdown`. Docker Desktop
+publishes on `0.0.0.0` independently, so containers stay reachable; the
+trade-off is that services running *inside* a WSL distro are no longer reachable
+from Windows via `localhost`.
+
+**Ten-second diagnosis**, worth trying before suspecting the app at all:
+
+```
+netstat -ano | findstr :5000        # more than one PID listening?
+curl http://127.0.0.1:5000/login    # works
+curl http://localhost:5000/login    # hangs
+```
+
+If IPv4 works and `localhost` doesn't, it is this. A size-independent failure —
+a 453-byte favicon timing out while the container serves it instantly — points
+at the transport, never at the application.
+
+### 2. watchtower silently reverting locally-built images
+
+Symptom: a feature works, then stops existing. `/app/VERSION` reads an older
+release than the image that was just built and deployed.
+
+Cause: `watchtower` runs on this host and watches
+`ghcr.io/andysom25/vidshelf:latest`. Any local build tagged that way is replaced
+on its next scan — it pulls the published release, stops the container and
+recreates it:
+
+```
+Found new ghcr.io/andysom25/vidshelf:latest image (ba25dfd9a752)
+Stopping /vidshelf ... Creating /vidshelf
+```
+
+This happened twice, hours apart, and both times the running container quietly
+went back to the previous release while the working tree and the local image
+were correct. Verifying "the image contains the new code" is not enough —
+what matters is what the *container* is running, and it can change underneath
+you between one check and the next.
+
+**Fix for local development**: build to a tag that does not exist in the
+registry (`vidshelf:dev`) and point `docker-compose.override.yml` at it, with
+`pull_policy: never` and watchtower's `com.centurylinklabs.watchtower.enable:
+"false"` label. A tag watchtower cannot pull is one it cannot overwrite. Normal
+operation is unaffected: switch the override back to the published image and
+watchtower resumes auto-updating.
+
+### The pattern in both
+
+Each fault produced evidence that pointed confidently at the wrong layer, and
+each was diagnosed only by comparing a request *inside* the container with the
+same request from the host. Container-side checks were reliable throughout;
+host-side ones were not — including several `curl` invocations that reported
+"0 bytes" because `MSYS_NO_PATHCONV=1` turned `-o /dev/null` into a literal
+Windows path and curl failed on the *write*, exit 23, while `-s` hid it.
+
+**When the app looks broken but its log is clean, stop testing the app.**
+
+### Still deliberately out of scope
+
+The dashboard shows no download *history* over time, no failure/retry record and
+no "added this week" beyond the file-date proxy, because the tracker stores video
+ids and nothing else. Those need the v2.0 data model, which is the item this
+release keeps deferring and keeps making a stronger case for.

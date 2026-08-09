@@ -538,7 +538,10 @@ def test_stats_disk_usage_measures_the_media_library():
             'artwork_sync': {'root_path': os.path.join(work, 'media')},
             'plex_base_path': os.path.join(work, 'media'),
             '_secret_key': 'k'}, indent=4)
-        app_module._LIBRARY_SIZE_CACHE['at'] = 0     # defeat the TTL cache
+        # Must drop the data, not just expire the timestamp: a stale entry is
+        # now served while it refreshes, so zeroing 'at' alone would hand back
+        # whatever a previous test left behind.
+        app_module._invalidate_library_scan()
 
         stats = _client(authenticated=True).get('/api/stats').get_json()
         assert stats['disk_usage'] == 8_000_000, (
@@ -547,7 +550,7 @@ def test_stats_disk_usage_measures_the_media_library():
         assert stats['library_videos'] == 2, stats['library_videos']
     finally:
         shutil.rmtree(work, ignore_errors=True)
-        app_module._LIBRARY_SIZE_CACHE['at'] = 0
+        app_module._invalidate_library_scan()
 
 
 def test_notification_config_never_echoes_the_url_back():

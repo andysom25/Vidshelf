@@ -92,26 +92,85 @@
                 </div>
             </div>
 
+            <!-- Library first. The channel cards below only render when there
+                 are channels — an install used purely for music videos was
+                 previously shown four numbers that all read 0 or "--". -->
             <div class="stats-grid">
-                <div class="stat-card" onclick="navigateTo('channels')">
-                    <div class="stat-icon">📺</div>
-                    <div class="stat-label">Monitored Channels</div>
-                    <div class="stat-value" id="stat-channels">--</div>
+                <div class="stat-card" onclick="navigateTo('artists')">
+                    <div class="stat-icon">🎤</div>
+                    <div class="stat-label">Artists</div>
+                    <div class="stat-value" id="stat-artists">--</div>
                 </div>
-                <div class="stat-card" onclick="navigateTo('channels')">
+                <div class="stat-card" onclick="navigateTo('artists')">
                     <div class="stat-icon">🎬</div>
-                    <div class="stat-label">New Available</div>
-                    <div class="stat-value" id="stat-videos">--</div>
+                    <div class="stat-label">Videos</div>
+                    <div class="stat-value" id="stat-library-videos">--</div>
                 </div>
-                <div class="stat-card" onclick="navigateTo('downloads')">
-                    <div class="stat-icon">⬇️</div>
-                    <div class="stat-label">Downloads</div>
-                    <div class="stat-value" id="stat-downloads">0</div>
-                </div>
-                <div class="stat-card" onclick="navigateTo('downloads')">
+                <div class="stat-card" onclick="navigateTo('artists')">
                     <div class="stat-icon">💾</div>
-                    <div class="stat-label">Disk Usage</div>
+                    <div class="stat-label">Library Size</div>
                     <div class="stat-value" id="stat-disk">--</div>
+                </div>
+                <div class="stat-card" onclick="navigateTo('downloads')">
+                    <div class="stat-icon">✨</div>
+                    <div class="stat-label">Added (30 days)</div>
+                    <div class="stat-value" id="stat-added-30d">--</div>
+                </div>
+            </div>
+
+            <div class="dash-panels">
+                <div class="dash-panel">
+                    <div class="dash-panel-head">
+                        <h3>Added over time</h3>
+                        <span class="dash-panel-note" id="chart-note"></span>
+                    </div>
+                    <div id="added-chart" class="dash-chart"></div>
+                </div>
+
+                <div class="dash-panel">
+                    <div class="dash-panel-head"><h3>Plex health</h3></div>
+                    <div id="plex-health"><p class="text-muted">Loading…</p></div>
+                </div>
+            </div>
+
+            <div class="dash-panels">
+                <div class="dash-panel">
+                    <div class="dash-panel-head">
+                        <h3>Top artists</h3>
+                        <span class="dash-panel-note">by size</span>
+                    </div>
+                    <div id="top-artists"><p class="text-muted">Loading…</p></div>
+                </div>
+
+                <div class="dash-panel">
+                    <div class="dash-panel-head">
+                        <h3>Recently added</h3>
+                        <button class="btn btn-sm" onclick="loadDashboardStats(true)"
+                                title="Rescan the library now">↻</button>
+                    </div>
+                    <div id="recently-added"><p class="text-muted">Loading…</p></div>
+                </div>
+            </div>
+
+            <!-- Hidden unless channels exist. -->
+            <div id="channel-stats-section" style="display:none;">
+                <h3 class="dash-section-title">Channel monitoring</h3>
+                <div class="stats-grid">
+                    <div class="stat-card" onclick="navigateTo('channels')">
+                        <div class="stat-icon">📺</div>
+                        <div class="stat-label">Monitored Channels</div>
+                        <div class="stat-value" id="stat-channels">--</div>
+                    </div>
+                    <div class="stat-card" onclick="navigateTo('channels')">
+                        <div class="stat-icon">🆕</div>
+                        <div class="stat-label">New Available</div>
+                        <div class="stat-value" id="stat-videos">--</div>
+                    </div>
+                    <div class="stat-card" onclick="navigateTo('downloads')">
+                        <div class="stat-icon">⬇️</div>
+                        <div class="stat-label">Downloads</div>
+                        <div class="stat-value" id="stat-downloads">0</div>
+                    </div>
                 </div>
             </div>
         </div>
