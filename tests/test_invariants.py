@@ -572,6 +572,53 @@ def test_the_sidebar_version_refreshes_with_the_dashboard():
         'badge; a long-lived tab will show a stale version again')
 
 
+def test_sized_bar_elements_are_not_inline():
+    """v1.9.0. A width set on an inline element does nothing.
+
+    The Top artists bars are `<span class="dash-row-fill">` with an inline
+    `width: 73.6%`. Spans default to `display: inline`, where width and height
+    are ignored — so every bar computed to 0px while carrying a perfectly
+    correct percentage, and the panel rendered as a column of identical empty
+    tracks with the right numbers beside them. No error, no failing test, and
+    the data was fine. It was only visible in a screenshot.
+
+    CLAUDE.md already records one CSS bug that only a screenshot caught (the
+    checkbox width rule in Settings). This is the second, so it gets a rule:
+    anything that has a width driven by data must say how it displays.
+    """
+    # Strip CSS comments before matching. Without this the rule passes on its
+    # own documentation: the comment explaining why `display: block` matters
+    # contains the literal text "display:block", so the check matched the
+    # explanation instead of the declaration and stayed green with the
+    # declaration deleted. Same shape as the ordering assertion in
+    # test_state_files_are_written_owner_only that was vacuously true — a guard
+    # is worthless until you have watched it fail.
+    css = re.sub(r'/\*.*?\*/', '', _read(os.path.join('static', 'css', 'dashboard.css')),
+                 flags=re.DOTALL)
+    js = _read(os.path.join('static', 'js', 'dashboard.js'))
+
+    # Classes whose width is set from data at render time.
+    sized = set(re.findall(r"class=\"([a-z-]+)\" style=\"width:", js))
+    sized |= set(re.findall(r"class='([a-z-]+)' style='width:", js))
+    assert sized, 'no data-driven width elements found — did the markup change?'
+
+    offenders = []
+    for cls in sorted(sized):
+        rule = re.search(r'\.' + re.escape(cls) + r'\s*\{([^}]*)\}', css)
+        if not rule:
+            offenders.append(f'.{cls}: has an inline width but no CSS rule at all')
+            continue
+        body = rule.group(1)
+        if not re.search(r'display\s*:\s*(block|flex|inline-block|grid)', body):
+            offenders.append(
+                f'.{cls}: width is set from data but nothing makes it a block — '
+                'if this is a <span> the width is silently ignored')
+
+    assert not offenders, (
+        'Data-driven width on an element that may render inline:\n  '
+        + '\n  '.join(offenders))
+
+
 def test_state_files_are_written_owner_only():
     """config.json holds the Plex token, the admin password hash and the session
     signing key, in a bind-mounted directory — 0644 meant any local user on the

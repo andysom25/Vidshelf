@@ -836,6 +836,13 @@ body {
     overflow: hidden;
 }
 .dash-row-fill {
+    /* display:block is load-bearing, not tidiness. Both of these are <span>s,
+       so the fill defaults to display:inline — and width/height are ignored on
+       inline elements. Every bar computed to 0px wide while carrying a
+       perfectly correct inline width="73.6%", so the panel rendered as a column
+       of identical empty tracks: no error, no failing test, and the numbers
+       beside them were right. It took a screenshot to notice. */
+    display: block;
     height: 100%;
     background: linear-gradient(90deg, #e94560, #c81e45);
     border-radius: 4px;
