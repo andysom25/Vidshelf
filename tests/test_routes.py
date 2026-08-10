@@ -647,6 +647,117 @@ def test_unknown_route_404s_rather_than_500s():
     assert resp.status_code == 404
 
 
+# Generated from the app on the commit BEFORE the v1.11.0 blueprint split, and
+# asserted unchanged after it. Moving 66 routes between files is a pure
+# relocation, and the only thing that makes that claim checkable is pinning the
+# whole surface rather than a sample of it.
+#
+# test_routes_are_registered above spot-checks ~20 known paths, which is the right
+# shape for "the known areas still exist" and cannot notice a route that was
+# dropped, duplicated under a second blueprint, or silently had a method removed.
+#
+# UPDATE THIS SET only when deliberately adding or removing a route, and say so in
+# the commit. A diff here during a refactor means the refactor was not pure.
+EXPECTED_ROUTES = {
+    ('/', 'GET'),
+    ('/api/artists', 'GET'),
+    ('/api/artists/summary', 'GET'),
+    ('/api/artists/videos', 'GET'),
+    ('/api/artwork/current_image', 'GET'),
+    ('/api/artwork/search', 'GET'),
+    ('/api/artwork/search_noauth', 'GET'),
+    ('/api/artwork/status', 'GET'),
+    ('/api/artwork/swap', 'POST'),
+    ('/api/artwork/swap_noauth', 'POST'),
+    ('/api/artwork/sync', 'POST'),
+    ('/api/browse-folder', 'POST'),
+    ('/api/channel/videos', 'GET'),
+    ('/api/channels', 'GET'),
+    ('/api/channels/add', 'POST'),
+    ('/api/channels/download-all', 'POST'),
+    ('/api/channels/mode', 'POST'),
+    ('/api/channels/quality', 'POST'),
+    ('/api/channels/remove', 'POST'),
+    ('/api/config', 'GET,POST'),
+    ('/api/conversion/scan', 'POST'),
+    ('/api/conversion/start', 'POST'),
+    ('/api/conversion/status', 'GET'),
+    ('/api/download', 'POST'),
+    ('/api/downloads/<download_id>/cancel', 'POST'),
+    ('/api/downloads/<download_id>/retry', 'POST'),
+    ('/api/downloads/<download_id>/verify', 'GET'),
+    ('/api/downloads/clear', 'POST'),
+    ('/api/downloads/progress', 'GET'),
+    ('/api/downloads/verify', 'POST'),
+    ('/api/library/stats', 'GET'),
+    ('/api/monitor/config', 'POST'),
+    ('/api/monitor/run', 'POST'),
+    ('/api/monitor/status', 'GET'),
+    ('/api/music-video-path', 'GET,POST'),
+    ('/api/music-videos/download', 'POST'),
+    ('/api/music-videos/search', 'POST'),
+    ('/api/notifications/config', 'POST'),
+    ('/api/notifications/test', 'POST'),
+    ('/api/password', 'POST'),
+    ('/api/plex-base-path', 'GET,POST'),
+    ('/api/plex/collections/create', 'POST'),
+    ('/api/plex/collections/dedupe', 'POST'),
+    ('/api/plex/collections/duplicates', 'GET'),
+    ('/api/plex/collections/status', 'GET'),
+    ('/api/plex/collections/sync', 'POST'),
+    ('/api/plex/config', 'GET,POST'),
+    ('/api/plex/discover-library', 'POST'),
+    ('/api/plex/libraries', 'GET'),
+    ('/api/plex/oauth/check', 'POST'),
+    ('/api/plex/oauth/servers', 'POST'),
+    ('/api/plex/oauth/start', 'POST'),
+    ('/api/plex/title-cards/generate', 'POST'),
+    ('/api/plex/titles/clean', 'POST'),
+    ('/api/retention/apply', 'POST'),
+    ('/api/retention/config', 'POST'),
+    ('/api/retention/plan', 'GET'),
+    ('/api/stats', 'GET'),
+    ('/api/system/health', 'GET'),
+    ('/api/system/info', 'GET'),
+    ('/api/system/update-check', 'POST'),
+    ('/api/system/version', 'GET'),
+    ('/dashboard', 'GET'),
+    ('/favicon.ico', 'GET'),
+    ('/login', 'GET,POST'),
+    ('/logout', 'GET'),
+    ('/static/<path:filename>', 'GET'),
+}
+
+
+def test_the_complete_route_inventory_is_unchanged():
+    actual = {
+        (r.rule, ','.join(sorted(m for m in r.methods if m not in ('HEAD', 'OPTIONS'))))
+        for r in app_module.app.url_map.iter_rules()
+    }
+    missing = EXPECTED_ROUTES - actual
+    added = actual - EXPECTED_ROUTES
+    assert not missing, (
+        f'{len(missing)} route(s) disappeared: {sorted(missing)}. If this is a '
+        'deliberate removal, update EXPECTED_ROUTES.')
+    assert not added, (
+        f'{len(added)} unexpected route(s): {sorted(added)}. If this is a '
+        'deliberate addition, update EXPECTED_ROUTES.')
+
+
+def test_no_route_is_registered_twice():
+    """A blueprint registered on two prefixes, or a view registered under two
+    blueprints, yields duplicate rules for one path — which url_map tolerates and
+    which changes which handler answers."""
+    seen = {}
+    for r in app_module.app.url_map.iter_rules():
+        seen.setdefault(r.rule, []).append(r.endpoint)
+    dupes = {rule: eps for rule, eps in seen.items() if len(eps) > 1}
+    # /api/artwork/search and /api/artwork/swap each carry a _noauth alias on the
+    # SAME view function, which is one endpoint with two rules, not two endpoints.
+    real = {rule: eps for rule, eps in dupes.items() if len(set(eps)) > 1}
+    assert not real, f'the same path is served by more than one endpoint: {real}'
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failures = 0
