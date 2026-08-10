@@ -246,6 +246,11 @@ body {
     transform: translateY(-2px);
 }
 .stat-card .stat-label {
+    /* flex so an inline hint marker sits on the label's baseline rather than
+       pushing the line height around. */
+    display: flex;
+    align-items: center;
+    gap: 5px;
     font-size: 0.85em;
     color: #8888a0;
     text-transform: uppercase;
@@ -256,7 +261,22 @@ body {
     font-size: 2em;
     font-weight: 700;
     color: #ffffff;
+    /* Tabular figures. The dashboard refreshes every 60s and proportional
+       digits make a number visibly change width as it updates; it also stops
+       "24.10 GB" and "197" sitting at different optical weights. */
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+    line-height: 1.15;
 }
+/* The info marker beside "Added (30 days)". Deliberately quiet -- it explains
+   a caveat, it is not a call to action. */
+.stat-hint {
+    color: #606070;
+    font-size: 0.9em;
+    cursor: help;
+    transition: color 0.15s ease;
+}
+.stat-hint:hover { color: #b0b0c0; }
 .stat-card .stat-icon {
     font-size: 1.5em;
     margin-bottom: 12px;
@@ -804,13 +824,35 @@ body {
 .dash-bar:hover {
     opacity: 1;
 }
+/* A month with nothing added still gets a stub, dimmed so it reads as an empty
+   month rather than a very small one. */
+.dash-bar-empty {
+    fill: rgba(255, 255, 255, 0.14);
+    opacity: 1;
+}
 .dash-axis {
-    fill: #707080;
-    font-size: 9px;
+    /* Set the family explicitly: SVG <text> does not inherit the page font
+       stack, so without this it falls back to the browser default and looks
+       out of place beside everything else. */
+    fill: #8888a0;
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    /* Axis labels are decoration -- selecting them while dragging across the
+       panel is never what you meant. */
+    user-select: none;
+    -webkit-user-select: none;
+}
+.dash-axis-y {
+    fill: #606070;
+    font-size: 9.5px;
+    font-variant-numeric: tabular-nums;
 }
 .dash-gridline {
-    stroke: rgba(255, 255, 255, 0.06);
+    stroke: rgba(255, 255, 255, 0.05);
     stroke-width: 1;
+    shape-rendering: crispEdges;   /* no half-pixel blur on a horizontal rule */
 }
 
 /* Horizontal bar rows (top artists) */
@@ -851,8 +893,10 @@ body {
     flex: 0 0 auto;
     color: #8888a0;
     font-size: 0.92em;
-    min-width: 58px;
+    min-width: 62px;
     text-align: right;
+    /* Tabular so the sizes read as a column instead of ragging. */
+    font-variant-numeric: tabular-nums;
 }
 
 /* Recently added list */
@@ -876,6 +920,7 @@ body {
     flex: 0 0 auto;
     color: #707080;
     font-size: 0.92em;
+    font-variant-numeric: tabular-nums;
 }
 
 /* Plex health rows */

@@ -172,6 +172,51 @@ def test_clean_video_title_returns_the_original_when_cleaning_empties_it():
     assert clean_video_title('Official Video') == 'Official Video'
 
 
+def test_boilerplate_in_square_brackets_leaves_no_residue():
+    """Regression, v1.10.0. The dangling-dash and empty-group rules only knew
+    about parentheses, so removing the phrase from a square-bracketed title left
+    the brackets standing. Both of these were visible on the dashboard's
+    Recently Added panel, and would have gone into filenames on the next
+    download."""
+    assert (clean_video_title('My Chemical Romance - Planetary (GO!) [Official Video] [HD]')
+            == 'My Chemical Romance - Planetary (GO!) [HD]')
+    assert (clean_video_title('MCR - I Am Not Okay (I Promise) [Official Video - 4K Film Restored]')
+            == 'MCR - I Am Not Okay (I Promise) [4K Film Restored]')
+    assert clean_video_title('X - Y [Official Music Video]') == 'X - Y'
+    assert clean_video_title('A - B [Official Video][HD]') == 'A - B [HD]'
+
+
+def test_parenthesised_boilerplate_still_leaves_no_residue():
+    """The paren cases the bracket fix generalised — same rules now serve both,
+    so this guards against fixing one style by breaking the other."""
+    assert clean_video_title('X - Y (Official Video)') == 'X - Y'
+    assert clean_video_title('X - Y (Official Video) [4K]') == 'X - Y [4K]'
+    assert clean_video_title('X - Y (Official Video - Remastered)') == 'X - Y (Remastered)'
+
+
+def test_meaningful_bracketed_text_is_preserved():
+    """The point of removing only the boilerplate phrase: brackets that carry
+    real information must survive untouched."""
+    assert clean_video_title('Keep [US Version] intact') == 'Keep [US Version] intact'
+    assert clean_video_title('Song [Live at Wembley]') == 'Song [Live at Wembley]'
+
+
+def test_no_cleaned_title_keeps_an_empty_bracket_pair():
+    """Property-style sweep over the shapes uploaders actually use, so a future
+    edit to one rule cannot reintroduce residue in a combination nobody wrote a
+    named test for."""
+    phrases = ['Official Video', 'Official Music Video', 'Official HD Video']
+    wrappers = ['({})', '[{}]', '- {}', '({} - Remastered)', '[{} - 4K]']
+    for phrase in phrases:
+        for wrapper in wrappers:
+            raw = f'Artist - Song {wrapper.format(phrase)}'
+            out = clean_video_title(raw)
+            for residue in ('()', '[]', '( ', ' )', '[ ', ' ]', ' -)', ' -]'):
+                assert residue not in out, f'{raw!r} -> {out!r} left {residue!r}'
+            assert not out.endswith('-'), f'{raw!r} -> {out!r}'
+            assert 'Song' in out, f'{raw!r} -> {out!r} lost the song title'
+
+
 def test_normalize_artist_prefix_is_a_noop_for_unknown_artists():
     assert normalize_artist_prefix('Xyz - Song', ['Foo']) == 'Xyz - Song'
 
