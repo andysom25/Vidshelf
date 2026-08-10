@@ -5157,3 +5157,96 @@ The dashboard shows no download *history* over time, no failure/retry record and
 no "added this week" beyond the file-date proxy, because the tracker stores video
 ids and nothing else. Those need the v2.0 data model, which is the item this
 release keeps deferring and keeps making a stronger case for.
+
+## v1.9.2 — the dashboard refresh was hammering YouTube
+
+Found while auditing v1.9.1 for anything else the release might have introduced,
+rather than from a report. It is the most serious bug in the 1.9.x line, and it
+was introduced by the 60-second auto-refresh added in v1.9.0.
+
+### The cost nobody measured
+
+`/api/channels` resolves each channel's display name through `get_channel_info()`,
+which is a live `yt_dlp.extract_info()` against YouTube. The docstring called it
+"lightweight". Measured on a real channel:
+
+```
+get_channel_info('https://www.youtube.com/@Metallica')  ->  23.22s
+second call (no cache)                                  ->  23.08s
+```
+
+Twenty-three seconds, uncached, per channel, per call.
+
+The Channels page has always paid that — 23s x N on every visit — which was slow
+but bounded and user-initiated. v1.9.0's dashboard auto-refresh then called the
+same endpoint **every 60 seconds**, turning it into unbounded background load:
+
+| channels | work per 60s cycle |
+| --- | --- |
+| 1 | ~23s |
+| 3 | ~69s — exceeds the cycle; never catches up |
+
+At best wasted bandwidth. At worst rate-limiting from YouTube, which would break
+the downloads the application exists to perform — a performance bug escalating
+into a functional one.
+
+### Why it survived
+
+The install it was developed and measured against has **zero channels**, so the
+loop was free there. Every timing figure in the v1.9.0 work — cold 0.83s, warm
+0.05s — was taken on a configuration that could not exhibit the problem.
+
+Worth stating plainly because the same shape recurs in this log: v1.6.1's
+capability drop was verified by reading and writing the share but not by the one
+syscall the capability gated; v1.8.2's disk-usage card looked plausible only
+because staging happened to hold leaked files. **A measurement is only as good as
+the configuration it was taken on**, and "the dashboard is fast now" was true and
+useless.
+
+### The fixes
+
+Two, because either alone would leave a sharp edge:
+
+1. **The dashboard no longer calls `/api/channels`.** It needed the channel
+   *count*, and `/api/stats` already returned `channels_count`. The expensive
+   endpoint is now only reached from user-initiated navigation.
+2. **`get_channel_info()` caches for 24 hours.** A display name effectively never
+   changes; a stale label costs nothing against being throttled. This also makes
+   the Channels page fast for the first time — previously every visit paid the
+   full cost.
+
+Measured after: `20.92s -> 0.000s` on a repeat lookup.
+
+**Failures are deliberately not cached.** A transient network blip or throttle
+returns `None`, and caching that for a day would pin a channel to
+"Unknown Channel" until a restart. Only successes are stored.
+
+`test_the_auto_refreshing_dashboard_never_calls_a_live_yt_dlp_endpoint` guards
+both halves and is proven to fire against each: it parses the body of
+`loadDashboardStats()` specifically — not the whole file — because the Channels
+page's own call to that endpoint is legitimate and must keep working.
+
+### Release-notes correction
+
+The cherry-pick that recovered this fix also carried a section describing it into
+`release-notes/v1.9.1.md` — a release that shipped **without** it. Removed. Notes
+must describe what the tag actually contains, or they are worse than absent.
+
+### The process failure that let it ship
+
+PR #27 was merged while a fourth commit was still in flight, so the squash
+captured three of four and v1.9.1 published without this fix. `dev` then held one
+orphaned commit against a squashed `main`.
+
+The recovery is the one CLAUDE.md already documents for this case, and it is
+worth following exactly rather than reaching for `reset --hard` alone:
+
+```bash
+git fetch origin
+git checkout dev && git reset --hard origin/main
+git cherry-pick <the orphaned commit>
+```
+
+A plain reset would have silently discarded the fix — which, given the fix was
+for a bug that quietly hammers YouTube, would have been a quiet loss of a quiet
+fix.

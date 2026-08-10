@@ -441,8 +441,44 @@ def is_video_downloaded(video_id, channel_url):
     tracker = load_downloaded_tracker()
     return video_id in tracker.get(channel_url, [])
 
-def get_channel_info(channel_url):
-    """Lightweight fetch of just the channel display name."""
+_CHANNEL_NAME_CACHE = {}          # url -> (fetched_at, name)
+_CHANNEL_NAME_TTL = 24 * 3600
+_CHANNEL_NAME_LOCK = threading.Lock()
+
+
+def get_channel_info(channel_url, force=False):
+    """Lightweight fetch of just the channel display name.
+
+    "Lightweight" is relative: this is a live yt-dlp extraction against YouTube
+    and it was measured at **23 seconds** for a single channel. /api/channels
+    calls it once per configured channel, so the Channels page cost 23s x N on
+    every visit, and v1.9.0's 60-second dashboard refresh turned that into a
+    continuous background load — with three channels the work per cycle exceeded
+    the cycle itself, so it would never catch up and would hammer YouTube
+    forever.
+
+    Cached for a day. A channel's display name effectively never changes, and
+    the cost of being a day stale is a slightly wrong label; the cost of not
+    caching is rate-limiting that breaks actual downloads.
+    """
+    now = time.time()
+    if not force:
+        with _CHANNEL_NAME_LOCK:
+            hit = _CHANNEL_NAME_CACHE.get(channel_url)
+        if hit and (now - hit[0]) < _CHANNEL_NAME_TTL:
+            return hit[1]
+
+    name = _fetch_channel_name(channel_url)
+    if name:
+        # Only cache successes. A failure is usually transient (network, a
+        # throttle), and caching it for a day would mean one bad moment
+        # labelling a channel "Unknown Channel" until a restart.
+        with _CHANNEL_NAME_LOCK:
+            _CHANNEL_NAME_CACHE[channel_url] = (now, name)
+    return name
+
+
+def _fetch_channel_name(channel_url):
     try:
         ydl_opts = {
             'quiet': True,

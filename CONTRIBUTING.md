@@ -84,6 +84,50 @@ reintroduce. A few that will bite you:
 - **Verify media-path changes end to end**, not just with tests. Two separate
   fixes in this project looked correct on paper and weren't.
 
+## Using AI assistants
+
+Use them if you like — much of this project was written with one, and saying
+otherwise would be dishonest. There is no disclosure requirement and no
+prohibition. What there is, is a bar, and it is the same bar for everyone:
+
+**Claims in a PR must be backed by something you ran.** "This fixes X" means you
+reproduced X first and confirmed it stopped. Several bugs here looked fixed on
+paper twice before they actually were, and the log records every one.
+
+**A test you have not watched fail proves nothing.** This is the requirement AI
+output misses most often, because a plausible-looking assertion that is
+vacuously true still shows green. Real examples from this repo:
+
+- an ordering assertion comparing `index('os.replace')` against
+  `index('os.chmod')` — the module docstring mentioned `os.replace` four times
+  before any code did, so it could never fail
+- a CSS rule requiring `display: block`, satisfied by the *comment* explaining
+  why `display: block` mattered
+- an XSS guard matching a fixed list of variable names, which passed while four
+  unescaped values sat in the same file
+
+Each was written in good faith, each passed, and each was worthless. Break the
+code deliberately and watch the test go red before you trust it.
+
+**Verify against the real thing where the real thing is what breaks.** The
+recurring failures in this project — CIFS mounts, container restarts, Docker
+port collisions, browser rendering — are invisible to unit tests by
+construction. `python tests/*.py` passing is necessary, not sufficient. If you
+touch the media path, do a real download to a real network mount.
+
+**Don't add dependencies to make something easier to generate.** No pytest, no
+npm, no chart library. These constraints are deliberate and long-standing; a PR
+that relaxes one to simplify its own implementation will be asked to put it
+back.
+
+**Comments must say why, and be true.** A comment restating what the line does
+is noise. A comment asserting something false about the system is worse than
+none, and stale comments have actively misled work here before — one entry in
+REFERENCE.md pointed at a function that had already been deleted.
+
+None of this is unique to AI-assisted work. It is just where that work tends to
+fall short, and it is cheaper to say so once here than to find it in review.
+
 ## Style
 
 Match the surrounding code — it's plain Flask and vanilla JS with no build
