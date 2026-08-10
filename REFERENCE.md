@@ -5368,6 +5368,71 @@ asserting no output contains `()`, `[]`, a dangling dash, or a lost song title.
 Both fail against the pre-fix code — verified by reverting the three patterns and
 re-running, not assumed.
 
+### End-to-end proof of the bracket fix, on a real download
+
+The unit tests use synthetic titles. This is the real one, downloaded through the
+UI of a v1.10.0 container mounted against the real NAS:
+
+    raw title from YouTube:
+      My Chemical Romance - The Ghost Of You [Official Music Video - 4K Film Restored]
+
+    v1.10.0 writes:  ... - The Ghost Of You [4K Film Restored]-uCUpvTMis-Y.mp4
+    v1.9.2 wrote:    ... - The Ghost Of You [ - 4K Film Restored]-uCUpvTMis-Y.mp4
+
+Both produced by running `build_music_video_title` on the identical raw string,
+with the pre-fix regexes reconstructed in the same interpreter — an A/B on one
+input, not two separate observations. The v1.9.2 name was already sitting in the
+library from an earlier download, which is what made the comparison free.
+
+The download also exercised two paths worth recording as verified together:
+
+- `_copystat_best_effort` logged
+  `could not copy timestamps/mode ... [Errno 1] Operation not permitted` and
+  **continued to completion**. That is v1.8.1's fix working under the real
+  `cap_drop: ALL` config, on a real CIFS write, at 58 MB. Before v1.8.1 this
+  aborted every download to the NAS.
+- Staging was left with **zero** files afterwards, so the move out of
+  `./downloads/music_videos` is not leaking intermediates — the leak that made
+  v1.8.2's disk card look correct for the wrong reason.
+
+### The trap this test walked into: an empty tracker re-downloads
+
+The throwaway container had its own empty `data/`, so `downloaded_videos.json`
+had no record of `uCUpvTMis-Y` and the download proceeded even though the file
+already existed on the NAS under its old name. Result: two byte-identical copies
+(same md5) under two different names.
+
+Worth knowing before running this kind of test again:
+
+- **The tracker, not the filesystem, is what prevents a re-download.** There is
+  no "does a file for this video id already exist" check on the media root — and
+  adding one is not free, because the filename is not derivable from the video id
+  alone once naming rules change, which is exactly the situation here.
+- **A throwaway container pointed at the real media root is therefore a writer,
+  not a reader.** Either seed it with a copy of the real tracker, or expect to
+  clean up after it. Mounting the media volume `:ro` is the safer default when the
+  test does not actually need to download.
+- The duplicate was removed by hashing both copies first and deleting only on an
+  exact match, with the delete refusing to run if the other copy was missing.
+  Given the staging sweep incident (640 MB of library deleted because safety was
+  derived from the current config rather than from the file itself), any delete
+  touching the media root should verify the specific bytes it is about to remove
+  are recoverable, at the moment it removes them.
+
+### Also verified during the same drill
+
+- `sort -V` ranks `v1.10.0` above `v1.9.2`, so `ci.yml`'s `is_newest` check moves
+  `:latest` correctly across the 1.9 -> 1.10 boundary. This was the specific
+  worry behind "harden at 1.10 does not make sense when we are on 1.9.2" and it
+  is worth having confirmed rather than assumed, because a string comparison
+  would get it wrong.
+- All five non-dashboard pages (Channels, Downloads, Music Videos, Artists,
+  Settings) render with no horizontal overflow and no console errors on the new
+  CSS. The classes the typography work touched (`.stat-card`, `.stat-label`,
+  `.stat-value`) appear only in `templates/dashboard.html`, but `dashboard.css` is
+  the global stylesheet, so "only the dashboard uses it" is a claim to check
+  rather than assume.
+
 ### Fix: the chart stretched its own axis labels
 
 `renderAddedChart` drew into a fixed `viewBox` and scaled it to the panel with
