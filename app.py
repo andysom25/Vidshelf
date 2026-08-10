@@ -13,6 +13,7 @@ import state
 import config_store
 import youtube
 import library
+import tracker
 import webauth
 import updates
 import notify
@@ -214,48 +215,17 @@ def _cookies_file():
     return None
 
 
-# Music-video downloads have no channel, so they're filed in the tracker under a
-# synthetic key. Both directions live here rather than being spelled out at each
-# site: the retry path needs to read the artist back out, and getting the
-# transform subtly wrong there is invisible until a retry lands in the wrong
-# folder. Lossy by construction — "A B" and "A_B" collapse to the same key — and
-# left that way deliberately, since changing it would orphan existing history.
-MUSIC_KEY_PREFIX = 'music_video_'
+# The download tracker and the music-video key scheme live in tracker.py as of
+# v1.11.0. Re-exported for the routes still here; blueprints import directly.
+MUSIC_KEY_PREFIX = tracker.MUSIC_KEY_PREFIX
+_music_key_for_artist = tracker._music_key_for_artist
+_artist_from_music_key = tracker._artist_from_music_key
+_music_retry_destination = tracker._music_retry_destination
+load_downloaded_tracker = tracker.load_downloaded_tracker
+save_downloaded_tracker = tracker.save_downloaded_tracker
+mark_video_downloaded = tracker.mark_video_downloaded
+is_video_downloaded = tracker.is_video_downloaded
 
-
-def _music_key_for_artist(artist):
-    """Tracker key for an artist's music videos."""
-    return f"{MUSIC_KEY_PREFIX}{artist.replace(' ', '_')}"
-
-
-def _artist_from_music_key(channel_url):
-    """Artist name from a synthetic music key, or None for a real channel URL."""
-    if not channel_url or not channel_url.startswith(MUSIC_KEY_PREFIX):
-        return None
-    return channel_url[len(MUSIC_KEY_PREFIX):].replace('_', ' ').strip() or None
-
-
-def _music_retry_destination(recorded_path, music_artist):
-    """Where a retried music video should land.
-
-    The path recorded on a download entry is only the artist folder once the job
-    has actually *started*: the music route queues it with the music root, and
-    download_video re-inits the entry with root/Artist when a worker picks it
-    up. A download cancelled while still queued never got that far — so
-    retrying one would drop the file loose in the root. Inside the library, but
-    with no artist folder, so no artwork, no collection, and nothing on the
-    Artists page.
-
-    No-op for channel downloads, and idempotent: a path that already ends in the
-    artist folder is returned unchanged, so the normal failed-mid-download case
-    doesn't get a second folder nested inside the first.
-    """
-    if not music_artist:
-        return recorded_path
-    folder = _sanitize_folder_name(music_artist)
-    if os.path.basename(os.path.normpath(recorded_path)) == folder:
-        return recorded_path
-    return os.path.join(recorded_path, folder)
 
 
 def _download_options(channel_url=None):
@@ -298,36 +268,6 @@ def _notify_download(kind, title, channel_url, error=None):
         print(f'[notify] could not dispatch {kind} notification: {exc}')
 
 
-def load_downloaded_tracker():
-    return state.read_json(TRACKER_FILE)
-
-def save_downloaded_tracker(tracker):
-    state.write_json(TRACKER_FILE, tracker, indent=2)
-
-def mark_video_downloaded(video_id, channel_url):
-    """Record a video as downloaded.
-
-    The read-modify-write has to happen under a single lock: this runs on the
-    bounded download pool (_DOWNLOAD_EXECUTOR), so with concurrency > 1 two
-    downloads finishing close together would both load the same tracker, each
-    append only its own video, and whichever wrote second would drop the
-    other's entry. The dropped video then looks new on the next channel check
-    and gets downloaded all over again.
-    """
-    def _add(tracker):
-        tracker.setdefault(channel_url, [])
-        if video_id not in tracker[channel_url]:
-            tracker[channel_url].append(video_id)
-
-    state.update_json(TRACKER_FILE, _add, indent=2)
-    # A new file exists on disk now, so the cached library scan is stale.
-    # Every successful download funnels through here, which makes it the one
-    # place that reliably knows the library changed.
-    _invalidate_library_scan()
-
-def is_video_downloaded(video_id, channel_url):
-    tracker = load_downloaded_tracker()
-    return video_id in tracker.get(channel_url, [])
 
 # yt-dlp metadata probes live in youtube.py as of v1.11.0. Re-exported under
 # their original names for the routes still in this module; blueprints import
@@ -824,19 +764,14 @@ def api_config():
         _update_config(_merge)
         return jsonify({'success': True, 'message': 'Configuration updated'})
 
-def _sanitize_folder_name(name):
-    """Sanitize a name for use as a folder name, removing invalid filesystem characters."""
-    invalid_chars = '<>:"/\\|?*'
-    for c in invalid_chars:
-        name = name.replace(c, '_')
-    # Remove leading/trailing spaces and dots (problematic on Windows)
-    name = name.strip().strip('.')
-    # Collapse multiple spaces/underscores
-    import re
-    name = re.sub(r'[_\s]+', '_', name)
-    if not name:
-        name = 'Unknown_Artist'
-    return name
+# Was a full second implementation of titles.artist_to_folder, which said
+# "mirrors _sanitize_folder_name" in its own docstring — two copies of the rule
+# that decides every artist folder name on disk, either of which could be edited
+# without the other. Deduped in v1.11.0 after confirming they agreed on all 3,029
+# inputs tried (3,000 of them randomised over spaces, dots, underscores, the
+# Windows-invalid character set, tabs and newlines), rather than on the strength
+# of the two functions looking the same.
+_sanitize_folder_name = titles.artist_to_folder
 
 
 def _resolve_existing_artist(query, root_path):

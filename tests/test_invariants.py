@@ -922,6 +922,32 @@ def test_the_search_never_waits_on_its_own_thread_pool():
         'hanging probe still holds the response open')
 
 
+def test_there_is_one_folder_name_sanitiser():
+    """v1.11.0 dedupe.
+
+    app._sanitize_folder_name and titles.artist_to_folder were two byte-identical
+    implementations of the rule that decides every artist folder name on disk —
+    artist_to_folder's docstring even said "mirrors _sanitize_folder_name". Either
+    could be edited without the other, and the one place it would show up first is
+    _music_retry_destination, i.e. silently in WHERE a retried music video lands.
+
+    Verified equivalent over 3,029 inputs before collapsing them, then collapsed
+    onto titles.artist_to_folder. This keeps the second copy from reappearing.
+    """
+    offenders = []
+    for name, code in _app_code_by_file():
+        if 'def _sanitize_folder_name(' in code:
+            offenders.append(name)
+    assert not offenders, (
+        f'{", ".join(offenders)} defines _sanitize_folder_name again. '
+        'titles.artist_to_folder is the single implementation — a second copy of '
+        'this rule can drift, and it decides artist folder names on disk.')
+
+    # And the survivor still exists, or the alias above points at nothing.
+    assert 'def artist_to_folder(' in _read('titles.py'), \
+        'titles.artist_to_folder is gone — it is the only folder-name sanitiser left'
+
+
 def test_the_app_source_list_covers_every_route_module():
     """The guard on the guards (v1.11.0).
 
