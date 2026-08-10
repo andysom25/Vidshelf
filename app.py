@@ -10,6 +10,8 @@ import secrets
 import requests
 import functools
 import state
+import config_store
+import webauth
 import updates
 import notify
 import retention
@@ -127,18 +129,20 @@ _DOWNLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix='download'
 )
 
-# State now lives in a mounted directory (./data) and is written atomically —
-# see state.py for why single-file bind mounts made both of those impossible.
-# Re-exported under the original names so the rest of this module reads
-# unchanged.
-CONFIG_FILE = state.CONFIG_FILE
-TRACKER_FILE = state.TRACKER_FILE
-ACTIVE_DOWNLOADS_FILE = state.ACTIVE_DOWNLOADS_FILE
+# config.json I/O and the credentials it seeds live in config_store.py as of
+# v1.11.0 — state still lives in a mounted directory (./data) and is still
+# written atomically; see state.py for why single-file bind mounts made both of
+# those impossible. Re-exported under the original names so the routes still in
+# this module read unchanged; blueprints import from config_store directly.
+CONFIG_FILE = config_store.CONFIG_FILE
+TRACKER_FILE = config_store.TRACKER_FILE
+ACTIVE_DOWNLOADS_FILE = config_store.ACTIVE_DOWNLOADS_FILE
+load_config = config_store.load_config
+_read_raw_config = config_store._read_raw_config
+_write_raw_config = config_store._write_raw_config
+_update_config = config_store._update_config
 
-for _migration in state.MIGRATIONS_PERFORMED:
-    # Not all migrations relocate a file any more — v1.8.0 added a config-key
-    # fold — so the message says what happened rather than assuming.
-    print(f"[state] Migration: {_migration}")
+config_store.report_migrations()
 
 # Youtube-only allowlist for any endpoint that hands a caller-supplied URL to
 # yt-dlp — yt-dlp supports hundreds of sites via a "generic" extractor, so an
@@ -166,152 +170,34 @@ _CONVERSION_STATE = {
     'current_file': None,
     'errors': [],
 }
+
 _CONVERSION_LOCK = threading.Lock()
+
 _CONVERSION_SCRATCH_DIR = os.path.join('.', 'downloads', '_conversion_scratch')
 
-def load_config():
-    return state.read_json(CONFIG_FILE)
-
-def _read_raw_config():
-    """Like load_config(), but never raises — used during startup, before
-    the app (and thus any request context) exists."""
-    return state.read_json(CONFIG_FILE)
-
-def _write_raw_config(config):
-    state.write_json(CONFIG_FILE, config, indent=4)
-
-def _update_config(mutate):
-    """Read-modify-write config.json under a lock, atomically.
-
-    Prefer this over load_config() + _write_raw_config() anywhere the new
-    value depends on the current one: Flask serves requests on threads, so
-    two settings saves (or a save racing the Plex OAuth callback, which
-    persists a token from a background poll) would otherwise each write a
-    full document built from a stale read, and the loser's field silently
-    disappears.
-    """
-    return state.update_json(CONFIG_FILE, mutate, indent=4)
-
-def _get_or_create_secret_key():
-    """Flask's secret key signs session cookies — anyone who knows it can
-    forge a valid 'logged in as admin' session outright. This used to be a
-    fixed string committed to source control, so anyone who'd ever seen this
-    repo could forge a session against any deployment still using it.
-
-    Prefer a SECRET_KEY env var; otherwise persist a freshly generated
-    random key in config.json (under a leading-underscore key so it reads
-    as internal state, not a user-facing setting) so sessions survive a
-    container restart without ever falling back to a known value.
-    """
-    env_key = os.environ.get('SECRET_KEY')
-    if env_key:
-        return env_key
-    config = _read_raw_config()
-    existing = config.get('_secret_key')
-    if existing:
-        return existing
-    new_key = secrets.token_hex(32)
-    config['_secret_key'] = new_key
-    try:
-        _write_raw_config(config)
-    except Exception:
-        print("[SECURITY] Could not persist generated secret key to config.json — "
-              "sessions will not survive a restart until this is writable.")
-    return new_key
-
-def _get_or_create_admin_credentials():
-    """Load the admin username + password hash from config.json, seeding it
-    on first run instead of a fixed 'admin'/'adminadmin' checked into
-    source. Also fixes a related bug: the old /api/password handler only
-    updated an in-memory dict, so any password change was silently reverted
-    on the next restart — this persists changes to config.json instead.
-
-    First-run behavior: ADMIN_USERNAME/ADMIN_PASSWORD env vars are used if
-    set; otherwise a random password is generated and printed once so it can
-    still be retrieved from `docker logs`.
-    """
-    config = _read_raw_config()
-    creds = config.get('_auth', {})
-    if creds.get('username') and creds.get('password_hash'):
-        return creds['username'], creds['password_hash']
-
-    # `or 'admin'` (not .get(..., 'admin')) because docker-compose passes
-    # ADMIN_USERNAME='' — not an absent key — when the .env var is unset, and
-    # os.environ.get() with a default only applies it for a missing key, not
-    # an empty-string value.
-    username = os.environ.get('ADMIN_USERNAME') or 'admin'
-    password = os.environ.get('ADMIN_PASSWORD')
-    generated = False
-    if not password:
-        password = secrets.token_urlsafe(12)
-        generated = True
-    password_hash = generate_password_hash(password)
-    config['_auth'] = {'username': username, 'password_hash': password_hash}
-    try:
-        _write_raw_config(config)
-    except Exception:
-        print("[SECURITY] Could not persist generated admin credentials to config.json.")
-    if generated:
-        print(f"[SECURITY] No ADMIN_PASSWORD set — generated a random admin password on "
-              f"first run: {password!r} (username: {username!r}). This is only printed "
-              f"once; change it via the dashboard's Settings page, or set ADMIN_PASSWORD "
-              f"and delete the '_auth' key from config.json to reset it.")
-    return username, password_hash
-
 app = Flask(__name__)
-app.secret_key = _get_or_create_secret_key()
+app.secret_key = config_store._get_or_create_secret_key()
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 # Off by default since this is commonly reached over plain HTTP on a LAN;
 # set SESSION_COOKIE_SECURE=true if this is ever put behind HTTPS/a reverse proxy.
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SESSION_COOKIE_SECURE', '').lower() == 'true'
 
-_ADMIN_USERNAME, _ADMIN_PASSWORD_HASH = _get_or_create_admin_credentials()
+_ADMIN_USERNAME, _ADMIN_PASSWORD_HASH = config_store._get_or_create_admin_credentials()
 
-# Simple in-memory login throttle, keyed by client IP. Resets on restart —
-# acceptable here since this is a single-container, single-account app, not
-# a distributed service; the goal is just to make the default/first-run
-# credential meaningfully harder to brute-force, not to build a full
-# rate-limiting subsystem.
-_LOGIN_FAILURES = {}  # ip -> (fail_count, locked_until_epoch)
-_LOGIN_MAX_ATTEMPTS = 5
-_LOGIN_LOCKOUT_SECONDS = 300
-# Above this many tracked IPs, expired records are swept on the next failed
-# login. Not a hard cap -- currently-locked IPs are never dropped, since
-# forgetting one would hand an attacker a free reset.
-_LOGIN_FAILURES_SOFT_CAP = 512
+# The login throttle, the session guard and the response headers live in
+# webauth.py as of v1.11.0. Re-exported under their original names for the routes
+# still in this module; blueprints import them from webauth directly.
+_login_is_locked = webauth._login_is_locked
+_record_login_failure = webauth._record_login_failure
+_clear_login_failures = webauth._clear_login_failures
+require_auth = webauth.require_auth
 
-def _login_is_locked(ip):
-    count, locked_until = _LOGIN_FAILURES.get(ip, (0, 0))
-    return count >= _LOGIN_MAX_ATTEMPTS and time.time() < locked_until
+# Registered here rather than in webauth because an after_request hook belongs to
+# an app, and webauth deliberately knows nothing about one — that is what lets
+# every blueprint import require_auth without a cycle back through app.py.
+app.after_request(webauth._set_security_headers)
 
-def _record_login_failure(ip):
-    now = time.time()
-    # Evict records that can no longer lock anyone out. Without this the dict
-    # kept one entry per source IP for the life of the process — unbounded
-    # growth driven entirely by unauthenticated requests, which is a poor
-    # property for the one endpoint that is reachable without a session.
-    # Cheap: this runs only on a *failed* login, which is already rate-limited.
-    if len(_LOGIN_FAILURES) > _LOGIN_FAILURES_SOFT_CAP:
-        for stale_ip, (_, until) in list(_LOGIN_FAILURES.items()):
-            if until < now and stale_ip != ip:
-                del _LOGIN_FAILURES[stale_ip]
-
-    count, locked_until = _LOGIN_FAILURES.get(ip, (0, 0))
-    count += 1
-    if count >= _LOGIN_MAX_ATTEMPTS:
-        locked_until = now + _LOGIN_LOCKOUT_SECONDS
-    _LOGIN_FAILURES[ip] = (count, locked_until)
-
-def _clear_login_failures(ip):
-    _LOGIN_FAILURES.pop(ip, None)
-
-@app.after_request
-def _set_security_headers(response):
-    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
-    response.headers.setdefault('X-Frame-Options', 'DENY')
-    response.headers.setdefault('Referrer-Policy', 'same-origin')
-    return response
 
 def _cookies_file():
     """Path to a yt-dlp cookies file, or None.
@@ -855,28 +741,6 @@ def dashboard():
         flash('Please log in first.', 'error')
         return redirect(url_for('login'))
     return render_template('dashboard.html', username=session['username'])
-
-def require_auth(view):
-    """Reject anonymous callers before the view runs.
-
-    This check used to be two hand-written lines at the top of 58 route
-    bodies. Both v1.6.1 and v1.7.0 were, in part, "an endpoint was missing
-    it" — and v1.7.0 found that /api/artwork/search_noauth had validated its
-    query parameter *before* checking the session, so it answered anonymous
-    probes with 400 and looked guarded to the route sweep while serving
-    ?artist=... to anyone. A decorator makes both failures structural: you
-    cannot forget half of it, and it cannot run after anything else.
-
-    functools.wraps matters here beyond tidiness — Flask derives the
-    endpoint name from __name__, and tests/test_routes.py keys its
-    public-endpoint allowlist off those names.
-    """
-    @functools.wraps(view)
-    def wrapper(*args, **kwargs):
-        if 'username' not in session:
-            return jsonify({'error': 'Unauthorized'}), 401
-        return view(*args, **kwargs)
-    return wrapper
 
 # ---------- API Routes ----------
 
