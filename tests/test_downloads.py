@@ -128,15 +128,23 @@ def test_is_cancelled_is_false_for_a_normal_download():
 
 # ------------------------------------------- search probe bounds (v1.10.1)
 #
-# These import app, which the rest of this file does not, so it happens inside
-# the tests rather than at module scope — a failed app import would otherwise
-# take the cancellation tests down with it.
+# Imported inside the tests rather than at module scope, so a failed import here
+# doesn't take the cancellation tests above down with it.
 
-def _app_with_fake_probe(probe):
+def _youtube_with_fake_probe(probe):
+    """Substitute the quality probe and hand back the module that owns it.
+
+    Patches `youtube`, not `app`. These probes moved to youtube.py in v1.11.0, and
+    _enrich_video_qualities resolves get_video_formats_info against its OWN
+    module globals — so patching app.get_video_formats_info silently stopped
+    having any effect while the tests still read as though it did. All three of
+    these failed on the extraction commit, which is the safety net working:
+    patch the real owner, not a re-export that happens to share the name.
+    """
     os.environ.setdefault('ADMIN_PASSWORD', 'test-only')
-    import app
-    app.get_video_formats_info = probe
-    return app
+    import youtube
+    youtube.get_video_formats_info = probe
+    return youtube
 
 
 def test_a_hanging_quality_probe_cannot_stall_the_search():
@@ -157,16 +165,16 @@ def test_a_hanging_quality_probe_cannot_stall_the_search():
             return {'best_quality': 'never'}
         return {'best_quality': '1080p'}
 
-    app = _app_with_fake_probe(probe)
-    original = app.PROBE_WALL_CLOCK_TIMEOUT
-    app.PROBE_WALL_CLOCK_TIMEOUT = 2
+    yt = _youtube_with_fake_probe(probe)
+    original = yt.PROBE_WALL_CLOCK_TIMEOUT
+    yt.PROBE_WALL_CLOCK_TIMEOUT = 2
     try:
         videos = [{'id': 'HANGS'}, {'id': 'ok1'}, {'id': 'ok2'}]
         started = time.time()
-        unresolved = app._enrich_video_qualities(videos)
+        unresolved = yt._enrich_video_qualities(videos)
         elapsed = time.time() - started
     finally:
-        app.PROBE_WALL_CLOCK_TIMEOUT = original
+        yt.PROBE_WALL_CLOCK_TIMEOUT = original
 
     assert elapsed < 8, (
         f'took {elapsed:.1f}s for a 2s timeout — the hang was not contained, '
@@ -183,9 +191,9 @@ def test_a_raising_quality_probe_does_not_fail_the_search():
     def probe(video_id):
         raise RuntimeError('YouTube said no')
 
-    app = _app_with_fake_probe(probe)
+    yt = _youtube_with_fake_probe(probe)
     videos = [{'id': 'a'}, {'id': 'b'}]
-    unresolved = app._enrich_video_qualities(videos)
+    unresolved = yt._enrich_video_qualities(videos)
     assert unresolved == 2, unresolved
     assert all(v['best_quality'] == 'unknown' for v in videos), videos
 
@@ -199,9 +207,9 @@ def test_already_enriched_videos_are_not_reprobed():
         calls.append(video_id)
         return {'best_quality': '720p'}
 
-    app = _app_with_fake_probe(probe)
+    yt = _youtube_with_fake_probe(probe)
     videos = [{'id': 'cached', 'best_quality': '4K'}, {'id': 'fresh'}]
-    app._enrich_video_qualities(videos)
+    yt._enrich_video_qualities(videos)
     assert calls == ['fresh'], calls
     assert videos[0]['best_quality'] == '4K', 'an existing label was overwritten'
 
@@ -209,13 +217,13 @@ def test_already_enriched_videos_are_not_reprobed():
 def test_every_metadata_probe_is_bounded():
     """yt-dlp defaults to no socket deadline and 10 retries with backoff. That is
     right for a download and wrong for anything a browser waits on."""
-    app = _app_with_fake_probe(lambda vid: {'best_quality': '1080p'})
-    opts = app._probe_opts()
+    yt = _youtube_with_fake_probe(lambda vid: {'best_quality': '1080p'})
+    opts = yt._probe_opts()
     assert opts['socket_timeout'] > 0, opts
     assert 0 < opts['retries'] <= 3, opts
     assert 0 <= opts['extractor_retries'] <= 2, opts
     # Extra keys must not be able to drop the bounds.
-    merged = app._probe_opts(extract_flat=True, dump_single_json=True)
+    merged = yt._probe_opts(extract_flat=True, dump_single_json=True)
     for key in ('socket_timeout', 'retries', 'extractor_retries'):
         assert merged[key] == opts[key], f'{key} lost when extra options passed'
 

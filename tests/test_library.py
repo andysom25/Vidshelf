@@ -30,6 +30,13 @@ os.environ['VIDSHELF_DATA_DIR'] = os.path.join(_WORK, 'data')
 os.environ.setdefault('ADMIN_PASSWORD', 'library-test-password')
 
 import app as app_module  # noqa: E402
+# The library scan moved to library.py in v1.11.0. These tests patch and read
+# module state (_LIBRARY_SCAN_CACHE, _invalidate_library_scan), and that only
+# works against the module that owns it — app.py re-exports the names, but
+# rebinding a re-export does not change what _library_scan itself sees. So they
+# address library directly, and app_module stays only for CONFIG_FILE and the
+# tracker write, which really are the app's.
+import library as library_module  # noqa: E402
 import state  # noqa: E402
 
 _MEDIA = os.path.join(_WORK, 'media')
@@ -51,7 +58,7 @@ def _seed(files):
         'artwork_sync': {'root_path': _MEDIA},
         'plex_base_path': _MEDIA,
         '_secret_key': 'k'}, indent=4)
-    app_module._invalidate_library_scan()
+    library_module._invalidate_library_scan()
 
 
 DEFAULT = [
@@ -67,7 +74,7 @@ def test_totals_count_videos_only():
     it was the Disk Usage card being wrong that started all of this."""
     _seed(DEFAULT + [('Nirvana', 'folder.jpg', 64, 1),
                      ('Nirvana', 'artist-metadata.json', 4, 1)])
-    scan = app_module._library_scan(force=True)
+    scan = library_module._library_scan(force=True)
     assert scan['videos'] == 4, scan['videos']
     assert scan['bytes'] == (900 + 700 + 500 + 400) * 1024, scan['bytes']
     assert scan['artists'] == 3, scan['artists']
@@ -75,7 +82,7 @@ def test_totals_count_videos_only():
 
 def test_added_30d_counts_only_the_last_30_days():
     _seed(DEFAULT)
-    scan = app_module._library_scan(force=True)
+    scan = library_module._library_scan(force=True)
     # 5, 2 and 1 days ago are in; 40 days ago is not.
     assert scan['added_30d'] == 3, scan['added_30d']
 
@@ -87,9 +94,9 @@ def test_month_series_is_dense_and_ends_now():
     spell would read as continuous activity — a chart that lies rather than one
     that is merely sparse.
     """
-    scan = app_module._library_scan(force=True)
+    scan = library_module._library_scan(force=True)
     months = scan['months']
-    assert len(months) == app_module.LIBRARY_HISTORY_MONTHS, len(months)
+    assert len(months) == library_module.LIBRARY_HISTORY_MONTHS, len(months)
     keys = [m['month'] for m in months]
     assert keys == sorted(keys), 'series is not chronological'
     assert len(set(keys)) == len(keys), 'series has duplicate months'
@@ -103,7 +110,7 @@ def test_month_series_is_dense_and_ends_now():
 
 def test_top_artists_ranked_by_size():
     _seed(DEFAULT)
-    scan = app_module._library_scan(force=True)
+    scan = library_module._library_scan(force=True)
     names = [a['artist'] for a in scan['top_artists']]
     assert names[0] == 'Foo Fighters', names   # 1600 KB across two files
     assert set(names) == {'Foo Fighters', 'Nirvana', 'Weezer'}, names
@@ -115,7 +122,7 @@ def test_top_artists_ranked_by_size():
 
 def test_recent_is_newest_first_with_clean_titles():
     _seed(DEFAULT)
-    scan = app_module._library_scan(force=True)
+    scan = library_module._library_scan(force=True)
     stamps = [r['added_at'] for r in scan['recent']]
     assert stamps == sorted(stamps, reverse=True), 'recent is not newest-first'
     titles = [r['title'] for r in scan['recent']]
@@ -130,15 +137,15 @@ def test_artwork_status_rides_along_on_the_same_scan():
     this scan had just produced. That duplicate traversal was the whole reason
     the dashboard felt slow."""
     _seed(DEFAULT + [('Foo_Fighters', 'folder.jpg', 32, 1)])
-    scan = app_module._library_scan(force=True)
+    scan = library_module._library_scan(force=True)
     # Nirvana and Weezer have no artwork; Foo Fighters does.
     assert scan['missing_artwork'] == 2, scan['missing_artwork']
 
 
 def test_cache_is_used_and_invalidated_on_download():
     _seed(DEFAULT)
-    first = app_module._library_scan(force=True)
-    assert app_module._library_scan() is first, 'a fresh cache should be reused'
+    first = library_module._library_scan(force=True)
+    assert library_module._library_scan() is first, 'a fresh cache should be reused'
 
     # A completed download must make the next read see the new file. Without
     # this the five-minute TTL means you download something, look at the
@@ -147,7 +154,7 @@ def test_cache_is_used_and_invalidated_on_download():
     with open(os.path.join(d, 'Nirvana - Breed-ddddddddddd.mp4'), 'wb') as fh:
         fh.write(b'\0' * 1024)
     app_module.mark_video_downloaded('ddddddddddd', 'music_video_Nirvana')
-    assert app_module._library_scan()['videos'] == 5, 'cache survived a download'
+    assert library_module._library_scan()['videos'] == 5, 'cache survived a download'
 
 
 def test_stale_cache_is_served_immediately_and_refreshed_behind_the_request():
@@ -158,14 +165,14 @@ def test_stale_cache_is_served_immediately_and_refreshed_behind_the_request():
     refreshes in the background for the same reason.
     """
     _seed(DEFAULT)
-    app_module._library_scan(force=True)
-    app_module._LIBRARY_SCAN_CACHE['at'] = 0.0     # force stale
+    library_module._library_scan(force=True)
+    library_module._LIBRARY_SCAN_CACHE['at'] = 0.0     # force stale
 
     result = {}
 
     def call():
         started = time.time()
-        scan = app_module._library_scan()
+        scan = library_module._library_scan()
         result['elapsed'] = time.time() - started
         result['videos'] = scan['videos']
 
@@ -185,17 +192,17 @@ def test_concurrent_stale_reads_start_only_one_rescan():
     dashboard load, and the 60s auto-refresh repeats that — without a guard a
     stale cache would kick off a pile of concurrent walks of the same tree."""
     _seed(DEFAULT)
-    app_module._library_scan(force=True)
-    app_module._LIBRARY_SCAN_CACHE['at'] = 0.0
+    library_module._library_scan(force=True)
+    library_module._LIBRARY_SCAN_CACHE['at'] = 0.0
 
-    threads = [threading.Thread(target=app_module._library_scan) for _ in range(8)]
+    threads = [threading.Thread(target=library_module._library_scan) for _ in range(8)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=5)
     assert not any(t.is_alive() for t in threads), 'a concurrent stale read hung'
     time.sleep(0.5)   # let the single background rescan finish
-    assert app_module._library_scan()['videos'] == 4
+    assert library_module._library_scan()['videos'] == 4
 
 
 def test_scan_survives_an_empty_or_missing_root():
@@ -204,11 +211,11 @@ def test_scan_survives_an_empty_or_missing_root():
         'artwork_sync': {'root_path': os.path.join(_WORK, 'does-not-exist')},
         'plex_base_path': os.path.join(_WORK, 'does-not-exist'),
         '_secret_key': 'k'}, indent=4)
-    app_module._invalidate_library_scan()
-    scan = app_module._library_scan(force=True)
+    library_module._invalidate_library_scan()
+    scan = library_module._library_scan(force=True)
     assert scan['videos'] == 0 and scan['artists'] == 0, scan
     assert scan['bytes'] == 0
-    assert len(scan['months']) == app_module.LIBRARY_HISTORY_MONTHS
+    assert len(scan['months']) == library_module.LIBRARY_HISTORY_MONTHS
     assert scan['top_artists'] == [] and scan['recent'] == []
 
 
