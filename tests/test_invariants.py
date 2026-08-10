@@ -751,6 +751,68 @@ def test_retention_never_clears_the_download_tracker():
             'download/delete loop this prevents.')
 
 
+def test_every_metadata_probe_goes_through_probe_opts():
+    """v1.10.1. yt-dlp defaults to no socket deadline and 10 retries with
+    backoff, which is right for a download and wrong for anything a browser is
+    waiting on: one throttled response held the music-video search open until
+    the browser gave up with "Failed to fetch".
+
+    The fix was a single `_probe_opts()` helper carrying the bounds. This is what
+    stops the next probe from being added as a bare dict literal — a functional
+    test cannot catch it, because an unbounded probe works fine right up until
+    the day YouTube is slow.
+    """
+    code = '\n'.join(_code_lines(_read('app.py')))
+
+    # Every YoutubeDL construction in app.py is a metadata probe (downloads live
+    # in downloader.py, which keeps yt-dlp's patient defaults on purpose).
+    constructions = code.count('yt_dlp.YoutubeDL(')
+    assert constructions >= 4, (
+        f'expected at least 4 yt_dlp.YoutubeDL( sites in app.py, found '
+        f'{constructions} — if probes moved, update this invariant')
+
+    # No bare options dict may be handed to YoutubeDL. Matching the literal
+    # `ydl_opts = {` is the check: every probe should build its options via
+    # _probe_opts(...) instead, so the bounds cannot be forgotten.
+    assert 'ydl_opts = {' not in code, (
+        'app.py builds a yt-dlp options dict literally. Use _probe_opts(...) so '
+        'socket_timeout and the retry caps are always present — an unbounded '
+        'probe can hang an HTTP response indefinitely.')
+
+    helper_calls = code.count('_probe_opts(')
+    assert helper_calls >= constructions, (
+        f'{constructions} YoutubeDL sites but only {helper_calls} _probe_opts( '
+        'references (one is the def) — a probe is not using the helper')
+
+    for key in ('socket_timeout', 'retries', 'extractor_retries'):
+        assert key in code, f'PROBE_TIMEOUTS lost its {key!r} bound'
+
+
+def test_the_search_never_waits_on_its_own_thread_pool():
+    """The subtle half of the same fix.
+
+    `with ThreadPoolExecutor(...)` exits via shutdown(wait=True), which blocks
+    until every submitted probe finishes, and Future.cancel() returns False once
+    a task is running. Written that way, the wall-clock timeout is inert: the
+    endpoint still hangs for as long as the slowest probe while looking as though
+    it is bounded. tests/test_downloads.py proves the behaviour; this catches the
+    regression at the point someone "tidies up" the executor into a with-block.
+    """
+    code = '\n'.join(_code_lines(_read('app.py')))
+    start = code.find('def _enrich_video_qualities')
+    assert start != -1, '_enrich_video_qualities is gone — has the search changed?'
+    body = code[start:start + 2600]
+
+    assert 'with concurrent.futures.ThreadPoolExecutor' not in body, (
+        '_enrich_video_qualities uses ThreadPoolExecutor as a context manager. '
+        'Its __exit__ calls shutdown(wait=True) and blocks on every probe, so '
+        'the timeout stops working. Use an explicit '
+        'shutdown(wait=False, cancel_futures=True).')
+    assert 'wait=False' in body, (
+        '_enrich_video_qualities must shut its pool down with wait=False, or a '
+        'hanging probe still holds the response open')
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failures = 0

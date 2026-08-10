@@ -653,6 +653,23 @@ longer reachable from Windows via `localhost` — use the distro's IP for those.
 **Changing Vidshelf's port does not help** — WSL rebinds whatever port Docker
 publishes, and will follow it.
 
+### Music Video search says "Failed to fetch" or times out
+
+Fixed in **v1.10.1** — upgrade first. Before that release, the search asked
+YouTube for a quality label on each of 9 results one at a time with no network
+timeout, so a single slow response held the whole request open until the browser
+gave up. `Failed to fetch` is the browser's wording for a dead connection, not an
+error from Vidshelf.
+
+On v1.10.1+ the lookups are bounded and run concurrently, and the message tells
+you which layer failed. If you still see a timeout:
+
+- **YouTube is throttling you.** Wait a minute and retry. Results are cached per
+  artist, so a retry that succeeds is fast.
+- **You reach Vidshelf through a reverse proxy.** Raise its read timeout — nginx
+  and Nginx Proxy Manager default to 60s, and a cold search on a slow connection
+  can approach that. The search itself gives up at 45s.
+
 ### A feature disappears after working (watchtower)
 
 If you run [watchtower](https://containrrr.dev/watchtower/) and build Vidshelf
