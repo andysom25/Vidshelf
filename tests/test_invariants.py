@@ -619,6 +619,41 @@ def test_sized_bar_elements_are_not_inline():
         + '\n  '.join(offenders))
 
 
+def test_the_auto_refreshing_dashboard_never_calls_a_live_yt_dlp_endpoint():
+    """v1.9.1. /api/channels resolves each channel's display name with a live
+    yt-dlp extraction — measured at 23 seconds for a single channel.
+
+    v1.9.0 added a 60-second dashboard auto-refresh that fetched it. On an
+    install with channels that is continuous background load against YouTube,
+    and with three channels the work per cycle exceeds the cycle, so it never
+    catches up. The user who found the dashboard slow had zero channels, which
+    is the only reason it went unnoticed.
+
+    The dashboard needs the channel *count*, which /api/stats already reports.
+    Nothing on a timer may call the expensive endpoint.
+    """
+    js = _read(os.path.join('static', 'js', 'dashboard.js'))
+
+    # The body of loadDashboardStats() — the function the 60s timer calls.
+    start = js.index('async function loadDashboardStats(')
+    end = js.index('async function loadLibraryPanels(', start)
+    body = js[start:end]
+
+    assert "fetch('/api/channels')" not in body, (
+        'loadDashboardStats fetches /api/channels, which does a live yt-dlp '
+        'lookup per channel. It runs on a 60s timer. Use '
+        'statsData.channels_count from /api/stats instead.')
+    assert 'channels_count' in body, (
+        'the dashboard no longer reads channels_count — it must not go back to '
+        'counting via /api/channels')
+
+    # And the lookup itself must stay cached, for the Channels page's sake.
+    app_src = _read('app.py')
+    assert '_CHANNEL_NAME_CACHE' in app_src, (
+        'the channel-name cache is gone; the Channels page will pay ~23s per '
+        'channel on every visit again')
+
+
 def test_state_files_are_written_owner_only():
     """config.json holds the Plex token, the admin password hash and the session
     signing key, in a bind-mounted directory — 0644 meant any local user on the

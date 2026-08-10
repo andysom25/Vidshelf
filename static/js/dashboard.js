@@ -180,14 +180,17 @@
             let channelCount = 0;
             let downloadsCount = 0;
             try {
-                const [chResp, statsResp] = await Promise.all([
-                    fetch('/api/channels'),
-                    fetch('/api/stats')
-                ]);
-                const chData = await chResp.json();
+                // Deliberately NOT /api/channels. That endpoint resolves each
+                // channel's display name with a live yt-dlp extraction —
+                // measured at 23 seconds for one channel — so calling it from a
+                // 60-second auto-refresh meant continuous background hammering
+                // of YouTube, and with three channels the work per cycle
+                // exceeded the cycle. /api/stats already reports the count,
+                // which is all the dashboard needs.
+                const statsResp = await fetch('/api/stats');
                 const statsData = await statsResp.json();
-                if (chData.channels) {
-                    channelCount = chData.channels.length;
+                if (statsData.channels_count !== undefined) {
+                    channelCount = statsData.channels_count;
                     document.getElementById('stat-channels').textContent = channelCount;
                 }
                 // The channel cards are hidden entirely with no channels. An
