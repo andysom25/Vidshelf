@@ -985,6 +985,12 @@
 
         let musicVideoSearchPage = 1;
 
+        // Comfortably above what the server allows itself: the search is a few
+        // seconds plus PROBE_WALL_CLOCK_TIMEOUT (25s) for the quality labels, so
+        // a healthy request finishes well inside this. Set it below the server's
+        // own ceiling and the client would abort work that was about to succeed.
+        const MUSIC_SEARCH_TIMEOUT_MS = 45000;
+
         function renderMusicVideoCard(v) {
             const thumb = v.thumbnail || '';
             const title = v.title || v.id;
@@ -1077,12 +1083,38 @@
             btn.disabled = true;
             btn.textContent = '⏳ Searching...';
 
+            // Give up deliberately rather than waiting forever. The server now
+            // bounds its own work (see PROBE_WALL_CLOCK_TIMEOUT in app.py), so
+            // this ceiling only ever fires if something between the browser and
+            // the app is at fault — a proxy, the container going away mid-flight
+            // — and it exists so that case produces a sentence instead of the
+            // browser's bare "Failed to fetch", which names nothing.
+            const controller = new AbortController();
+            const abortTimer = setTimeout(() => controller.abort(), MUSIC_SEARCH_TIMEOUT_MS);
             try {
                 const resp = await fetch('/api/music-videos/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ artist: musicVideoSearchArtist, page: musicVideoSearchPage })
+                    body: JSON.stringify({ artist: musicVideoSearchArtist, page: musicVideoSearchPage }),
+                    signal: controller.signal
                 });
+
+                // Check the status before parsing. A proxy 502/504 has an HTML
+                // body, so resp.json() throws a JSON syntax error and the user
+                // is shown "Unexpected token <" — a parser complaint standing in
+                // for "your reverse proxy timed out".
+                if (!resp.ok) {
+                    let detail = '';
+                    try {
+                        const body = await resp.json();
+                        detail = body.error ? ': ' + body.error : '';
+                    } catch (_) { /* not JSON — the status code is the whole story */ }
+                    status.innerHTML = '<div class="empty-state"><p>Search failed — the server returned '
+                        + resp.status + ' ' + escapeHtml(resp.statusText || '') + escapeHtml(detail)
+                        + '.</p></div>';
+                    return;
+                }
+
                 const data = await resp.json();
 
                 if (data.error) {
@@ -1105,8 +1137,25 @@
 
                 if (data.has_more) addMusicVideoLoadMoreButton(grid);
             } catch (e) {
-                status.innerHTML = '<div class="empty-state"><p>Failed to search: ' + escapeHtml(e.message) + '</p></div>';
+                // "Failed to fetch" is the browser's TypeError for a connection
+                // that died, and on its own it is indistinguishable from an
+                // application bug — it sent one real report chasing the wrong
+                // layer. Say which of the two things happened, and what to try.
+                let msg;
+                if (e.name === 'AbortError') {
+                    msg = 'Search timed out after ' + Math.round(MUSIC_SEARCH_TIMEOUT_MS / 1000)
+                        + 's. YouTube may be throttling requests — try again in a moment. '
+                        + 'If you reach Vidshelf through a reverse proxy, check its read timeout.';
+                } else if (e instanceof TypeError) {
+                    msg = 'Could not reach the server (' + escapeHtml(e.message)
+                        + '). The connection dropped rather than the search failing — '
+                        + 'check the container is still running: docker ps';
+                } else {
+                    msg = 'Failed to search: ' + escapeHtml(e.message);
+                }
+                status.innerHTML = '<div class="empty-state"><p>' + msg + '</p></div>';
             } finally {
+                clearTimeout(abortTimer);
                 btn.disabled = false;
                 btn.textContent = '🔍 Search';
             }

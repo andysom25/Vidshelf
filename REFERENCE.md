@@ -5523,3 +5523,125 @@ other file shows `i/lf`). CRLF normalisation was therefore skipped for it, and
 removing the stray CR causes the whole file to re-diff once as its blob joins the
 repo convention. The v1.10.0 diff for `ci.yml` is that one-time normalisation
 plus five real added lines. Nothing else about the workflow changed.
+
+
+---
+
+## v1.10.1 — "Failed to search: Failed to fetch", and why that message cost time
+
+Reported immediately after upgrading to v1.10.0, which made it look like a release
+regression. It was not: `git diff v1.9.2..v1.10.0 -- app.py` touches nothing in
+the search path (the only change was removing two dead dict fields), and the
+feature has behaved this way since it shipped. **Check that before diagnosing —
+"it broke after I upgraded" and "the upgrade broke it" are different claims, and
+the diff settles which one you have in seconds.**
+
+### The message is the first lesson
+
+`Failed to search: Failed to fetch` came from:
+
+```javascript
+} catch (e) {
+    status.innerHTML = '... Failed to search: ' + escapeHtml(e.message) + ' ...';
+}
+```
+
+`"Failed to fetch"` is Chrome's `TypeError` message for a connection that died
+before a response arrived. Concatenating it after "Failed to search:" produces a
+sentence that reads like the *application* failed, when it means the opposite: the
+app never got the chance to answer. The first pass at diagnosing this went looking
+at the search code.
+
+Two things follow from it, and both are now in the code:
+
+- **The route cannot produce that string.** It ends in
+  `except Exception as e: return jsonify({'error': str(e)}), 500`, and the UI
+  renders that as `Error: <message>`. So seeing `Failed to fetch` *proves* the
+  response never arrived — a genuinely useful deduction, available only if you
+  know which error text belongs to which layer.
+- **Absence of log lines proved nothing.** The first instinct was "nothing in
+  `docker logs` for the search, so the request never arrived." Wrong: waitress
+  does no access logging and that route logged nothing, so a request that failed
+  *inside* the app would have been equally silent. A silent log is evidence only
+  when you know something would have spoken.
+
+### The actual cause
+
+`/api/music-videos/search` enriches each of the 9 results on a page with a
+quality label from `get_video_formats_info()`, which was:
+
+```python
+ydl_opts = {'quiet': True, 'no_warnings': True}
+```
+
+No `socket_timeout` and no `retries` — anywhere in the codebase; `grep` across
+`app.py`, `downloader.py` and `artwork_sync.py` found neither. yt-dlp then applies
+its defaults: no socket deadline, 10 retries with escalating backoff. Correct for
+a download, where patience is the point. Fatal for an HTTP handler, because the 9
+probes ran **serially** and any one of them could stall the whole response until
+the browser abandoned it.
+
+Measured on a healthy day, which is why this was invisible in testing: the search
+itself is 3.2s, and the 9 serial probes added 9.7s. Throttle one probe and the
+request simply never ends.
+
+### The fix, and the trap inside the fix
+
+Three parts:
+
+1. `PROBE_TIMEOUTS` + `_probe_opts(**extra)` — one helper carrying
+   `socket_timeout=15`, `retries=2`, `extractor_retries=1`, used by all four
+   metadata probes in `app.py`. **`downloader.py` deliberately keeps yt-dlp's
+   patient defaults**; a download is not something a browser waits on.
+2. `_enrich_video_qualities()` — the 9 probes run on a 6-worker pool with a 25s
+   wall-clock ceiling, each failure contained to one video's label. Search time
+   dropped from ~13s to 6.7s as a side effect.
+3. Client side: an `AbortController` at 45s (above the server's own ceiling, so it
+   can only fire when something *between* browser and app is at fault), a
+   `resp.ok` check before parsing, and messages that name the layer.
+
+**The trap.** The obvious implementation is wrong in a way that still looks right:
+
+```python
+with concurrent.futures.ThreadPoolExecutor(...) as pool:      # WRONG
+    ...
+    for fut in pending:
+        fut.cancel()
+```
+
+`__exit__` calls `shutdown(wait=True)`, which **blocks until every submitted probe
+finishes**, and `Future.cancel()` returns `False` for anything already running. So
+the timeout is completely inert — the endpoint hangs for exactly as long as it did
+before, while the code reads as though it is bounded. This was written that way
+first and caught only by a test that measured elapsed time.
+
+The correct form is an explicit pool with
+`shutdown(wait=False, cancel_futures=True)` in a `finally`: it returns
+immediately and lets the orphaned threads finish into a result nobody reads.
+
+`socket_timeout` alone is also not sufficient, which is why the wall-clock ceiling
+exists too: yt-dlp spends time outside socket reads (DNS, extractor parsing, its
+own sleeps between retries), so bounding the socket does not bound the endpoint.
+
+### Tests
+
+- `test_a_hanging_quality_probe_cannot_stall_the_search` — substitutes a probe
+  that sleeps 20s, sets the ceiling to 2s, and **asserts on elapsed time**. It
+  fails at 20.0s against the `with`-block version, which is the whole reason it
+  exists. Also asserts the healthy probes still return real labels, so "degrade
+  everything when one is slow" cannot pass.
+- `test_a_raising_quality_probe_does_not_fail_the_search`,
+  `test_already_enriched_videos_are_not_reprobed`,
+  `test_every_metadata_probe_is_bounded`.
+- Two invariants: no bare `ydl_opts = {` literal may exist in `app.py` (every
+  probe must go through the helper — an unbounded probe works perfectly until the
+  day YouTube is slow, so no functional test can catch its addition), and
+  `_enrich_video_qualities` must not use the executor as a context manager.
+
+Both invariants were mutation-checked against the exact regressions they describe.
+
+### Unrelated but visible in the same logs
+
+`WARNING:artwork_sync:Failed to list library items ... 192.168.1.218:32400 ...
+Connection refused` — the Plex server was down. Worth separating from the search
+failure rather than assuming one story explains both lines in a log.

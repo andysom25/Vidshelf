@@ -478,13 +478,39 @@ def get_channel_info(channel_url, force=False):
     return name
 
 
+# Bounds on every metadata-only yt-dlp call. These are NOT cosmetic.
+#
+# yt-dlp's defaults are tuned for "get the file eventually": no socket deadline
+# at all, and 10 retries with escalating backoff. That is right for a download
+# and wrong for anything a browser is waiting on, because a single throttled
+# response stalls the HTTP request indefinitely. The music-video search made 9
+# of these calls in series, so one slow probe took the whole response down and
+# the UI reported "Failed to search: Failed to fetch" -- the browser's own
+# message for a dead connection, naming nothing and pointing nowhere.
+#
+# Deliberately applied to metadata probes only. The download path in
+# downloader.py keeps yt-dlp's patient defaults, because there a retry is the
+# difference between getting the video and not.
+PROBE_TIMEOUTS = {
+    'socket_timeout': 15,
+    'retries': 2,
+    'extractor_retries': 1,
+}
+
+
+def _probe_opts(**extra):
+    """yt-dlp options for a metadata-only call, with the timeouts applied.
+
+    Everything that calls extract_info(download=False) should build its options
+    through here, so a new probe cannot be added without bounds by forgetting to
+    copy three keys. tests/test_invariants.py enforces that.
+    """
+    return {'quiet': True, 'no_warnings': True, **PROBE_TIMEOUTS, **extra}
+
+
 def _fetch_channel_name(channel_url):
     try:
-        ydl_opts = {
-            'quiet': True,
-            'extract_flat': True,
-            'dump_single_json': True,
-        }
+        ydl_opts = _probe_opts(extract_flat=True, dump_single_json=True)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(channel_url, download=False)
             return info.get('channel') or info.get('uploader') or 'Unknown Channel'
@@ -498,11 +524,7 @@ def get_channel_videos(channel_url):
     elif '/channel/' in channel_url and not channel_url.endswith('/videos'):
         channel_url = channel_url.rstrip('/') + '/videos'
 
-    ydl_opts = {
-        'quiet': True,
-        'extract_flat': True,
-        'dump_single_json': True,
-    }
+    ydl_opts = _probe_opts(extract_flat=True, dump_single_json=True)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info_dict = ydl.extract_info(channel_url, download=False)
         entries = info_dict.get('entries', [])
@@ -551,11 +573,7 @@ def search_music_videos(artist):
     all_results = []
     
     for query in queries:
-        ydl_opts = {
-            'quiet': True,
-            'extract_flat': True,
-            'dump_single_json': True,
-        }
+        ydl_opts = _probe_opts(extract_flat=True, dump_single_json=True)
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 results = ydl.extract_info(query, download=False)
@@ -687,10 +705,7 @@ def rank_videos_by_quality(videos, artist):
 def get_video_formats_info(video_id):
     """Get available format qualities for a video to determine best quality available."""
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-        }
+        ydl_opts = _probe_opts()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
             formats = info.get('formats', [])
@@ -735,6 +750,68 @@ def get_video_formats_info(video_id):
             'channel': None,
             'view_count': None,
         }
+
+
+# One page of search results is 9 videos; 6 at a time keeps the wall-clock close
+# to a single probe without opening nine simultaneous connections to YouTube,
+# which is the behaviour that got the dashboard throttled in v1.9.2.
+PROBE_CONCURRENCY = 6
+# Belt and braces over socket_timeout. yt-dlp can spend time outside a socket
+# read (DNS, extractor parsing, its own sleeps between retries), so the only way
+# to bound the endpoint is to stop waiting on the future as well.
+PROBE_WALL_CLOCK_TIMEOUT = 25
+
+
+def _enrich_video_qualities(page_videos):
+    """Fill in 'best_quality' for a page of search results, in parallel.
+
+    Never raises, and never leaves the caller without a response: a probe that
+    fails or overruns yields 'unknown' for that one video. Returns the number
+    that could not be resolved, for logging.
+    """
+    todo = [v for v in page_videos if 'best_quality' not in v]
+    if not todo:
+        return 0
+
+    unresolved = 0
+    # NOT `with ThreadPoolExecutor(...)`. The context manager exits via
+    # shutdown(wait=True), which blocks until every probe finishes — and
+    # Future.cancel() returns False for anything already running. Using it here
+    # would make PROBE_WALL_CLOCK_TIMEOUT completely inert: the endpoint would
+    # still hang for as long as the slowest probe, exactly the bug being fixed,
+    # while looking like it had a timeout. shutdown(wait=False) returns
+    # immediately and lets the orphaned threads finish into a result nobody
+    # reads.
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(PROBE_CONCURRENCY, len(todo)),
+        thread_name_prefix='probe')
+    try:
+        futures = {pool.submit(get_video_formats_info, v['id']): v for v in todo}
+        try:
+            done, pending = concurrent.futures.wait(
+                futures, timeout=PROBE_WALL_CLOCK_TIMEOUT)
+        except Exception:       # noqa: BLE001 - wait() itself must not sink the request
+            done, pending = set(), set(futures)
+        for fut in done:
+            v = futures[fut]
+            try:
+                v['best_quality'] = fut.result().get('best_quality', 'unknown')
+            except Exception:   # noqa: BLE001
+                v['best_quality'] = 'unknown'
+                unresolved += 1
+        for fut in pending:
+            # Set it rather than leaving it absent. These dicts ARE the cached
+            # objects, so an absent key means the next page request re-probes —
+            # which is right. What must not happen is the request waiting on it.
+            futures[fut]['best_quality'] = 'unknown'
+            unresolved += 1
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    if unresolved:
+        print(f'[search] {unresolved}/{len(todo)} quality probes did not resolve '
+              f'within {PROBE_WALL_CLOCK_TIMEOUT}s; labelled unknown', flush=True)
+    return unresolved
 
 
 # ---------- Routes ----------
@@ -1650,10 +1727,16 @@ def api_music_videos_search():
         # Enrich only this page — these dicts are the same objects held in
         # the cache, so a video that reappears (e.g. overlap between pages
         # after a re-search) doesn't get re-probed either.
-        for v in page_videos:
-            if 'best_quality' not in v:
-                fmt_info = get_video_formats_info(v['id'])
-                v['best_quality'] = fmt_info.get('best_quality', 'unknown')
+        #
+        # Concurrently, and with each probe's failure contained. This loop used
+        # to be serial and unguarded, which made the whole endpoint as slow as
+        # the sum of 9 network round-trips and as reliable as the worst one of
+        # them: a single probe that hung took the entire HTTP response with it,
+        # and the browser reported "Failed to fetch" — its message for a dead
+        # connection, which names nothing and sends you looking in the wrong
+        # place. Ask for a quality label, get 'unknown' if it doesn't arrive;
+        # never trade the search results for it.
+        _enrich_video_qualities(page_videos)
 
         return jsonify({
             'videos': page_videos,
