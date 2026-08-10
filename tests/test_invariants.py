@@ -14,19 +14,120 @@ invariant that fails loudly in CI beats a comment nobody reads at the moment
 they're changing the line.
 """
 
+import glob
 import os
 import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PY_FILES = ['app.py', 'downloader.py', 'transcode.py', 'artwork_swap.py',
-            'artwork_sync.py', 'state.py', 'updates.py', 'scheduler.py',
-            'retention.py', 'notify.py', 'titles.py']
+
+# The modules that together make up the web application. Everything that used to
+# live in app.py is in here, so an invariant written against "the app" keeps
+# holding after code moves between these files.
+#
+# WHY THIS EXISTS (v1.11.0). Ten invariants below used to read _read('app.py')
+# directly. Splitting app.py into blueprints did not fail any of them — it
+# *satisfied* them, silently, because the pattern each one forbids was no longer
+# in the single file being read. Five of those ten guard bugs that actually
+# shipped (the v1.6.1/v1.7.0 missing auth checks, v1.8.0's dropped cookies,
+# v1.10.1's unbounded probe and its inert timeout). A refactor that disarms them
+# without a single test going red is precisely the failure REFERENCE.md already
+# records for the retention invariant: "defeated by any rename."
+#
+# Membership is asserted against the filesystem by
+# test_the_app_source_list_covers_every_route_module, so a new blueprint cannot
+# be added outside the guards' view.
+APP_MODULES = ['app.py', 'config_store.py', 'webauth.py', 'tracker.py',
+               'youtube.py', 'library.py']
+
+_NON_APP_MODULES = [
+    'downloader.py', 'transcode.py', 'artwork_swap.py', 'artwork_sync.py',
+    'state.py', 'updates.py', 'scheduler.py', 'retention.py', 'notify.py',
+    'titles.py',
+]
+
+
+def _route_modules():
+    """Every blueprint module on disk, repo-relative and sorted."""
+    found = glob.glob(os.path.join(ROOT, 'routes', '*.py'))
+    return sorted(
+        os.path.relpath(p, ROOT).replace(os.sep, '/')
+        for p in found
+        if os.path.basename(p) != '__init__.py'
+    )
+
+
+def _app_sources():
+    """APP_MODULES plus every routes/*.py, skipping any that don't exist yet.
+
+    Tolerant of absence on purpose: this list is the target layout, and the
+    invariants must pass at every commit of the split rather than only at the
+    end. What is NOT tolerated is a route module on disk that isn't covered —
+    see test_the_app_source_list_covers_every_route_module.
+    """
+    names = [n for n in APP_MODULES if os.path.exists(os.path.join(ROOT, n))]
+    return names + _route_modules()
 
 
 def _read(name):
     with open(os.path.join(ROOT, name), encoding='utf-8') as fh:
         return fh.read()
+
+
+def _read_app_sources():
+    """The whole web application as one raw string.
+
+    Replaces _read('app.py') in every invariant that is about the app rather than
+    about one particular file.
+    """
+    return '\n'.join(_read(name) for name in _app_sources())
+
+
+def _app_code_by_file():
+    """[(name, code)] for each app module, comments and docstrings stripped.
+
+    Use this, not _app_code(), for anything that slices a WINDOW of source —
+    e.g. "the 2600 characters after `def _enrich_video_qualities`". In a
+    concatenated string such a window can run off the end of one file and into
+    the next, and then pass on the neighbouring file's text.
+
+    A `# ==== name ====` separator does not solve that: _code_lines() splits each
+    line on '#' and drops what's left when it's empty, so comment markers are
+    gone by the time a window is taken. Keeping the files apart is the fix.
+    """
+    return [(name, '\n'.join(_code_lines(_read(name)))) for name in _app_sources()]
+
+
+def _app_code():
+    """Every app module's code as one string, comments and docstrings stripped.
+
+    Fine for substring and count checks over the whole application. Not for
+    window slicing — see _app_code_by_file().
+    """
+    return '\n'.join(code for _, code in _app_code_by_file())
+
+
+def _find_in_app_code(needle):
+    """(name, code, index) for the one app module containing needle.
+
+    Returns (None, '', -1) if absent. Callers that slice a window use this so the
+    window is bounded by a single file, which is what stops it running past the
+    end of one module and asserting against the next one's text.
+    """
+    for name, code in _app_code_by_file():
+        at = code.find(needle)
+        if at != -1:
+            return name, code, at
+    return None, '', -1
+
+
+# PY_FILES is every module in the project, and several invariants read all of
+# them. Filtered by existence because APP_MODULES describes the target layout of
+# the v1.11.0 split: the modules appear one commit at a time, and an invariant
+# suite that crashes on a not-yet-created file is useless precisely during the
+# refactor it exists to police.
+PY_FILES = [n for n in APP_MODULES + _NON_APP_MODULES
+            if os.path.exists(os.path.join(ROOT, n))] + _route_modules()
 
 
 def _code_lines(source):
@@ -371,7 +472,7 @@ def test_every_download_call_site_passes_download_options():
     there would resolve config deep in a worker thread and hide exactly this
     class of omission again.
     """
-    src = _read('app.py')
+    src = _read_app_sources()
     # Each call spans several lines; look at a window after the opening paren.
     offenders = []
     for match in re.finditer(r'\bdownload_video\(', src):
@@ -423,7 +524,7 @@ def test_there_is_one_music_root_setting():
                 'config again — artwork_sync.root_path is the single source of '
                 f'truth. {line.strip()}')
 
-    app_src = _read('app.py')
+    app_src = _read_app_sources()
     literals = [ln.strip() for ln in _code_lines(app_src)
                 if "'/app/music_videos_final'" in ln
                 and 'DEFAULT_MUSIC_ROOT' not in ln]
@@ -445,13 +546,15 @@ def test_api_routes_are_guarded_by_the_decorator_not_by_hand():
     `dashboard()` is the one legitimate exception — it flashes and redirects to
     the login page rather than returning JSON.
     """
-    src = _read('app.py')
+    src = _read_app_sources()
     inline = [ln for ln in src.split('\n') if "if 'username' not in session:" in ln]
-    # One in dashboard(), one inside require_auth itself.
+    # One in dashboard(), one inside require_auth itself — wherever those two
+    # now live. Counted across every app module, so relocating a route cannot
+    # smuggle a hand-rolled check past this by leaving app.py.
     assert len(inline) <= 2, (
-        f'{len(inline)} hand-written session checks found; expected at most 2 '
-        '(dashboard() and require_auth itself). New routes should use '
-        '@require_auth.')
+        f'{len(inline)} hand-written session checks found across '
+        f'{len(_app_sources())} app modules; expected at most 2 (dashboard() and '
+        'require_auth itself). New routes should use @require_auth.')
     assert 'def require_auth(view):' in src, 'the require_auth decorator is gone'
     assert '@functools.wraps(view)' in src, (
         'require_auth must use functools.wraps — Flask derives the endpoint name '
@@ -503,7 +606,7 @@ def test_queue_depth_and_reconcile_share_one_status_list():
     them. If the two lists ever disagreed, a status counted by one and not
     cleared by the other would throttle channel monitoring forever — which is
     the v1.8.1 bug, in a new disguise."""
-    app_src = _read('app.py')
+    app_src = _read_app_sources()
     assert 'downloader_module.IN_FLIGHT_STATUSES' in app_src, (
         '_monitor_queue_depth no longer uses downloader.IN_FLIGHT_STATUSES; it '
         'must not keep its own copy of the status list')
@@ -542,7 +645,7 @@ def test_disk_usage_is_measured_from_the_media_roots():
     1024x too large. The pair hid each other: staging is usually near-empty, and
     "0.0 KB" looks correct however you divide it.
     """
-    src = _read('app.py')
+    src = _read_app_sources()
     assert "os.walk('./downloads')" not in src, (
         'disk usage is walking the staging directory again — it must measure '
         '_gather_media_roots(), which is the actual library')
@@ -648,7 +751,7 @@ def test_the_auto_refreshing_dashboard_never_calls_a_live_yt_dlp_endpoint():
         'counting via /api/channels')
 
     # And the lookup itself must stay cached, for the Channels page's sake.
-    app_src = _read('app.py')
+    app_src = _read_app_sources()
     assert '_CHANNEL_NAME_CACHE' in app_src, (
         'the channel-name cache is gone; the Channels page will pay ~23s per '
         'channel on every visit again')
@@ -690,7 +793,7 @@ def test_plex_token_is_never_returned_by_the_api():
     admin session could exfiltrate it with one fetch. The UI only ever needed to
     know whether one exists, which is what token_set reports.
     """
-    src = _read('app.py')
+    src = _read_app_sources()
     # Both GET handlers must strip it and expose the boolean instead.
     assert src.count("plex['token_set']") >= 2 or src.count("['token_set']") >= 2, \
         'token_set marker missing — did a GET handler stop stripping the token?'
@@ -762,22 +865,25 @@ def test_every_metadata_probe_goes_through_probe_opts():
     test cannot catch it, because an unbounded probe works fine right up until
     the day YouTube is slow.
     """
-    code = '\n'.join(_code_lines(_read('app.py')))
+    code = _app_code()
 
-    # Every YoutubeDL construction in app.py is a metadata probe (downloads live
-    # in downloader.py, which keeps yt-dlp's patient defaults on purpose).
+    # Every YoutubeDL construction in the web app is a metadata probe. Downloads
+    # live in downloader.py, which is deliberately NOT in APP_MODULES because it
+    # keeps yt-dlp's patient defaults on purpose.
     constructions = code.count('yt_dlp.YoutubeDL(')
     assert constructions >= 4, (
-        f'expected at least 4 yt_dlp.YoutubeDL( sites in app.py, found '
-        f'{constructions} — if probes moved, update this invariant')
+        f'expected at least 4 yt_dlp.YoutubeDL( sites across the app, found '
+        f'{constructions} — if probes moved out of APP_MODULES, this invariant '
+        'is no longer watching them')
 
     # No bare options dict may be handed to YoutubeDL. Matching the literal
     # `ydl_opts = {` is the check: every probe should build its options via
     # _probe_opts(...) instead, so the bounds cannot be forgotten.
-    assert 'ydl_opts = {' not in code, (
-        'app.py builds a yt-dlp options dict literally. Use _probe_opts(...) so '
-        'socket_timeout and the retry caps are always present — an unbounded '
-        'probe can hang an HTTP response indefinitely.')
+    offenders = [name for name, mod in _app_code_by_file() if 'ydl_opts = {' in mod]
+    assert not offenders, (
+        f'{", ".join(offenders)} builds a yt-dlp options dict literally. Use '
+        '_probe_opts(...) so socket_timeout and the retry caps are always '
+        'present — an unbounded probe can hang an HTTP response indefinitely.')
 
     helper_calls = code.count('_probe_opts(')
     assert helper_calls >= constructions, (
@@ -798,9 +904,12 @@ def test_the_search_never_waits_on_its_own_thread_pool():
     it is bounded. tests/test_downloads.py proves the behaviour; this catches the
     regression at the point someone "tidies up" the executor into a with-block.
     """
-    code = '\n'.join(_code_lines(_read('app.py')))
-    start = code.find('def _enrich_video_qualities')
-    assert start != -1, '_enrich_video_qualities is gone — has the search changed?'
+    # Located per-file, not in a concatenation of every app module: the window
+    # below is a fixed character count, and in a joined string it would happily
+    # run off the end of this function's file and start asserting against the
+    # next module's text.
+    owner, code, start = _find_in_app_code('def _enrich_video_qualities')
+    assert owner is not None, '_enrich_video_qualities is gone — has the search changed?'
     body = code[start:start + 2600]
 
     assert 'with concurrent.futures.ThreadPoolExecutor' not in body, (
@@ -811,6 +920,43 @@ def test_the_search_never_waits_on_its_own_thread_pool():
     assert 'wait=False' in body, (
         '_enrich_video_qualities must shut its pool down with wait=False, or a '
         'hanging probe still holds the response open')
+
+
+def test_the_app_source_list_covers_every_route_module():
+    """The guard on the guards (v1.11.0).
+
+    Every invariant that says "the app must never do X" reads _app_sources(). If a
+    module of the web app is outside that list, X becomes legal there — silently,
+    with the whole suite green. That is exactly how splitting app.py would have
+    disarmed ten invariants at once, five of them protecting bugs that shipped.
+
+    Two halves:
+      - every routes/*.py on disk is picked up (handled by globbing, asserted
+        here so the glob itself can't quietly stop matching)
+      - every module that registers a Flask route is inside _app_sources()
+    """
+    covered = set(_app_sources())
+
+    on_disk = set(_route_modules())
+    assert on_disk <= covered, (
+        f'route modules not covered by _app_sources(): {sorted(on_disk - covered)}')
+
+    # The real check: find anything that looks like a Flask view anywhere in the
+    # repo and insist it is covered. A new package (say `api/v2/`) would be
+    # invisible to the routes/*.py glob, and this is what notices.
+    route_markers = ('@app.route(', '.route(', 'Blueprint(')
+    uncovered = []
+    for path in glob.glob(os.path.join(ROOT, '**', '*.py'), recursive=True):
+        rel = os.path.relpath(path, ROOT).replace(os.sep, '/')
+        if rel.startswith(('tests/', '.venv/', 'venv/')) or rel in covered:
+            continue
+        code = '\n'.join(_code_lines(_read(rel)))
+        if any(marker in code for marker in route_markers):
+            uncovered.append(rel)
+    assert not uncovered, (
+        f'{", ".join(uncovered)} registers Flask routes but is not in '
+        'APP_MODULES / routes/. Every source-level invariant reads '
+        '_app_sources(), so code outside it is unguarded. Add it there.')
 
 
 def main():
