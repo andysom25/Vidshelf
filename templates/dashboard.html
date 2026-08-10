@@ -113,7 +113,16 @@
                 </div>
                 <div class="stat-card" onclick="navigateTo('downloads')">
                     <div class="stat-icon">✨</div>
-                    <div class="stat-label">Added (30 days)</div>
+                    <div class="stat-label">Added (30 days)
+                        <!-- The caveat matters enough to surface. Vidshelf has
+                             never recorded download timestamps — the tracker
+                             holds video ids and nothing else — so this counts
+                             files by modification time. Accurate for files
+                             Vidshelf wrote, wrong for anything moved by hand on
+                             the NAS. Title is set from the API's dates_from so
+                             the explanation can't drift from the source. -->
+                        <span class="stat-hint" id="added-30d-hint" title="">ⓘ</span>
+                    </div>
                     <div class="stat-value" id="stat-added-30d">--</div>
                 </div>
             </div>

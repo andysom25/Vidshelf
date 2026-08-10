@@ -56,6 +56,11 @@ python tests/test_download_state.py# interrupted downloads, history pruning, cop
 python tests/test_library.py       # library scan, caching, chart series
 python tests/test_invariants.py    # source-level rules for bugs CI can't reproduce
 node tests/test_artists_filter.js   # Artists page search/filter/sort logic
+
+# Optional, and skipped (exit 0) unless a live instance is configured and
+# Playwright is installed. Catches the bugs only a rendered page shows.
+pip install playwright && playwright install chromium
+VIDSHELF_URL=http://127.0.0.1:5000 VIDSHELF_PASSWORD=... python tests/test_browser.py
 ```
 
 Plain assertions, no pytest and no `npm install` — so they run identically on

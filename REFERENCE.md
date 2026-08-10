@@ -5250,3 +5250,276 @@ git cherry-pick <the orphaned commit>
 A plain reset would have silently discarded the fix — which, given the fix was
 for a bug that quietly hammers YouTube, would have been a quiet loss of a quiet
 fix.
+
+
+---
+
+## v1.10.0 — closing the "no test can see the page" gap, and four fixes
+
+Three consecutive patch releases after v1.9.0 each fixed a dashboard bug that a
+person spots instantly and that no test in this repo could reach:
+
+| Release | Bug | What found it |
+|---|---|---|
+| v1.8.2 | disk card wrong, chart empty, artwork count wrong | a screenshot |
+| v1.9.1 | Top Artists bars rendered at 0 px | a screenshot |
+| v1.9.2 | refresh loop hammering YouTube, ~23 s per channel | reading the code |
+| v1.10.0 | axis labels stretched ~3× horizontally | a screenshot |
+
+Every suite here asserts either on source text or on JSON from the Flask test
+client. Both are blind to layout, and two of the four above had a **correct DOM
+and correct data** — `display: inline` ignored the widths, and
+`preserveAspectRatio="none"` distorted the glyphs. Nothing threw, nothing 500'd,
+no assertion could have failed. The pattern was not "we keep writing bugs"; it
+was "the last inch of this application is unobserved."
+
+### `tests/test_browser.py` — Playwright, optional, skips clean
+
+Six checks against a **rendered** page: the stats populate with real values, the
+Top Artists bars have non-zero width, the chart draws bars, the auto-refresh does
+not touch a live-yt-dlp endpoint, no console errors, and no panel is still on
+"Loading…".
+
+Three design constraints, each load-bearing:
+
+- **Not in `requirements.txt`, and not a dev dependency.** `pip install
+  playwright` does *not* download browsers — `playwright install chromium` is a
+  separate ~130 MB step. Making that mandatory would break this project's rule
+  that the suite runs with nothing but `requirements.txt`. Falls back to
+  `channel='chrome'` when no bundled browser is present, so an installed Chrome
+  is enough.
+- **Skips with exit 0** when Playwright is missing or `VIDSHELF_URL` /
+  `VIDSHELF_PASSWORD` are unset. It is wired into `ci.yml` in exactly that
+  state — which sounds pointless but catches a syntax error or a broken skip
+  path in the file itself, rather than discovering it mid-release-drill.
+- **Waits on data, not on elements.** The first version waited for
+  `'#top-artists .dash-row, #top-artists .text-muted'` — and `.text-muted` *is*
+  the "Loading…" placeholder, so the selector matched immediately and every
+  assertion ran against an unpopulated page. On a cold cache it reported the
+  application as broken; once the cache warmed, the identical test passed. It now
+  waits for `#stat-artists` to hold something other than `--`. **A check whose
+  result depends on timing is telling you about the timing.**
+
+### `prerelease.ps1` — the drill CI structurally cannot run
+
+Sequence: unit suite → build → throwaway container on a spare port → mount
+reality check → write/`utime`/`chmod` probe → library scan → anonymous-access
+sweep → browser smoke test → upgrade from the previous release's image on the
+same data directory → **print what was not covered**.
+
+The last step matters as much as the checks. A green run that stays silent about
+its blind spots reads as "everything verified"; a real download and a real Plex
+sync are still manual, and the script says so.
+
+The `utime`/`chmod` probe exists because that exact syscall is what v1.6.1's
+`cap_drop: ALL` removed (`CAP_FOWNER`) and v1.8.1 restored — and v1.6.1's
+verification *did* test the mount, by reading and writing to it. Read and write
+both worked. The capability gated neither. **A measurement is only as good as
+the configuration it was taken on** — the same lesson as the decoy volume
+(CLAUDE.md gotcha #1) and v1.8.2's disk card, which looked right because leaked
+staging files happened to make it add up.
+
+Two Windows/PowerShell traps hit while writing it, both worth knowing:
+
+- **PowerShell variables are case-insensitive.** A parameter `$Name` and a local
+  `$name` are the *same variable*. This silently corrupted the container name
+  passed to `docker exec`, and `2>$null` on the failing call hid the error
+  entirely. Renamed to `$ProbeName`. Do not rely on case to distinguish
+  PowerShell variables — it does not work, and it fails quietly.
+- **`MSYS_NO_PATHCONV=1` breaks `curl -o /dev/null`** under Git Bash: the path
+  is passed through literally, curl fails with exit 23 and writes nothing. This
+  produced three consecutive false "0 bytes returned" readings that were
+  explained away twice as an application problem before anyone checked the exit
+  code. Check the exit code before theorising.
+
+### Fix: boilerplate removal left square brackets standing
+
+`titles.clean_video_title` strips phrases like "(Official Video)", then tidies up
+the punctuation left behind. The tidy-up only ever knew about **parentheses**:
+
+```
+'... Planetary (GO!) [Official Video] [HD]'   ->  '... Planetary (GO!) [] [HD]'
+'... [Official Video - 4K Film Restored]'     ->  '... [ - 4K Film Restored]'
+'Artist - Song [Official Music Video]'        ->  'Artist - Song []'
+```
+
+`_EMPTY_PARENS_RE`, `_DANGLING_DASH_BEFORE_PAREN_RE` and
+`_DANGLING_DASH_AFTER_PAREN_RE` matched `(` and `)` only, so any uploader who
+brackets their boilerplate got residue. Visible on the dashboard's Recently Added
+panel, and headed for the **filename** of the next music-video download from such
+a channel.
+
+The fix is deliberately *not* a second set of bracket-specific patterns — that is
+how the two styles drifted apart in the first place. The three rules now use
+character classes with a backreference, so a third style cannot fall out of sync:
+
+    _DANGLING_DASH_BEFORE_CLOSE_RE = re.compile(r'\s*-\s*([\)\]])')
+    _DANGLING_DASH_AFTER_OPEN_RE   = re.compile(r'([\(\[])\s*-\s*')
+    _EMPTY_GROUP_RE                = re.compile(r'\(\s*\)|\[\s*\]')
+
+Existing files self-correct on the dashboard, because `_library_scan` cleans the
+filename stem at render time (`app.py:1050`) rather than storing a cleaned copy.
+Files on disk keep their names; Settings → Clean Up Titles is still the fix for
+Plex.
+
+`tests/test_titles.py` gained four cases, two of them named for the exact
+reproductions above and one a property sweep over {3 phrases} × {5 wrappers}
+asserting no output contains `()`, `[]`, a dangling dash, or a lost song title.
+Both fail against the pre-fix code — verified by reverting the three patterns and
+re-running, not assumed.
+
+### End-to-end proof of the bracket fix, on a real download
+
+The unit tests use synthetic titles. This is the real one, downloaded through the
+UI of a v1.10.0 container mounted against the real NAS:
+
+    raw title from YouTube:
+      My Chemical Romance - The Ghost Of You [Official Music Video - 4K Film Restored]
+
+    v1.10.0 writes:  ... - The Ghost Of You [4K Film Restored]-uCUpvTMis-Y.mp4
+    v1.9.2 wrote:    ... - The Ghost Of You [ - 4K Film Restored]-uCUpvTMis-Y.mp4
+
+Both produced by running `build_music_video_title` on the identical raw string,
+with the pre-fix regexes reconstructed in the same interpreter — an A/B on one
+input, not two separate observations. The v1.9.2 name was already sitting in the
+library from an earlier download, which is what made the comparison free.
+
+The download also exercised two paths worth recording as verified together:
+
+- `_copystat_best_effort` logged
+  `could not copy timestamps/mode ... [Errno 1] Operation not permitted` and
+  **continued to completion**. That is v1.8.1's fix working under the real
+  `cap_drop: ALL` config, on a real CIFS write, at 58 MB. Before v1.8.1 this
+  aborted every download to the NAS.
+- Staging was left with **zero** files afterwards, so the move out of
+  `./downloads/music_videos` is not leaking intermediates — the leak that made
+  v1.8.2's disk card look correct for the wrong reason.
+
+### The trap this test walked into: an empty tracker re-downloads
+
+The throwaway container had its own empty `data/`, so `downloaded_videos.json`
+had no record of `uCUpvTMis-Y` and the download proceeded even though the file
+already existed on the NAS under its old name. Result: two byte-identical copies
+(same md5) under two different names.
+
+Worth knowing before running this kind of test again:
+
+- **The tracker, not the filesystem, is what prevents a re-download.** There is
+  no "does a file for this video id already exist" check on the media root — and
+  adding one is not free, because the filename is not derivable from the video id
+  alone once naming rules change, which is exactly the situation here.
+- **A throwaway container pointed at the real media root is therefore a writer,
+  not a reader.** Either seed it with a copy of the real tracker, or expect to
+  clean up after it. Mounting the media volume `:ro` is the safer default when the
+  test does not actually need to download.
+- The duplicate was removed by hashing both copies first and deleting only on an
+  exact match, with the delete refusing to run if the other copy was missing.
+  Given the staging sweep incident (640 MB of library deleted because safety was
+  derived from the current config rather than from the file itself), any delete
+  touching the media root should verify the specific bytes it is about to remove
+  are recoverable, at the moment it removes them.
+
+### Also verified during the same drill
+
+- `sort -V` ranks `v1.10.0` above `v1.9.2`, so `ci.yml`'s `is_newest` check moves
+  `:latest` correctly across the 1.9 -> 1.10 boundary. This was the specific
+  worry behind "harden at 1.10 does not make sense when we are on 1.9.2" and it
+  is worth having confirmed rather than assumed, because a string comparison
+  would get it wrong.
+- All five non-dashboard pages (Channels, Downloads, Music Videos, Artists,
+  Settings) render with no horizontal overflow and no console errors on the new
+  CSS. The classes the typography work touched (`.stat-card`, `.stat-label`,
+  `.stat-value`) appear only in `templates/dashboard.html`, but `dashboard.css` is
+  the global stylesheet, so "only the dashboard uses it" is a claim to check
+  rather than assume.
+
+### Fix: the chart stretched its own axis labels
+
+`renderAddedChart` drew into a fixed `viewBox` and scaled it to the panel with
+`preserveAspectRatio="none"`. That is correct for the bars and wrong for
+everything else: on a desktop window the horizontal scale factor was ~3.3× and
+the vertical ~1×, so every glyph was stretched to roughly three times its
+intended width. It read as a bad font choice, which is why it survived a
+screenshot review.
+
+Now the chart measures `host.clientWidth` and draws a **1:1 viewBox** at real
+pixel size, with a resize redraw off the cached `lastLibraryScan`. Two related
+notes: SVG `<text>` does **not** inherit the page font stack, so `.dash-axis`
+sets `font-family: inherit` explicitly or the labels fall back to the browser
+default; and numeric month indices were replaced with names (`Oct`, `Dec`,
+`Feb`), which are shorter to read and unambiguous across a year boundary.
+
+Elsewhere: `font-variant-numeric: tabular-nums` on every figure that updates or
+sits in a column (`.stat-value`, `.dash-row-value`, `.dash-recent-when`), so a
+60-second refresh no longer changes a number's width; and `.dash-bar-empty`
+gives a zero month a dimmed stub, since nothing at all looks like a rendering
+fault.
+
+### Fix: Plex sync percentage compared a number to itself
+
+The Plex panel's denominator fell back to the filesystem artist count when Plex
+had not reported one — so the ratio became `n/n` and read as fully synced
+regardless of what Plex actually held. It now renders `--`. An honest blank beats
+a confident wrong number, and this is the same failure shape as the v1.8.2 disk
+card: a fallback that makes a broken measurement look healthy.
+
+### Fix: two dead fields removed from `/api/library/stats`
+
+`largest_artist_bytes` and `scanned_at` were added in v1.9.0 and read by nothing.
+`dates_from` was kept and is now *consumed* — the Added (30 days) card renders it
+into an info tooltip, so the caveat that the count comes from file modification
+time travels with the number instead of living only in a source comment.
+
+### Why 1.10.0 and not 1.9.3
+
+Asked directly during the release: "harden at 1.10 does not make sense when we
+are on 1.9.2?" It does — semver components are integers, not decimals, so
+`1.10.0 > 1.9.2` the same way Python 3.10 follows 3.9. The version job in
+`ci.yml` sorts with `sort -V`, which handles this correctly; a naive string
+comparison would not, which is worth remembering before anyone hand-rolls a
+version check.
+
+### Known, NOT fixed in v1.10.0: doubled artist when the folder and the title spell the name differently
+
+Visible in the v1.10.0 verification screenshot:
+
+    Matchbox 20 - Matchbox Twenty - Real World
+
+`build_music_video_title` tier 2 accepts an existing `" - "` only when the prefix
+matches the artist, using `_looks_like()` — which normalises case, spacing and
+punctuation but nothing else. The folder is `Matchbox_20`, so the artist is
+`Matchbox 20`; the uploader's title says `Matchbox Twenty`. Normalised, those are
+`matchbox20` and `matchboxtwenty`: not equal. Tier 2 declines, tier 3 prepends the
+folder's form, and the result carries the name twice in two spellings.
+
+This is a numeral-versus-word equivalence problem (`20`/`Twenty`, and equally
+`3`/`Three`, `&`/`and`, `II`/`2`), not a bug in the tier logic. Deliberately left
+alone because the cheap fixes are worse than the symptom:
+
+- **A numeral↔word table** silently corrupts artists whose names contain a
+  meaningful number — `Sum 41`, `Blink-182`, `Front 242` are not `Sum Forty-One`.
+- **Loosening `_looks_like` to a fuzzy/prefix match** would let a genuinely
+  different artist satisfy tier 2, which is the exact failure the strict check
+  exists to prevent (`Song - Live at X` must not be read as an artist prefix).
+- **Detecting "the title already starts with something artist-shaped"** cannot
+  distinguish that from a song title that happens to contain a dash.
+
+The honest fix is for tier 3 to notice that `rest` already contains a `" - "`
+whose prefix is *some* known artist folder — i.e. compare against the full
+canonical artist list rather than the single supplied name — and skip prepending
+in that case. That needs the artist list threaded into `build_music_video_title`,
+which is a signature change and worth doing with the v2.0.0 data model rather
+than as a patch.
+
+Affected files already on disk keep their names; nothing re-derives them. The
+scope is one file per artist whose own uploads use a different spelling than the
+folder.
+
+### Also: `ci.yml` line endings normalised
+
+The committed blob carried a single stray CR-CR-LF, which was enough for git to
+classify the file as non-text (`git ls-files --eol` showed `i/-text` where every
+other file shows `i/lf`). CRLF normalisation was therefore skipped for it, and
+removing the stray CR causes the whole file to re-diff once as its blob joins the
+repo convention. The v1.10.0 diff for `ci.yml` is that one-time normalisation
+plus five real added lines. Nothing else about the workflow changed.

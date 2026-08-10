@@ -42,9 +42,14 @@ jobs:
           # Source-level invariants for bugs that only manifest against a real
           # CIFS mount or container restart, so nothing else can catch them.
           python tests/test_invariants.py
-          python tests/test_titles.py
+          python tests/test_titles.py
           python tests/test_download_state.py
           python tests/test_library.py
+          # Skips (exit 0) here: no browser, no running instance, no Playwright.
+          # Run for real against a live container — prerelease.ps1 does that.
+          # Included anyway so a syntax error or a broken skip path in the
+          # smoke test is caught by CI rather than during a release drill.
+          python tests/test_browser.py
 
       # The Artists page's filter/sort logic is client-side, so it's tested by
       # running the real static/js/dashboard.js under node (already present on

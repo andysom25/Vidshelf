@@ -276,6 +276,10 @@
         // blink through an empty state for no reason.
         let dashboardFirstPaint = true;
 
+        // Kept so a window resize can redraw the chart at the new width
+        // without going back to the server for data that hasn't changed.
+        let lastLibraryScan = null;
+
         // ---------- Library panels (v1.9.0) ----------
         //
         // Everything below renders from ONE request. /api/library/stats does a
@@ -299,6 +303,7 @@
                     chart.innerHTML = `<p class="text-muted">${escapeHtml(data.error)}</p>`;
                     return;
                 }
+                lastLibraryScan = data;
                 renderLibrarySummary(data);
                 renderAddedChart(data.months || []);
                 renderTopArtists(data.top_artists || []);
@@ -323,6 +328,20 @@
             set('stat-artists', d.artists);
             set('stat-library-videos', d.videos);
             set('stat-added-30d', d.added_30d);
+            // dates_from was previously returned by the API and read by nobody.
+            // It exists to say WHERE the dates come from, and that belongs in
+            // front of the user: the tracker has never recorded download
+            // timestamps, so this counts files by modification time. Right for
+            // files Vidshelf wrote, wrong for anything moved by hand on the NAS.
+            const hint = document.getElementById('added-30d-hint');
+            if (hint) {
+                const basis = d.dates_from || 'file modification time';
+                hint.title = 'Counted by ' + basis + ', not a download log — '
+                           + 'Vidshelf has never recorded download timestamps. '
+                           + 'Accurate for videos it downloaded; files you moved '
+                           + 'or re-copied on your NAS will show the date of '
+                           + 'the move.';
+            }
             // Library Size shares an element with the old Disk Usage card, and
             // /api/stats already filled it from the same underlying scan.
             set('stat-disk', formatBytes(d.bytes));
@@ -349,42 +368,98 @@
                 return;
             }
 
-            const W = 320, H = 120, PAD_B = 16, PAD_L = 18;
+            // Draw at the container's ACTUAL pixel size so the viewBox scale is
+            // 1:1 and nothing is resampled.
+            //
+            // This previously used a fixed 320-unit viewBox with
+            // preserveAspectRatio="none", which stretched it to whatever width
+            // the panel happened to be — about 1050px on a desktop. Rects don't
+            // care, but text does: glyphs were scaled ~3.3x horizontally and 1x
+            // vertically, so every label rendered smeared and thin. Non-uniform
+            // scaling of an SVG is fine for geometry and never fine for type.
+            const W = Math.max(280, Math.round(host.clientWidth) || 320);
+            const H = Math.round(host.clientHeight) || 160;
+            const PAD_L = 30;   // room for the max-value label
+            const PAD_T = 10;   // so the tallest bar doesn't touch the top
+            const PAD_B = 22;   // month labels sit below the baseline
             const max = Math.max.apply(null, counts);
-            const usableH = H - PAD_B;
+            const plotH = H - PAD_B - PAD_T;
             const slot = (W - PAD_L) / months.length;
-            const barW = Math.max(3, slot * 0.62);
+            const barW = Math.max(4, Math.min(28, slot * 0.55));
+            const baseline = PAD_T + plotH;
 
-            // Two faint gridlines (max and half) give the bars a scale to be
-            // read against; more than that is noise at this size.
-            let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"`
-                    + ` aria-label="Videos added per month">`;
+            let svg = `<svg viewBox="0 0 ${W} ${H}" role="img"`
+                    + ` aria-label="Videos added per month, last ${months.length} months">`;
+
+            // Three gridlines: 0, half, max. Enough to read a bar against,
+            // few enough not to become texture.
             [0, 0.5, 1].forEach(frac => {
-                const y = usableH - (usableH * frac);
+                const y = (baseline - plotH * frac).toFixed(1);
                 svg += `<line class="dash-gridline" x1="${PAD_L}" y1="${y}" x2="${W}" y2="${y}"/>`;
+                const label = frac === 0 ? '0' : (frac === 1 ? String(max) : '');
+                if (label) {
+                    svg += `<text class="dash-axis dash-axis-y" x="${PAD_L - 7}" y="${y}"`
+                         + ` text-anchor="end" dominant-baseline="middle">${label}</text>`;
+                }
             });
-            svg += `<text class="dash-axis" x="0" y="9">${max}</text>`;
 
             months.forEach((m, i) => {
-                const h = max ? (m.count / max) * usableH : 0;
+                const h = max ? (m.count / max) * plotH : 0;
                 const x = PAD_L + (i * slot) + ((slot - barW) / 2);
-                const y = usableH - h;
-                // A month with zero gets a 1px stub so the axis stays legible
-                // and the gap is visibly a gap rather than a missing column.
-                const drawn = Math.max(h, m.count ? 2 : 1);
-                svg += `<rect class="dash-bar" x="${x.toFixed(1)}" y="${(usableH - drawn).toFixed(1)}"`
-                     + ` width="${barW.toFixed(1)}" height="${drawn.toFixed(1)}" rx="1">`
-                     + `<title>${escapeHtml(m.month)}: ${m.count}</title></rect>`;
-                // Label every other month so they never collide.
-                if (i % 2 === months.length % 2) {
-                    const label = escapeHtml(m.month.slice(5));   // "MM"
+                // A zero month gets a 2px stub, so a gap reads as a gap rather
+                // than as missing data.
+                const drawn = m.count ? Math.max(h, 3) : 2;
+                const cls = m.count ? 'dash-bar' : 'dash-bar dash-bar-empty';
+                svg += `<rect class="${cls}" x="${x.toFixed(1)}" y="${(baseline - drawn).toFixed(1)}"`
+                     + ` width="${barW.toFixed(1)}" height="${drawn.toFixed(1)}" rx="2">`
+                     + `<title>${escapeHtml(monthLabel(m.month, true))}: ${m.count}</title></rect>`;
+
+                // Label as many months as will fit without colliding. Short
+                // names ("Jul") read far faster than "07", and the year is
+                // appended in January so a 12-month window is unambiguous.
+                const step = slot < 34 ? 3 : (slot < 52 ? 2 : 1);
+                if (i % step === (months.length - 1) % step) {
                     svg += `<text class="dash-axis" x="${(x + barW / 2).toFixed(1)}"`
-                         + ` y="${H - 4}" text-anchor="middle">${label}</text>`;
+                         + ` y="${H - 6}" text-anchor="middle">`
+                         + `${escapeHtml(monthLabel(m.month))}</text>`;
                 }
             });
             svg += '</svg>';
             setHtmlIfChanged(host, svg);
         }
+
+        const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                             'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+        function monthLabel(key, full) {
+            // key is 'YYYY-MM', formatted server-side with '%04d-%02d'.
+            //
+            // `monthName` rather than `name`: the XSS invariant treats a bare
+            // `name` as server-supplied text reaching the DOM, and flagged this.
+            // The value here is an entry from the hardcoded array above (or the
+            // two digits from the key), and both call sites wrap the result in
+            // escapeHtml() — so it was a false positive. The specific name is
+            // clearer regardless, which is why this is a rename and not an
+            // entry in the check's allowlist.
+            const [y, m] = String(key).split('-');
+            const monthName = MONTH_NAMES[(parseInt(m, 10) || 1) - 1] || m;
+            if (full) return `${monthName} ${y}`;
+            return m === '01' ? `${monthName} ${String(y).slice(2)}` : monthName;
+        }
+
+        // Re-render on resize: the chart is drawn at the container's pixel width,
+        // so a resized window needs new geometry rather than a stretched copy.
+        // Debounced, and only while the dashboard is the visible page.
+        let chartResizeTimer = null;
+        window.addEventListener('resize', () => {
+            clearTimeout(chartResizeTimer);
+            chartResizeTimer = setTimeout(() => {
+                const page = document.getElementById('page-dashboard');
+                if (page && page.style.display !== 'none' && lastLibraryScan) {
+                    renderAddedChart(lastLibraryScan.months || []);
+                }
+            }, 200);
+        });
 
         function renderTopArtists(artists) {
             const host = document.getElementById('top-artists');
@@ -459,8 +534,16 @@
                     const col = await resp.json();
                     const list = col.artists || col.results || [];
                     const withCol = list.filter(a => a.has_collection).length;
-                    collectionsRow = healthRow('Plex collections', withCol,
-                                               list.length || total);
+                    // Use Plex's own list length. Falling back to the artist
+                    // count from the filesystem scan (`list.length || total`)
+                    // silently mixed two different populations: if Plex returned
+                    // an empty or partial list, the row read "0 / 28" as though
+                    // 28 collections were expected and missing, when the truth
+                    // was that Plex told us about none of them.
+                    collectionsRow = list.length
+                        ? healthRow('Plex collections', withCol, list.length)
+                        : '<div class="dash-health"><span>Plex collections</span>'
+                          + '<span class="text-muted">No data from Plex</span></div>';
                 } else {
                     collectionsRow = '<div class="dash-health"><span>Plex collections</span>'
                                    + '<span class="text-muted">Not connected</span></div>';

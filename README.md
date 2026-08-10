@@ -692,6 +692,11 @@ python tests/test_download_state.py# interrupted downloads, history pruning, cop
 python tests/test_library.py       # library scan, caching, chart series
 python tests/test_invariants.py    # source-level rules for bugs CI can't reproduce
 node tests/test_artists_filter.js   # Artists page search/filter/sort logic
+
+# Optional, and skipped (exit 0) unless a live instance is configured and
+# Playwright is installed. Catches the bugs only a rendered page shows.
+pip install playwright && playwright install chromium
+VIDSHELF_URL=http://127.0.0.1:5000 VIDSHELF_PASSWORD=... python tests/test_browser.py
 ```
 
 `test_invariants.py` is unusual: it asserts on the *source text*. Some bugs in
@@ -710,6 +715,23 @@ with no dev dependencies to install.
 it tags the release, builds and pushes multi-arch images to
 `ghcr.io/andysom25/vidshelf`, and creates the GitHub release. A merge that
 doesn't change `VERSION` releases nothing.
+
+**Before merging a release** — run the pre-release drill (Windows, Docker
+Desktop):
+
+```powershell
+.\prerelease.ps1
+```
+
+It runs the unit suite, builds the image, starts a **throwaway** container on a
+spare port (your real one keeps running), then checks the things CI structurally
+cannot: that the media mount is a real network share rather than a decoy volume,
+that `utime`/`chmod` on a file the container doesn't own actually succeed, that
+a library scan returns real numbers, that anonymous callers are rejected, and
+that the browser smoke test passes against the rendered page. Finally it
+upgrades from the previous release's image on the same data directory. It ends
+by printing what it did **not** cover — a real download and a real Plex sync
+are still manual, and CI is not a substitute for either.
 
 ---
 

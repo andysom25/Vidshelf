@@ -64,9 +64,16 @@ def artist_to_folder(artist):
 _TRAILING_YOUTUBE_ID_RE = re.compile(r'-[A-Za-z0-9_-]{11}$')
 _TRAILING_URL_RE = re.compile(r'\s*www\.\S+\s*$', re.IGNORECASE)
 _OFFICIAL_VIDEO_PHRASE_RE = re.compile(r'\bofficial(?:\s+hd|\s+music)?\s+video\b', re.IGNORECASE)
-_DANGLING_DASH_BEFORE_PAREN_RE = re.compile(r'\s*-\s*\)')
-_DANGLING_DASH_AFTER_PAREN_RE = re.compile(r'\(\s*-\s*')
-_EMPTY_PARENS_RE = re.compile(r'\(\s*\)')
+# Brackets get the same treatment as parentheses. They did not, and the residue
+# was visible in the UI: "Planetary (GO!) [Official Video] [HD]" cleaned to
+# "Planetary (GO!) [] [HD]", and "[Official Video - 4K Film Restored]" to
+# "[ - 4K Film Restored]". The phrase was removed correctly; the punctuation
+# around it was only handled for one bracket style, so uploaders who use square
+# brackets got the wreckage. Character classes rather than two sets of patterns,
+# so a third style cannot drift out of sync.
+_DANGLING_DASH_BEFORE_CLOSE_RE = re.compile(r'\s*-\s*([\)\]])')
+_DANGLING_DASH_AFTER_OPEN_RE = re.compile(r'([\(\[])\s*-\s*')
+_EMPTY_GROUP_RE = re.compile(r'\(\s*\)|\[\s*\]')
 _MULTI_SPACE_RE = re.compile(r'\s{2,}')
 _TRAILING_DASH_RE = re.compile(r'\s*-\s*$')
 
@@ -125,9 +132,9 @@ def clean_video_title(raw_title):
     title = _TRAILING_YOUTUBE_ID_RE.sub('', title)
     title = _TRAILING_URL_RE.sub('', title)
     title = _OFFICIAL_VIDEO_PHRASE_RE.sub('', title)
-    title = _DANGLING_DASH_BEFORE_PAREN_RE.sub(')', title)
-    title = _DANGLING_DASH_AFTER_PAREN_RE.sub('(', title)
-    title = _EMPTY_PARENS_RE.sub('', title)
+    title = _DANGLING_DASH_BEFORE_CLOSE_RE.sub(r'\1', title)
+    title = _DANGLING_DASH_AFTER_OPEN_RE.sub(r'\1', title)
+    title = _EMPTY_GROUP_RE.sub('', title)
     title = _MULTI_SPACE_RE.sub(' ', title)
     title = _TRAILING_DASH_RE.sub('', title)
     title = title.strip()

@@ -1042,8 +1042,6 @@ def _library_scan(force=False):
         'bytes': total_bytes,
         'added_30d': sum(1 for r in recent if r[0] >= cutoff_30d),
         'missing_artwork': missing_artwork,
-        'largest_artist_bytes': max((a['bytes'] for a in per_artist.values()),
-                                    default=0),
         'months': _month_series(per_month, LIBRARY_HISTORY_MONTHS, now),
         'top_artists': sorted(
             ({'artist': a, 'videos': v['videos'], 'bytes': v['bytes']}
@@ -1053,8 +1051,9 @@ def _library_scan(force=False):
                         os.path.splitext(t)[0]),
                     'bytes': b, 'added_at': m}
                    for m, a, t, b in recent[:RECENTLY_ADDED_LIMIT]],
-        'scanned_at': now,
-        # The UI says "added", not "downloaded", and this is why.
+        # The UI says "added" rather than "downloaded", and shows this string in
+        # a tooltip on the Added card, so the caveat travels with the number
+        # instead of living only in a comment.
         'dates_from': 'file modification time',
     }
 
