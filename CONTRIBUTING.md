@@ -71,6 +71,46 @@ If you add a route, `test_routes.py` should still pass unchanged — it asserts
 that every non-public route rejects unauthenticated callers, which is a
 standing invariant rather than a per-feature test.
 
+## Where things live
+
+`app.py` is the Flask app, the 66 route handlers and the server startup. As of
+v1.11.0 the shared logic lives beside it, in modules that know nothing about
+Flask:
+
+| Module | Owns |
+|---|---|
+| `config_store.py` | `config.json` I/O; the secret key and admin credentials it seeds |
+| `webauth.py` | `@require_auth`, the login throttle, the security headers |
+| `tracker.py` | `downloaded_videos.json` — the "do we already have this?" record |
+| `youtube.py` | every yt-dlp **metadata** call (names, listings, search, quality) |
+| `library.py` | the cached media-root walk that feeds the dashboard |
+| `downloader.py` | actually downloading; `transcode.py` converts |
+| `artwork_sync.py` | artwork providers, title cards, the Plex client, Plex OAuth |
+| `state.py` | atomic JSON reads/writes for everything above |
+
+**Two rules that are load-bearing, not stylistic:**
+
+- **Nothing in that table may import `app`.** The routes are being moved into
+  blueprints (v1.12.0), and a blueprint that imports `app` while `app` imports
+  blueprints is a cycle. If a route needs shared state, the state moves into a
+  module of its own — not into `app` with a deferred import to dodge the cycle.
+- **Bound anything a browser waits on; leave downloads patient.** `youtube.py`
+  builds every request through `_probe_opts()`, which carries a socket timeout and
+  a retry cap. `downloader.py` deliberately keeps yt-dlp's defaults, because there
+  a retry is the difference between getting the video and not. Mixing these up is
+  what made the music-video search hang in v1.10.1.
+
+**After moving code between modules, run `python -m pyflakes <files>`.** A
+module-level name that is used but not imported still lets `import <module>`
+succeed — Python resolves it at call time — so CI's import check passes while the
+function is a `NameError` waiting for its first call. That shipped once as a
+guaranteed startup crash and was caught by pyflakes, not by any test.
+
+**And check what your tests actually patch.** `app.py` re-exports the extracted
+names for convenience. Rebinding `app.some_name` does *not* change what the owning
+module sees, so a test that patches the re-export silently stops testing anything.
+Patch the module that defines it.
+
 ## Things worth knowing before you change anything
 
 **Read [REFERENCE.md](REFERENCE.md) first.** It's an engineering log, not user

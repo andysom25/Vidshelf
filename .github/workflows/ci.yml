@@ -62,7 +62,7 @@ jobs:
       - name: Check every module imports
         # Catches the class of breakage that only shows up at import time,
         # which is exactly where the pre-v1.1.0 fresh-install crash lived.
-        run: python -c "import state, titles, transcode, downloader, artwork_swap, artwork_sync, updates, scheduler, retention, notify, app"
+        run: python -c "import state, config_store, webauth, tracker, youtube, library, titles, transcode, downloader, artwork_swap, artwork_sync, updates, scheduler, retention, notify, app"
 
   # Decides whether this run should publish, and what version it is publishing.
   #
