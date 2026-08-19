@@ -14,7 +14,30 @@
 
 # Direct dependencies
 Flask==3.1.3
-yt-dlp==2026.7.4
+# TEMPORARY NIGHTLY PIN, not the usual yt-dlp==X.Y.Z (see REFERENCE.md,
+# 2026-08-19). Every stable release through 2026.7.4 downloads real
+# 1080p/720p (DASH-only, e.g. itag 137) formats for a few seconds/megabytes
+# and then dies with HTTP 403 — confirmed independent of cookies, Deno, and a
+# working PO Token provider; only true legacy progressive-muxed formats
+# (itag 18, 360p) survive on 2026.7.4. This exact nightly is the first build
+# verified (by an actual end-to-end 1080p download) to get past that wall.
+# bump-yt-dlp.yml skips this pin rather than fighting it — see its comment.
+# Revert to a plain `yt-dlp==X.Y.Z` pin once a stable release incorporates
+# whatever fixed this (check by re-running the REFERENCE.md verification
+# steps against the new stable before switching back).
+yt-dlp @ https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.08.18.122307/yt-dlp.tar.gz
+# yt-dlp plugin: registers itself as a PO Token provider on import (no code
+# changes needed elsewhere). Without a PO Token, YouTube serves a throttled
+# stream that dies mid-download with HTTP 403 a few seconds in, even with
+# valid cookies and a working JS runtime for signature descrambling (see
+# REFERENCE.md, 2026-08-19). Runs its BotGuard-challenge script through Deno,
+# which the Dockerfile already installs for yt-dlp's own EJS requirement.
+bgutil-ytdlp-pot-provider==1.3.1
+# Bundles yt-dlp's own JS-challenge (nsig/signature) solver script so it runs
+# locally through Deno instead of yt-dlp fetching remote code at runtime via
+# --remote-components. Without this, "n challenge solving failed" and most
+# formats silently disappear even though Deno itself is present and working.
+yt-dlp-ejs==0.8.0
 requests==2.34.2
 pillow==12.3.0
 # Production WSGI server. Werkzeug's built-in server is explicitly not meant

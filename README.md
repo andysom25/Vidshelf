@@ -70,7 +70,8 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 ### Download Control
 - **Cancel** a queued or running download, and **retry** anything that failed or was cancelled — from the Downloads page
 - **Per-channel quality cap** — best available, 4K, 1440p, 1080p or 720p, set per channel so one 4K publisher doesn't force a global downgrade
-- **Cookies support** — drop a yt-dlp `cookies.txt` into `data/` for age-restricted and members-only videos. Settings → System Health shows whether it was found
+- **Cookies support** — drop a real yt-dlp `cookies.txt`, exported from a browser tab logged into **youtube.com** (not this app), into `data/` for age-restricted and members-only videos. Settings → System Health validates it actually contains a YouTube session, not just that a file exists there
+- **PO Token support** (v1.11.0+) — a bundled `bgutil-provider` service and Deno-based JS-challenge solver, required for YouTube's current anti-bot enforcement. Included automatically in the Docker Compose setup; see `docker-compose.yml`
 
 ### Download Format & Quality
 - Downloads the **best available quality** — 4K, 1080p60, 1440p, etc.
@@ -118,10 +119,20 @@ No clone or build required. Create a `docker-compose.yml`:
 name: vidshelf
 
 services:
+  # Mints YouTube PO Tokens for yt-dlp — required as of v1.11.0 for downloads
+  # above 360p to complete (YouTube's anti-bot enforcement otherwise cuts the
+  # stream off partway through with HTTP 403). Not exposed to the host.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    restart: unless-stopped
+
   vidshelf:
     image: ghcr.io/andysom25/vidshelf:latest
     container_name: vidshelf
     restart: unless-stopped
+    depends_on:
+      - bgutil-provider
     ports:
       - "5000:5000"
     volumes:
@@ -201,6 +212,22 @@ docker compose up -d --build                     # building from source
 Your `data/` directory carries config and history across upgrades, so nothing
 needs migrating.
 
+### Coming from before v1.11.0 (one-time)
+
+v1.11.0 requires a second container, `bgutil-provider`, for downloads above
+360p to complete — pulling the new `vidshelf` image alone does **not** add it,
+since Compose only creates services listed in your own `docker-compose.yml`.
+Add the `bgutil-provider` block from the Quick Start example above to your
+existing file, then:
+
+```bash
+docker compose up -d   # creates bgutil-provider, recreates vidshelf to see it
+```
+
+Skipping this doesn't break anything immediately, but every download above
+360p will fail with `HTTP Error 403: Forbidden` partway through — see
+Troubleshooting below.
+
 ### `update.ps1` (Windows)
 
 A one-shot wrapper around the above that also checks the things worth checking:
@@ -263,6 +290,7 @@ All optional — see `.env.example` for the full template.
 | `PLEX_CLIENT_ID` / `PLEX_PRODUCT` | This deployment's identity for Plex's OAuth flow. Auto-generated/persisted if unset. |
 | `NAS_SMB_USER` / `NAS_SMB_PASS` / `NAS_SMB_DEVICE` | Only needed if you use the Docker Compose `cifs` volume for a network share — see the comments in `docker-compose.yml`. |
 | `FFMPEG_PATH` | Override the ffmpeg/ffprobe binary location if not on `PATH`. |
+| `POT_PROVIDER_URL` | Where yt-dlp reaches its PO Token provider. Defaults to `http://bgutil-provider:4416`, the bundled Compose service — only override for a local (non-Docker) install running its own [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) server. |
 | `MAX_CONCURRENT_DOWNLOADS` | Max downloads (and their format-conversion re-encodes) running at once, across all download types combined. Defaults to `2` — format conversion is CPU/memory-heavy, so raise this only if your hardware can handle more concurrent encodes. |
 | `VIDSHELF_DATA_DIR` | Where persistent state (`config.json`, download trackers) is kept. Defaults to `./data`. In Docker leave this alone and mount a volume at `/app/data` instead. |
 | `PORT` | Port to listen on. Defaults to `5000`. In Docker, remap on the host side instead (`-p 8080:5000`). |
@@ -669,6 +697,21 @@ you which layer failed. If you still see a timeout:
 - **You reach Vidshelf through a reverse proxy.** Raise its read timeout — nginx
   and Nginx Proxy Manager default to 60s, and a cold search on a slow connection
   can approach that. The search itself gives up at 45s.
+
+### Downloads fail partway through with "HTTP Error 403: Forbidden"
+
+As of v1.11.0, this needs the bundled `bgutil-provider` service — check
+`docker compose ps` includes it and is running. If it's missing (an older
+`docker-compose.yml` from before v1.11.0), add the `bgutil-provider` block
+from the Quick Start example above and `docker compose up -d`.
+
+If `bgutil-provider` is already running and this still happens: confirm
+`data/cookies.txt` is a real export from a **youtube.com** tab (Settings →
+System Health now validates this, not just that a file exists) and that a
+360p-and-below download (itag 18) works while 1080p doesn't — that specific
+pattern means YouTube's enforcement has moved again and yt-dlp needs an
+update. See `REFERENCE.md`'s 2026-08-19 entries for the full diagnostic
+trail if you're digging into this yourself.
 
 ### A feature disappears after working (watchtower)
 

@@ -10,6 +10,11 @@ import secrets
 import requests
 import functools
 import state
+import config_store
+import youtube
+import library
+import tracker
+import webauth
 import updates
 import notify
 import retention
@@ -127,18 +132,20 @@ _DOWNLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix='download'
 )
 
-# State now lives in a mounted directory (./data) and is written atomically —
-# see state.py for why single-file bind mounts made both of those impossible.
-# Re-exported under the original names so the rest of this module reads
-# unchanged.
-CONFIG_FILE = state.CONFIG_FILE
-TRACKER_FILE = state.TRACKER_FILE
-ACTIVE_DOWNLOADS_FILE = state.ACTIVE_DOWNLOADS_FILE
+# config.json I/O and the credentials it seeds live in config_store.py as of
+# v1.11.0 — state still lives in a mounted directory (./data) and is still
+# written atomically; see state.py for why single-file bind mounts made both of
+# those impossible. Re-exported under the original names so the routes still in
+# this module read unchanged; blueprints import from config_store directly.
+CONFIG_FILE = config_store.CONFIG_FILE
+TRACKER_FILE = config_store.TRACKER_FILE
+ACTIVE_DOWNLOADS_FILE = config_store.ACTIVE_DOWNLOADS_FILE
+load_config = config_store.load_config
+_read_raw_config = config_store._read_raw_config
+_write_raw_config = config_store._write_raw_config
+_update_config = config_store._update_config
 
-for _migration in state.MIGRATIONS_PERFORMED:
-    # Not all migrations relocate a file any more — v1.8.0 added a config-key
-    # fold — so the message says what happened rather than assuming.
-    print(f"[state] Migration: {_migration}")
+config_store.report_migrations()
 
 # Youtube-only allowlist for any endpoint that hands a caller-supplied URL to
 # yt-dlp — yt-dlp supports hundreds of sites via a "generic" extractor, so an
@@ -166,152 +173,34 @@ _CONVERSION_STATE = {
     'current_file': None,
     'errors': [],
 }
+
 _CONVERSION_LOCK = threading.Lock()
+
 _CONVERSION_SCRATCH_DIR = os.path.join('.', 'downloads', '_conversion_scratch')
 
-def load_config():
-    return state.read_json(CONFIG_FILE)
-
-def _read_raw_config():
-    """Like load_config(), but never raises — used during startup, before
-    the app (and thus any request context) exists."""
-    return state.read_json(CONFIG_FILE)
-
-def _write_raw_config(config):
-    state.write_json(CONFIG_FILE, config, indent=4)
-
-def _update_config(mutate):
-    """Read-modify-write config.json under a lock, atomically.
-
-    Prefer this over load_config() + _write_raw_config() anywhere the new
-    value depends on the current one: Flask serves requests on threads, so
-    two settings saves (or a save racing the Plex OAuth callback, which
-    persists a token from a background poll) would otherwise each write a
-    full document built from a stale read, and the loser's field silently
-    disappears.
-    """
-    return state.update_json(CONFIG_FILE, mutate, indent=4)
-
-def _get_or_create_secret_key():
-    """Flask's secret key signs session cookies — anyone who knows it can
-    forge a valid 'logged in as admin' session outright. This used to be a
-    fixed string committed to source control, so anyone who'd ever seen this
-    repo could forge a session against any deployment still using it.
-
-    Prefer a SECRET_KEY env var; otherwise persist a freshly generated
-    random key in config.json (under a leading-underscore key so it reads
-    as internal state, not a user-facing setting) so sessions survive a
-    container restart without ever falling back to a known value.
-    """
-    env_key = os.environ.get('SECRET_KEY')
-    if env_key:
-        return env_key
-    config = _read_raw_config()
-    existing = config.get('_secret_key')
-    if existing:
-        return existing
-    new_key = secrets.token_hex(32)
-    config['_secret_key'] = new_key
-    try:
-        _write_raw_config(config)
-    except Exception:
-        print("[SECURITY] Could not persist generated secret key to config.json — "
-              "sessions will not survive a restart until this is writable.")
-    return new_key
-
-def _get_or_create_admin_credentials():
-    """Load the admin username + password hash from config.json, seeding it
-    on first run instead of a fixed 'admin'/'adminadmin' checked into
-    source. Also fixes a related bug: the old /api/password handler only
-    updated an in-memory dict, so any password change was silently reverted
-    on the next restart — this persists changes to config.json instead.
-
-    First-run behavior: ADMIN_USERNAME/ADMIN_PASSWORD env vars are used if
-    set; otherwise a random password is generated and printed once so it can
-    still be retrieved from `docker logs`.
-    """
-    config = _read_raw_config()
-    creds = config.get('_auth', {})
-    if creds.get('username') and creds.get('password_hash'):
-        return creds['username'], creds['password_hash']
-
-    # `or 'admin'` (not .get(..., 'admin')) because docker-compose passes
-    # ADMIN_USERNAME='' — not an absent key — when the .env var is unset, and
-    # os.environ.get() with a default only applies it for a missing key, not
-    # an empty-string value.
-    username = os.environ.get('ADMIN_USERNAME') or 'admin'
-    password = os.environ.get('ADMIN_PASSWORD')
-    generated = False
-    if not password:
-        password = secrets.token_urlsafe(12)
-        generated = True
-    password_hash = generate_password_hash(password)
-    config['_auth'] = {'username': username, 'password_hash': password_hash}
-    try:
-        _write_raw_config(config)
-    except Exception:
-        print("[SECURITY] Could not persist generated admin credentials to config.json.")
-    if generated:
-        print(f"[SECURITY] No ADMIN_PASSWORD set — generated a random admin password on "
-              f"first run: {password!r} (username: {username!r}). This is only printed "
-              f"once; change it via the dashboard's Settings page, or set ADMIN_PASSWORD "
-              f"and delete the '_auth' key from config.json to reset it.")
-    return username, password_hash
-
 app = Flask(__name__)
-app.secret_key = _get_or_create_secret_key()
+app.secret_key = config_store._get_or_create_secret_key()
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 # Off by default since this is commonly reached over plain HTTP on a LAN;
 # set SESSION_COOKIE_SECURE=true if this is ever put behind HTTPS/a reverse proxy.
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SESSION_COOKIE_SECURE', '').lower() == 'true'
 
-_ADMIN_USERNAME, _ADMIN_PASSWORD_HASH = _get_or_create_admin_credentials()
+_ADMIN_USERNAME, _ADMIN_PASSWORD_HASH = config_store._get_or_create_admin_credentials()
 
-# Simple in-memory login throttle, keyed by client IP. Resets on restart —
-# acceptable here since this is a single-container, single-account app, not
-# a distributed service; the goal is just to make the default/first-run
-# credential meaningfully harder to brute-force, not to build a full
-# rate-limiting subsystem.
-_LOGIN_FAILURES = {}  # ip -> (fail_count, locked_until_epoch)
-_LOGIN_MAX_ATTEMPTS = 5
-_LOGIN_LOCKOUT_SECONDS = 300
-# Above this many tracked IPs, expired records are swept on the next failed
-# login. Not a hard cap -- currently-locked IPs are never dropped, since
-# forgetting one would hand an attacker a free reset.
-_LOGIN_FAILURES_SOFT_CAP = 512
+# The login throttle, the session guard and the response headers live in
+# webauth.py as of v1.11.0. Re-exported under their original names for the routes
+# still in this module; blueprints import them from webauth directly.
+_login_is_locked = webauth._login_is_locked
+_record_login_failure = webauth._record_login_failure
+_clear_login_failures = webauth._clear_login_failures
+require_auth = webauth.require_auth
 
-def _login_is_locked(ip):
-    count, locked_until = _LOGIN_FAILURES.get(ip, (0, 0))
-    return count >= _LOGIN_MAX_ATTEMPTS and time.time() < locked_until
+# Registered here rather than in webauth because an after_request hook belongs to
+# an app, and webauth deliberately knows nothing about one — that is what lets
+# every blueprint import require_auth without a cycle back through app.py.
+app.after_request(webauth._set_security_headers)
 
-def _record_login_failure(ip):
-    now = time.time()
-    # Evict records that can no longer lock anyone out. Without this the dict
-    # kept one entry per source IP for the life of the process — unbounded
-    # growth driven entirely by unauthenticated requests, which is a poor
-    # property for the one endpoint that is reachable without a session.
-    # Cheap: this runs only on a *failed* login, which is already rate-limited.
-    if len(_LOGIN_FAILURES) > _LOGIN_FAILURES_SOFT_CAP:
-        for stale_ip, (_, until) in list(_LOGIN_FAILURES.items()):
-            if until < now and stale_ip != ip:
-                del _LOGIN_FAILURES[stale_ip]
-
-    count, locked_until = _LOGIN_FAILURES.get(ip, (0, 0))
-    count += 1
-    if count >= _LOGIN_MAX_ATTEMPTS:
-        locked_until = now + _LOGIN_LOCKOUT_SECONDS
-    _LOGIN_FAILURES[ip] = (count, locked_until)
-
-def _clear_login_failures(ip):
-    _LOGIN_FAILURES.pop(ip, None)
-
-@app.after_request
-def _set_security_headers(response):
-    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
-    response.headers.setdefault('X-Frame-Options', 'DENY')
-    response.headers.setdefault('Referrer-Policy', 'same-origin')
-    return response
 
 def _cookies_file():
     """Path to a yt-dlp cookies file, or None.
@@ -326,48 +215,62 @@ def _cookies_file():
     return None
 
 
-# Music-video downloads have no channel, so they're filed in the tracker under a
-# synthetic key. Both directions live here rather than being spelled out at each
-# site: the retry path needs to read the artist back out, and getting the
-# transform subtly wrong there is invisible until a retry lands in the wrong
-# folder. Lossy by construction — "A B" and "A_B" collapse to the same key — and
-# left that way deliberately, since changing it would orphan existing history.
-MUSIC_KEY_PREFIX = 'music_video_'
+# Any real YouTube session carries at least one of these on a youtube.com/
+# google.com line. A file exported from the wrong tab (e.g. Vidshelf's own
+# localhost login page) has neither — it passes the old "does a file exist"
+# check while doing nothing for yt-dlp, which is exactly how this went
+# unnoticed until every download started failing with HTTP 403s.
+_YOUTUBE_AUTH_COOKIE_NAMES = ('SAPISID', 'SSID', 'HSID', 'SID', 'LOGIN_INFO',
+                              '__Secure-1PSID', '__Secure-3PSID')
 
 
-def _music_key_for_artist(artist):
-    """Tracker key for an artist's music videos."""
-    return f"{MUSIC_KEY_PREFIX}{artist.replace(' ', '_')}"
+def _cookies_status():
+    """Whether a *usable* cookies file is present — not just one that exists.
 
-
-def _artist_from_music_key(channel_url):
-    """Artist name from a synthetic music key, or None for a real channel URL."""
-    if not channel_url or not channel_url.startswith(MUSIC_KEY_PREFIX):
-        return None
-    return channel_url[len(MUSIC_KEY_PREFIX):].replace('_', ' ').strip() or None
-
-
-def _music_retry_destination(recorded_path, music_artist):
-    """Where a retried music video should land.
-
-    The path recorded on a download entry is only the artist folder once the job
-    has actually *started*: the music route queues it with the music root, and
-    download_video re-inits the entry with root/Artist when a worker picks it
-    up. A download cancelled while still queued never got that far — so
-    retrying one would drop the file loose in the root. Inside the library, but
-    with no artist folder, so no artwork, no collection, and nothing on the
-    Artists page.
-
-    No-op for channel downloads, and idempotent: a path that already ends in the
-    artist folder is returned unchanged, so the normal failed-mid-download case
-    doesn't get a second folder nested inside the first.
+    A cookies.txt with no real YouTube auth cookies (e.g. exported from the
+    wrong browser tab) used to report 'available: true' here, because the old
+    check only asked whether a file existed at the path. That let a broken
+    export sit invisible until age-restricted/members-only downloads failed
+    with no indication why.
     """
-    if not music_artist:
-        return recorded_path
-    folder = _sanitize_folder_name(music_artist)
-    if os.path.basename(os.path.normpath(recorded_path)) == folder:
-        return recorded_path
-    return os.path.join(recorded_path, folder)
+    path = _cookies_file()
+    if not path:
+        return {
+            'available': False,
+            'path': None,
+            'detail': 'Not found — age-restricted and members-only videos will '
+                       'fail. Drop a yt-dlp cookies.txt into the data directory '
+                       'to enable them.',
+        }
+    try:
+        with open(path, encoding='utf-8') as f:
+            content = f.read()
+    except OSError:
+        content = ''
+    has_youtube_domain = 'youtube.com' in content or 'google.com' in content
+    has_auth_cookie = any(name in content for name in _YOUTUBE_AUTH_COOKIE_NAMES)
+    if has_youtube_domain and has_auth_cookie:
+        return {'available': True, 'path': path, 'detail': f'In use: {path}'}
+    return {
+        'available': False,
+        'path': path,
+        'detail': f'Found at {path}, but it has no YouTube login cookies — '
+                  'export cookies.txt from your browser while logged into '
+                  'youtube.com (not this app), then replace the file.',
+    }
+
+
+# The download tracker and the music-video key scheme live in tracker.py as of
+# v1.11.0. Re-exported for the routes still here; blueprints import directly.
+MUSIC_KEY_PREFIX = tracker.MUSIC_KEY_PREFIX
+_music_key_for_artist = tracker._music_key_for_artist
+_artist_from_music_key = tracker._artist_from_music_key
+_music_retry_destination = tracker._music_retry_destination
+load_downloaded_tracker = tracker.load_downloaded_tracker
+save_downloaded_tracker = tracker.save_downloaded_tracker
+mark_video_downloaded = tracker.mark_video_downloaded
+is_video_downloaded = tracker.is_video_downloaded
+
 
 
 def _download_options(channel_url=None):
@@ -410,408 +313,23 @@ def _notify_download(kind, title, channel_url, error=None):
         print(f'[notify] could not dispatch {kind} notification: {exc}')
 
 
-def load_downloaded_tracker():
-    return state.read_json(TRACKER_FILE)
 
-def save_downloaded_tracker(tracker):
-    state.write_json(TRACKER_FILE, tracker, indent=2)
+# yt-dlp metadata probes live in youtube.py as of v1.11.0. Re-exported under
+# their original names for the routes still in this module; blueprints import
+# from youtube directly. downloader.py is deliberately NOT part of this --
+# see youtube.py for why probes are bounded and downloads are not.
+PROBE_TIMEOUTS = youtube.PROBE_TIMEOUTS
+PROBE_CONCURRENCY = youtube.PROBE_CONCURRENCY
+PROBE_WALL_CLOCK_TIMEOUT = youtube.PROBE_WALL_CLOCK_TIMEOUT
+_probe_opts = youtube._probe_opts
+get_channel_info = youtube.get_channel_info
+get_channel_videos = youtube.get_channel_videos
+search_music_videos = youtube.search_music_videos
+rank_videos_by_quality = youtube.rank_videos_by_quality
+get_video_formats_info = youtube.get_video_formats_info
+_enrich_video_qualities = youtube._enrich_video_qualities
+_CHANNEL_NAME_CACHE = youtube._CHANNEL_NAME_CACHE
 
-def mark_video_downloaded(video_id, channel_url):
-    """Record a video as downloaded.
-
-    The read-modify-write has to happen under a single lock: this runs on the
-    bounded download pool (_DOWNLOAD_EXECUTOR), so with concurrency > 1 two
-    downloads finishing close together would both load the same tracker, each
-    append only its own video, and whichever wrote second would drop the
-    other's entry. The dropped video then looks new on the next channel check
-    and gets downloaded all over again.
-    """
-    def _add(tracker):
-        tracker.setdefault(channel_url, [])
-        if video_id not in tracker[channel_url]:
-            tracker[channel_url].append(video_id)
-
-    state.update_json(TRACKER_FILE, _add, indent=2)
-    # A new file exists on disk now, so the cached library scan is stale.
-    # Every successful download funnels through here, which makes it the one
-    # place that reliably knows the library changed.
-    _invalidate_library_scan()
-
-def is_video_downloaded(video_id, channel_url):
-    tracker = load_downloaded_tracker()
-    return video_id in tracker.get(channel_url, [])
-
-_CHANNEL_NAME_CACHE = {}          # url -> (fetched_at, name)
-_CHANNEL_NAME_TTL = 24 * 3600
-_CHANNEL_NAME_LOCK = threading.Lock()
-
-
-def get_channel_info(channel_url, force=False):
-    """Lightweight fetch of just the channel display name.
-
-    "Lightweight" is relative: this is a live yt-dlp extraction against YouTube
-    and it was measured at **23 seconds** for a single channel. /api/channels
-    calls it once per configured channel, so the Channels page cost 23s x N on
-    every visit, and v1.9.0's 60-second dashboard refresh turned that into a
-    continuous background load — with three channels the work per cycle exceeded
-    the cycle itself, so it would never catch up and would hammer YouTube
-    forever.
-
-    Cached for a day. A channel's display name effectively never changes, and
-    the cost of being a day stale is a slightly wrong label; the cost of not
-    caching is rate-limiting that breaks actual downloads.
-    """
-    now = time.time()
-    if not force:
-        with _CHANNEL_NAME_LOCK:
-            hit = _CHANNEL_NAME_CACHE.get(channel_url)
-        if hit and (now - hit[0]) < _CHANNEL_NAME_TTL:
-            return hit[1]
-
-    name = _fetch_channel_name(channel_url)
-    if name:
-        # Only cache successes. A failure is usually transient (network, a
-        # throttle), and caching it for a day would mean one bad moment
-        # labelling a channel "Unknown Channel" until a restart.
-        with _CHANNEL_NAME_LOCK:
-            _CHANNEL_NAME_CACHE[channel_url] = (now, name)
-    return name
-
-
-# Bounds on every metadata-only yt-dlp call. These are NOT cosmetic.
-#
-# yt-dlp's defaults are tuned for "get the file eventually": no socket deadline
-# at all, and 10 retries with escalating backoff. That is right for a download
-# and wrong for anything a browser is waiting on, because a single throttled
-# response stalls the HTTP request indefinitely. The music-video search made 9
-# of these calls in series, so one slow probe took the whole response down and
-# the UI reported "Failed to search: Failed to fetch" -- the browser's own
-# message for a dead connection, naming nothing and pointing nowhere.
-#
-# Deliberately applied to metadata probes only. The download path in
-# downloader.py keeps yt-dlp's patient defaults, because there a retry is the
-# difference between getting the video and not.
-PROBE_TIMEOUTS = {
-    'socket_timeout': 15,
-    'retries': 2,
-    'extractor_retries': 1,
-}
-
-
-def _probe_opts(**extra):
-    """yt-dlp options for a metadata-only call, with the timeouts applied.
-
-    Everything that calls extract_info(download=False) should build its options
-    through here, so a new probe cannot be added without bounds by forgetting to
-    copy three keys. tests/test_invariants.py enforces that.
-    """
-    return {'quiet': True, 'no_warnings': True, **PROBE_TIMEOUTS, **extra}
-
-
-def _fetch_channel_name(channel_url):
-    try:
-        ydl_opts = _probe_opts(extract_flat=True, dump_single_json=True)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(channel_url, download=False)
-            return info.get('channel') or info.get('uploader') or 'Unknown Channel'
-    except Exception:
-        return None
-
-def get_channel_videos(channel_url):
-    """Fetch latest videos from a channel with full metadata in a single call."""
-    if '/@' in channel_url and not channel_url.endswith('/videos'):
-        channel_url = channel_url.rstrip('/') + '/videos'
-    elif '/channel/' in channel_url and not channel_url.endswith('/videos'):
-        channel_url = channel_url.rstrip('/') + '/videos'
-
-    ydl_opts = _probe_opts(extract_flat=True, dump_single_json=True)
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(channel_url, download=False)
-        entries = info_dict.get('entries', [])
-        if not entries:
-            return []
-        videos = []
-        for entry in entries:
-            if entry is None:
-                continue
-            video_id = entry.get('id')
-            if not video_id or len(video_id) != 11:
-                continue
-            thumbnail = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
-            videos.append({
-                'id': video_id,
-                'title': entry.get('title') or 'Unknown Title',
-                'duration': entry.get('duration'),
-                'view_count': entry.get('view_count'),
-                'upload_date': entry.get('upload_date'),
-                'thumbnail': thumbnail,
-                'channel': info_dict.get('channel') or entry.get('uploader') or info_dict.get('uploader'),
-                'description': ''
-            })
-        return videos
-
-# ---------- Music Video Search Helpers ----------
-
-def search_music_videos(artist):
-    """Search YouTube for music videos by an artist using yt-dlp search."""
-    # Three differently-angled queries instead of two near-duplicates
-    # ("music video official" vs "official music video" return almost
-    # identical result sets) - a bare-artist query catches uploads that
-    # don't literally say "official"/"music video" in the title, and a
-    # vevo-scoped query specifically surfaces official-channel uploads.
-    # Deeper per-query result counts than before (15 -> 20-25) since the
-    # full set is now cached and paged through server-side (see
-    # api_music_videos_search) instead of being the only chance to see
-    # more than ~15-30 results.
-    queries = [
-        f"ytsearch25:{artist} official music video",
-        f"ytsearch20:{artist} vevo",
-        f"ytsearch20:{artist}",
-    ]
-    
-    seen_ids = set()
-    all_results = []
-    
-    for query in queries:
-        ydl_opts = _probe_opts(extract_flat=True, dump_single_json=True)
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                results = ydl.extract_info(query, download=False)
-                entries = results.get('entries', [])
-                for entry in entries:
-                    if entry is None:
-                        continue
-                    video_id = entry.get('id')
-                    if not video_id or len(video_id) != 11:
-                        continue
-                    if video_id in seen_ids:
-                        continue
-                    seen_ids.add(video_id)
-                    
-                    thumbnail = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
-                    uploader = entry.get('uploader') or entry.get('channel') or 'Unknown'
-                    
-                    all_results.append({
-                        'id': video_id,
-                        'title': entry.get('title') or 'Unknown Title',
-                        'duration': entry.get('duration'),
-                        'view_count': entry.get('view_count'),
-                        'upload_date': entry.get('upload_date'),
-                        'thumbnail': thumbnail,
-                        'channel': uploader,
-                        'description': entry.get('description', '')[:200] if entry.get('description') else ''
-                    })
-        except Exception:
-            continue
-    
-    return rank_videos_by_quality(all_results, artist)
-
-
-def rank_videos_by_quality(videos, artist):
-    """Rank music video results by quality signals to find the best versions."""
-    artist_lower = artist.lower().strip()
-    artist_simple = artist_lower.replace(' ', '').replace('.', '').replace('&', 'and')
-    
-    # Common known official music video channels. Deliberately excludes
-    # "topic" - YouTube auto-generates "Artist - Topic" channels for
-    # audio-only uploads (a static image, no real video), so treating them
-    # as "official" for a *music video* search ranked them above genuine
-    # official video uploads whenever one happened to appear in results.
-    official_channel_patterns = [
-        artist_lower,
-        artist_simple,
-        f"{artist_simple}vevo",
-        f"{artist_lower}vevo",
-        "vevo",
-        "official",
-    ]
-    
-    for v in videos:
-        score = 0
-        title_lower = v.get('title', '').lower()
-        channel_lower = v.get('channel', '').lower()
-        channel_simple = channel_lower.replace(' ', '').replace('.', '').replace('&', 'and')
-        
-        # --- Official channel detection (highest weight) ---
-        # Check if channel name contains artist name or VEVO/Topic patterns
-        is_official_channel = False
-        for pattern in official_channel_patterns:
-            if pattern in channel_simple or pattern in channel_lower:
-                is_official_channel = True
-                break
-        
-        if is_official_channel:
-            score += 50
-        
-        # Extra bonus for exact artist match in channel name
-        if artist_simple == channel_simple or artist_lower == channel_lower:
-            score += 20
-        
-        # --- Title quality signals ---
-        official_keywords = ['official', 'music video', 'official video', 'official music video',
-                           'hq', 'hd', '4k', 'lyric video', 'audio']
-        for kw in official_keywords:
-            if kw in title_lower:
-                score += 5
-        
-        # Penalize cover/karaoke/remix/live (unless we want those)
-        low_quality_keywords = ['cover', 'karaoke', 'remix', 'live', 'tutorial', 'how to play',
-                                'reaction', 'guitar lesson', 'drum cover', 'acoustic cover',
-                                'instrumental', 'nightcore', 'sped up', 'slowed',
-                                'trailer', 'teaser']
-        for kw in low_quality_keywords:
-            if kw in title_lower:
-                score -= 10
-
-        # Penalize very short durations - almost certainly a YouTube Short
-        # or a teaser clip, not an actual music video, regardless of what
-        # the title/channel otherwise suggested.
-        duration = v.get('duration') or 0
-        if 0 < duration < 60:
-            score -= 15
-
-        # Artist name in title
-        if artist_lower in title_lower or artist_simple in title_lower.replace(' ', ''):
-            score += 10
-
-        # --- View count score (logarithmic, up to 20 pts) ---
-        views = v.get('view_count') or 0
-        if views > 0:
-            view_score = min(20, math.log10(views) * 3)
-            score += view_score
-
-        # --- Recency bonus (up to 10 pts) ---
-        upload_date = v.get('upload_date') or ''
-        if upload_date and len(upload_date) == 8:
-            try:
-                upload_dt = datetime.datetime.strptime(upload_date, '%Y%m%d')
-                days_old = (datetime.datetime.now() - upload_dt).days
-                if days_old < 30:
-                    score += 10  # Very recent
-                elif days_old < 365:
-                    score += 5   # Within the year
-                elif days_old < 1825:
-                    score += 2   # Within 5 years
-            except ValueError:
-                pass
-        
-        v['score'] = round(score, 1)
-    
-    # Sort by score descending
-    videos.sort(key=lambda x: x.get('score', 0), reverse=True)
-    return videos
-
-
-def get_video_formats_info(video_id):
-    """Get available format qualities for a video to determine best quality available."""
-    try:
-        ydl_opts = _probe_opts()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
-            formats = info.get('formats', [])
-            
-            # Extract the best available quality label
-            max_height = 0
-            best_quality = 'unknown'
-            has_audio = False
-            
-            for f in formats:
-                height = f.get('height') or 0
-                if height > max_height and f.get('vcodec') != 'none':
-                    max_height = height
-            
-            if max_height >= 2160:
-                best_quality = '4K'
-            elif max_height >= 1440:
-                best_quality = '1440p'
-            elif max_height >= 1080:
-                best_quality = '1080p'
-            elif max_height >= 720:
-                best_quality = '720p'
-            elif max_height >= 480:
-                best_quality = '480p'
-            elif max_height > 0:
-                best_quality = f'{max_height}p'
-            
-            return {
-                'best_quality': best_quality,
-                'max_height': max_height,
-                'duration': info.get('duration'),
-                'title': info.get('title'),
-                'channel': info.get('channel') or info.get('uploader'),
-                'view_count': info.get('view_count'),
-            }
-    except Exception:
-        return {
-            'best_quality': 'unknown',
-            'max_height': 0,
-            'duration': None,
-            'title': None,
-            'channel': None,
-            'view_count': None,
-        }
-
-
-# One page of search results is 9 videos; 6 at a time keeps the wall-clock close
-# to a single probe without opening nine simultaneous connections to YouTube,
-# which is the behaviour that got the dashboard throttled in v1.9.2.
-PROBE_CONCURRENCY = 6
-# Belt and braces over socket_timeout. yt-dlp can spend time outside a socket
-# read (DNS, extractor parsing, its own sleeps between retries), so the only way
-# to bound the endpoint is to stop waiting on the future as well.
-PROBE_WALL_CLOCK_TIMEOUT = 25
-
-
-def _enrich_video_qualities(page_videos):
-    """Fill in 'best_quality' for a page of search results, in parallel.
-
-    Never raises, and never leaves the caller without a response: a probe that
-    fails or overruns yields 'unknown' for that one video. Returns the number
-    that could not be resolved, for logging.
-    """
-    todo = [v for v in page_videos if 'best_quality' not in v]
-    if not todo:
-        return 0
-
-    unresolved = 0
-    # NOT `with ThreadPoolExecutor(...)`. The context manager exits via
-    # shutdown(wait=True), which blocks until every probe finishes — and
-    # Future.cancel() returns False for anything already running. Using it here
-    # would make PROBE_WALL_CLOCK_TIMEOUT completely inert: the endpoint would
-    # still hang for as long as the slowest probe, exactly the bug being fixed,
-    # while looking like it had a timeout. shutdown(wait=False) returns
-    # immediately and lets the orphaned threads finish into a result nobody
-    # reads.
-    pool = concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(PROBE_CONCURRENCY, len(todo)),
-        thread_name_prefix='probe')
-    try:
-        futures = {pool.submit(get_video_formats_info, v['id']): v for v in todo}
-        try:
-            done, pending = concurrent.futures.wait(
-                futures, timeout=PROBE_WALL_CLOCK_TIMEOUT)
-        except Exception:       # noqa: BLE001 - wait() itself must not sink the request
-            done, pending = set(), set(futures)
-        for fut in done:
-            v = futures[fut]
-            try:
-                v['best_quality'] = fut.result().get('best_quality', 'unknown')
-            except Exception:   # noqa: BLE001
-                v['best_quality'] = 'unknown'
-                unresolved += 1
-        for fut in pending:
-            # Set it rather than leaving it absent. These dicts ARE the cached
-            # objects, so an absent key means the next page request re-probes —
-            # which is right. What must not happen is the request waiting on it.
-            futures[fut]['best_quality'] = 'unknown'
-            unresolved += 1
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
-
-    if unresolved:
-        print(f'[search] {unresolved}/{len(todo)} quality probes did not resolve '
-              f'within {PROBE_WALL_CLOCK_TIMEOUT}s; labelled unknown', flush=True)
-    return unresolved
 
 
 # ---------- Routes ----------
@@ -856,28 +374,6 @@ def dashboard():
         return redirect(url_for('login'))
     return render_template('dashboard.html', username=session['username'])
 
-def require_auth(view):
-    """Reject anonymous callers before the view runs.
-
-    This check used to be two hand-written lines at the top of 58 route
-    bodies. Both v1.6.1 and v1.7.0 were, in part, "an endpoint was missing
-    it" — and v1.7.0 found that /api/artwork/search_noauth had validated its
-    query parameter *before* checking the session, so it answered anonymous
-    probes with 400 and looked guarded to the route sweep while serving
-    ?artist=... to anyone. A decorator makes both failures structural: you
-    cannot forget half of it, and it cannot run after anything else.
-
-    functools.wraps matters here beyond tidiness — Flask derives the
-    endpoint name from __name__, and tests/test_routes.py keys its
-    public-endpoint allowlist off those names.
-    """
-    @functools.wraps(view)
-    def wrapper(*args, **kwargs):
-        if 'username' not in session:
-            return jsonify({'error': 'Unauthorized'}), 401
-        return view(*args, **kwargs)
-    return wrapper
-
 # ---------- API Routes ----------
 
 @app.route('/api/channels')
@@ -911,336 +407,26 @@ def api_channel_videos():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-DEFAULT_MUSIC_ROOT = '/app/music_videos_final'
+# The library scan and the media-root resolution live in library.py as of
+# v1.11.0. Re-exported for the routes still in this module; blueprints import
+# from library directly. The two traps that bit before -- the non-reentrant
+# scan lock and invalidation that only zeroed the timestamp -- are documented
+# there, next to the code they apply to.
+DEFAULT_MUSIC_ROOT = library.DEFAULT_MUSIC_ROOT
+LIBRARY_HISTORY_MONTHS = library.LIBRARY_HISTORY_MONTHS
+RECENTLY_ADDED_LIMIT = library.RECENTLY_ADDED_LIMIT
+TOP_ARTISTS_LIMIT = library.TOP_ARTISTS_LIMIT
+_music_root = library._music_root
+_resolve_plex_path = library._resolve_plex_path
+_sweep_staging_dirs = library._sweep_staging_dirs
+_library_scan = library._library_scan
+_maybe_rescan_async = library._maybe_rescan_async
+_invalidate_library_scan = library._invalidate_library_scan
+_is_under = library._is_under
+_month_series = library._month_series
+_library_size = library._library_size
+_gather_media_roots = library._gather_media_roots
 
-
-def _music_root(config=None):
-    """The one directory music videos live in.
-
-    There used to be two settings for this. `artwork_sync.root_path` had twelve
-    readers — the Artists page, artwork sync, retention, collections, title
-    cards — and `music_video_plex_path` had none in any download path: it was
-    editable in Settings, persisted, seeded into config.json.example and
-    documented in the README, while the download route ignored it and hardcoded
-    the value below. A setting that lies is worse than no setting, so v1.8.0
-    made this the single source of truth and migrated the other key away
-    (see state.migrate_music_video_path).
-    """
-    cfg = config if config is not None else load_config()
-    root = (cfg.get('artwork_sync', {}) or {}).get('root_path') or DEFAULT_MUSIC_ROOT
-    return root
-
-
-def _resolve_plex_path(per_channel_plex_path):
-    """Resolve the actual Plex destination path.
-    
-    If the per-channel plex_media_path is relative (starts with '.' or no drive letter),
-    join it with the global plex_base_path. Otherwise use it as-is (supports UNC/absolute).
-    """
-    config = load_config()
-    base = config.get('plex_base_path', './downloads')
-    path = (per_channel_plex_path or './downloads').strip()
-
-    # If path is absolute (has drive letter like D:\ or starts with \\ for UNC), use as-is
-    if os.path.isabs(path):
-        return path
-    # If it starts with ./ or is just a relative folder name, resolve relative to base
-    resolved = os.path.normpath(os.path.join(base, path))
-    return resolved
-
-
-def _sweep_staging_dirs():
-    """Clean local staging leftovers at startup.
-
-    Only ONE directory is vouched for as pure staging: `./downloads/music_videos`.
-    The music-video route always writes there and always copies out to
-    `<music root>/<Artist>/`, so nothing in it is ever a finished location. That
-    is a property of the code, not of the current configuration.
-
-    `./downloads` gets intermediates-only treatment, permanently. It is the
-    historical default `plex_media_path`, which means it can hold finished media
-    from *any* past configuration — and a config that no longer points at it is
-    exactly when it holds orphans. Deriving safety from today's config deleted
-    four finished videos on the first install this ran against; see
-    sweep_staging's docstring.
-    """
-    config = load_config()
-
-    intermediates_only = ['./downloads']
-    for ch in config.get('channels', []):
-        intermediates_only.append(ch.get('download_path', './downloads'))
-
-    pure_staging = ['./downloads/music_videos']
-
-    # A channel whose download path is not also its Plex path is staging by the
-    # same argument as music_videos: the file is always copied out of it.
-    for ch in config.get('channels', []):
-        dl = ch.get('download_path', './downloads')
-        dest = _resolve_plex_path(ch.get('plex_media_path', './downloads'))
-        if os.path.normpath(os.path.abspath(dl)) != os.path.normpath(os.path.abspath(dest)):
-            pure_staging.append(dl)
-    # ...but never if some other channel treats it as a destination.
-    finals = {os.path.normpath(os.path.abspath(p)) for p in _gather_media_roots(config)}
-    finals.add(os.path.normpath(os.path.abspath(_music_root(config))))
-    for ch in config.get('channels', []):
-        finals.add(os.path.normpath(os.path.abspath(
-            _resolve_plex_path(ch.get('plex_media_path', './downloads')))))
-    pure_staging = [p for p in pure_staging
-                    if os.path.normpath(os.path.abspath(p)) not in finals]
-
-    removed, freed = downloader_module.sweep_staging(intermediates_only, pure_staging)
-    if removed:
-        print(f"[downloads] swept {removed} leftover file(s), "
-              f"freed {freed / (1024 * 1024):.0f} MB")
-
-
-_LIBRARY_SCAN_CACHE = {'at': 0.0, 'data': None}
-_LIBRARY_SCAN_TTL = 300  # seconds
-_LIBRARY_SCAN_LOCK = threading.Lock()
-
-# How far back the "added over time" chart looks.
-LIBRARY_HISTORY_MONTHS = 12
-RECENTLY_ADDED_LIMIT = 10
-TOP_ARTISTS_LIMIT = 8
-
-
-def _library_scan(force=False):
-    """One walk of the media roots, feeding every dashboard panel.
-
-    Deliberately a single scan rather than an endpoint per panel. The media root
-    is normally a CIFS mount, so each traversal is the expensive part and doing
-    it four times to fill four cards would be four times the cost for the same
-    bytes. Everything the dashboard shows is derived from this one pass.
-
-    On dates: st_mtime is the closest thing to a download date that exists
-    today. The tracker records only video ids — no timestamps at all — so
-    "added over time" and "recently added" come from the filesystem. That is
-    accurate for files Vidshelf wrote and wrong for anything moved or re-copied
-    on the NAS by hand, which is why the UI labels it "added" rather than
-    "downloaded". Real download dates need the v2.0 data model.
-
-    Cached for _LIBRARY_SCAN_TTL: the dashboard asks on every visit, and a
-    stat() per file over SMB is cheap for hundreds of videos and decidedly not
-    for tens of thousands.
-    """
-    now = time.time()
-    serve_stale = False
-    with _LIBRARY_SCAN_LOCK:
-        cached = _LIBRARY_SCAN_CACHE['data']
-        fresh = cached is not None and (now - _LIBRARY_SCAN_CACHE['at']) < _LIBRARY_SCAN_TTL
-        if cached is not None and not force:
-            if fresh:
-                return cached
-            serve_stale = True
-
-    if serve_stale:
-        # Stale, but usable. Serve it and refresh behind the request rather than
-        # making someone wait for a CIFS walk — measured at 2.1s on a 197-video
-        # library, and it is the *user* who pays it every time the TTL lapses.
-        # Mirrors updates.get_status(), which returns what it knows and refreshes
-        # in the background for exactly this reason.
-        #
-        # The numbers are minutes-stale at worst, and a completed download
-        # invalidates the cache outright, so the case this covers is "nobody has
-        # looked at the dashboard in a while" — where a slightly old count beats
-        # a spinner.
-        #
-        # Deliberately called *outside* the lock above: _maybe_rescan_async
-        # acquires the same non-reentrant lock, so calling it from within would
-        # deadlock every request the moment the cache went stale.
-        _maybe_rescan_async()
-        return cached
-
-    config = load_config()
-    music_root = os.path.normpath(os.path.abspath(_music_root(config)))
-
-    total_bytes = 0
-    video_count = 0
-    per_artist = {}          # artist -> {'videos': n, 'bytes': n}
-    per_month = {}           # 'YYYY-MM' -> n
-    recent = []              # (mtime, artist, title, bytes)
-
-    for root in _gather_media_roots(config):
-        root_abs = os.path.normpath(os.path.abspath(root))
-        for dirpath, _, filenames in os.walk(root):
-            for name in filenames:
-                if not name.lower().endswith(retention.VIDEO_EXTENSIONS):
-                    continue
-                try:
-                    stat = os.stat(os.path.join(dirpath, name))
-                except OSError:
-                    # A file can vanish mid-walk (retention sweep, a move on the
-                    # NAS). Skip it rather than failing the whole dashboard.
-                    continue
-
-                total_bytes += stat.st_size
-                video_count += 1
-
-                # Artist is the folder directly under the music root. Files
-                # elsewhere (channel destinations) still count toward totals but
-                # have no artist to attribute them to.
-                artist = None
-                here = os.path.normpath(os.path.abspath(dirpath))
-                if here != music_root and _is_under(here, music_root):
-                    artist = titles.folder_to_artist(
-                        os.path.basename(here.rstrip(os.sep)))
-                elif here != root_abs:
-                    artist = os.path.basename(here.rstrip(os.sep))
-
-                if artist:
-                    bucket = per_artist.setdefault(
-                        artist, {'videos': 0, 'bytes': 0, 'dir': here})
-                    bucket['videos'] += 1
-                    bucket['bytes'] += stat.st_size
-
-                month = time.strftime('%Y-%m', time.localtime(stat.st_mtime))
-                per_month[month] = per_month.get(month, 0) + 1
-                recent.append((stat.st_mtime, artist or '', name, stat.st_size))
-
-    recent.sort(reverse=True)
-    cutoff_30d = now - (30 * 86400)
-
-    # Artwork status is folded in here rather than left to
-    # /api/artists/summary. The dashboard's Plex-health panel originally called
-    # that endpoint, which walks the media root all over again — measured at
-    # 0.75s per call, every call, against 0.00s for this cache. That second
-    # traversal was exactly the duplication a single scan exists to avoid, and
-    # it was the whole reason the dashboard felt slow. One extra isdir/isfile
-    # check per artist folder is nothing next to a second full walk.
-    missing_artwork = 0
-    for info in per_artist.values():
-        info['has_artwork'] = has_artwork(info['dir'])
-        if not info['has_artwork']:
-            missing_artwork += 1
-
-    data = {
-        'artists': len(per_artist),
-        'videos': video_count,
-        'bytes': total_bytes,
-        'added_30d': sum(1 for r in recent if r[0] >= cutoff_30d),
-        'missing_artwork': missing_artwork,
-        'months': _month_series(per_month, LIBRARY_HISTORY_MONTHS, now),
-        'top_artists': sorted(
-            ({'artist': a, 'videos': v['videos'], 'bytes': v['bytes']}
-             for a, v in per_artist.items()),
-            key=lambda a: (-a['bytes'], a['artist']))[:TOP_ARTISTS_LIMIT],
-        'recent': [{'artist': a, 'title': titles.clean_video_title(
-                        os.path.splitext(t)[0]),
-                    'bytes': b, 'added_at': m}
-                   for m, a, t, b in recent[:RECENTLY_ADDED_LIMIT]],
-        # The UI says "added" rather than "downloaded", and shows this string in
-        # a tooltip on the Added card, so the caveat travels with the number
-        # instead of living only in a comment.
-        'dates_from': 'file modification time',
-    }
-
-    with _LIBRARY_SCAN_LOCK:
-        _LIBRARY_SCAN_CACHE.update({'at': now, 'data': data})
-    return data
-
-
-_library_rescanning = False
-
-
-def _maybe_rescan_async():
-    """Refresh the library scan in the background, one at a time.
-
-    The guard matters: /api/stats and /api/library/stats are requested together
-    on every dashboard load, so without it a stale cache would start two
-    concurrent CIFS walks for the same data — and the 60-second auto-refresh
-    would keep doing it.
-    """
-    global _library_rescanning
-    with _LIBRARY_SCAN_LOCK:
-        if _library_rescanning:
-            return
-        _library_rescanning = True
-
-    def _run():
-        global _library_rescanning
-        try:
-            _library_scan(force=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f'[library] background rescan failed: {exc}')
-        finally:
-            with _LIBRARY_SCAN_LOCK:
-                _library_rescanning = False
-
-    threading.Thread(target=_run, name='library-scan', daemon=True).start()
-
-
-def _invalidate_library_scan():
-    """Drop the cached scan so the next dashboard load reflects a new file.
-
-    Called when a download completes. Without this the five-minute TTL means
-    you download something, look at the dashboard, and it isn't there — which
-    reads as a bug rather than as caching. Invalidating on the event is far
-    better than shortening the TTL: it costs one rescan when something actually
-    changed, instead of a CIFS walk every minute forever.
-
-    Drops the *data*, not just the timestamp. Expiring the timestamp alone is
-    not enough now that a stale entry is served while it refreshes: the next
-    read would hand back the pre-download counts and only correct itself once
-    the background scan landed, so the download still appeared to do nothing.
-    With no cached value there is nothing stale to serve, so the next read
-    blocks and returns the truth — which is the right trade for an event that
-    happens once per completed download.
-    """
-    with _LIBRARY_SCAN_LOCK:
-        _LIBRARY_SCAN_CACHE['at'] = 0.0
-        _LIBRARY_SCAN_CACHE['data'] = None
-
-
-def _is_under(child, parent):
-    """True if child is inside parent, comparing whole path components."""
-    try:
-        return os.path.commonpath([child, parent]) == parent
-    except ValueError:      # different drives on Windows
-        return False
-
-
-def _month_series(counts, months, now):
-    """A dense, chronologically ordered month series ending at the current month.
-
-    Dense on purpose: a month with no downloads has to appear as a zero, or the
-    chart silently closes the gap and a quiet spell reads as continuous
-    activity. Sorting the dict keys alone would do exactly that.
-    """
-    series = []
-    year, month = time.localtime(now).tm_year, time.localtime(now).tm_mon
-    for offset in range(months - 1, -1, -1):
-        m = month - offset
-        y = year
-        while m <= 0:
-            m += 12
-            y -= 1
-        key = '%04d-%02d' % (y, m)
-        series.append({'month': key, 'count': counts.get(key, 0)})
-    return series
-
-
-def _library_size(force=False):
-    """Back-compat shim: (bytes, videos) from the shared scan."""
-    scan = _library_scan(force=force)
-    return scan['bytes'], scan['videos']
-
-
-def _gather_media_roots(config):
-    """Every directory this app might have downloaded videos into: the
-    music-video root plus every configured channel's resolved
-    plex_media_path plus the global plex_base_path, deduplicated."""
-    roots = set()
-    music_root = _music_root(config)
-    if os.path.isdir(music_root):
-        roots.add(os.path.normpath(music_root))
-    for ch in config.get('channels', []):
-        resolved = _resolve_plex_path(ch.get('plex_media_path', './downloads'))
-        if os.path.isdir(resolved):
-            roots.add(os.path.normpath(resolved))
-    base = config.get('plex_base_path', './downloads')
-    if os.path.isdir(base):
-        roots.add(os.path.normpath(base))
-    return sorted(roots)
 
 
 def _scan_conversion_candidates(config):
@@ -1623,19 +809,14 @@ def api_config():
         _update_config(_merge)
         return jsonify({'success': True, 'message': 'Configuration updated'})
 
-def _sanitize_folder_name(name):
-    """Sanitize a name for use as a folder name, removing invalid filesystem characters."""
-    invalid_chars = '<>:"/\\|?*'
-    for c in invalid_chars:
-        name = name.replace(c, '_')
-    # Remove leading/trailing spaces and dots (problematic on Windows)
-    name = name.strip().strip('.')
-    # Collapse multiple spaces/underscores
-    import re
-    name = re.sub(r'[_\s]+', '_', name)
-    if not name:
-        name = 'Unknown_Artist'
-    return name
+# Was a full second implementation of titles.artist_to_folder, which said
+# "mirrors _sanitize_folder_name" in its own docstring — two copies of the rule
+# that decides every artist folder name on disk, either of which could be edited
+# without the other. Deduped in v1.11.0 after confirming they agreed on all 3,029
+# inputs tried (3,000 of them randomised over spaces, dots, underscores, the
+# Windows-invalid character set, tabs and newlines), rather than on the strength
+# of the two functions looking the same.
+_sanitize_folder_name = titles.artist_to_folder
 
 
 def _resolve_existing_artist(query, root_path):
@@ -2205,20 +1386,12 @@ def api_system_health():
     # cookies.txt sat in the repo for months while nothing passed it to yt-dlp,
     # so age-restricted downloads failed with no indication why. Reporting it
     # here means "is it being used" is answerable without reading the source.
-    cookies = _cookies_file()
     return jsonify({
         'ffmpeg': binaries['ffmpeg'],
         'ffprobe': binaries['ffprobe'],
         'pillow': title_card_deps['pillow'],
         'fonts': title_card_deps['fonts'],
-        'cookies': {
-            'available': bool(cookies),
-            'path': cookies,
-            'detail': (f'In use: {cookies}' if cookies else
-                       'Not found — age-restricted and members-only videos will '
-                       'fail. Drop a yt-dlp cookies.txt into the data directory '
-                       'to enable them.'),
-        },
+        'cookies': _cookies_status(),
     })
 
 
