@@ -5645,3 +5645,202 @@ Both invariants were mutation-checked against the exact regressions they describ
 `WARNING:artwork_sync:Failed to list library items ... 192.168.1.218:32400 ...
 Connection refused` — the Plex server was down. Worth separating from the search
 failure rather than assuming one story explains both lines in a log.
+
+## FIXED, PART 1 of 2 (2026-08-19): no usable cookies file, and why System Health said cookies were fine
+
+**This was necessary but not sufficient** — fixing this alone did not stop the
+403s. See "PART 2" below for the rest of the story; read both before touching
+this area again.
+
+Every channel and music-video download started failing partway through with
+`ERROR: unable to download video data: HTTP Error 403: Forbidden` — `docker logs`
+showed the probe succeeding and the download starting normally (real progress
+percentages, real speeds), then a hard 403 anywhere from 0% to 30% in. Not a
+yt-dlp pin problem: `requirements.txt` was already on `2026.7.4`, and
+`bump-yt-dlp.yml` had run weekly (2026-08-03, 08-10, 08-17) finding no newer
+release each time. This is the classic signature of YouTube serving/throttling
+video-data URLs to a client with no valid authenticated session, not a stale
+extractor.
+
+### The actual cause
+
+The container had **no usable cookies file at all**, despite Settings → System
+Health reporting cookies as available:
+
+- `data/cookies.txt` — the path `_cookies_file()` prefers, bind-mounted from
+  `./data` — did not exist on the host.
+- The repo-root `cookies.txt` fallback existed, but it was not a YouTube
+  session export. Its full contents were one `localhost` Flask session cookie
+  (Vidshelf's own login) plus two generic consent cookies (`PREF`, `SOCS`) —
+  no `SID`/`SAPISID`/`LOGIN_INFO`/etc. It was very likely produced by a
+  browser cookie-export extension run while the *Vidshelf login tab* was
+  focused instead of a youtube.com tab.
+- It also wouldn't have reached a container built from this repo's Dockerfile
+  regardless: `.dockerignore` excludes `cookies.txt` from the build context on
+  purpose (see the "Env / secrets" block), so the only path that can ever
+  supply cookies to the running container is the bind-mounted
+  `data/cookies.txt`.
+
+`_cookies_file()` (`app.py`) only ever checked "does a file exist at this
+path" — so a garbage export and a real one reported identically. That's what
+let this sit invisible: the health panel said "In use: ./cookies.txt" the
+entire time.
+
+### The fix
+
+`_cookies_status()` (`app.py`, used by `/api/system/health`) now opens the
+resolved file and checks for at least one real auth-cookie name
+(`_YOUTUBE_AUTH_COOKIE_NAMES` — `SID`, `SAPISID`, `LOGIN_INFO`, etc.) on a
+`youtube.com`/`google.com` line before reporting `available: true`. A file
+that exists but has no real session now reports `available: false` with a
+detail message naming the path and telling the user to re-export from a
+logged-in youtube.com tab, instead of silently passing as healthy.
+
+The bogus repo-root `cookies.txt` was deleted (it was gitignored, never
+committed). The working fix is a real export dropped at `data/cookies.txt`:
+log into YouTube in a browser, export cookies for `youtube.com` specifically
+(with that tab focused) using a cookies.txt-exporting extension, and save the
+result to `data/cookies.txt` — no rebuild needed, since `_download_options()`
+resolves the path fresh on every download.
+
+### How to verify
+
+`docker exec vidshelf sh -c "cat /app/data/cookies.txt"` should show real
+`.youtube.com` lines with names like `SAPISID`/`__Secure-3PSID`/`LOGIN_INFO`,
+not just `PREF`/`SOCS`. Settings → System Health should show cookies as
+available only when that's true. **This alone does not confirm downloads
+work** — retrying a previously-403'd download still failed after this fix
+alone, at almost exactly the same byte offset every time. See PART 2.
+
+### What to check first if it regresses
+
+A cookies file passing the old "file exists" check but still failing
+downloads means the new content check in `_cookies_status()` has a gap (e.g.
+YouTube adds a new primary auth cookie name) — check the actual file content
+first, not the extractor version. And note the `available: true` boolean from
+`_cookies_status()` is display-only; `_cookies_file()` (used by
+`_download_options()`) still returns any existing path unvalidated, so a
+mid-life cookie *expiry* (as opposed to a wrong export) will still need
+System Health to be re-checked or the logs read directly — it isn't caught by
+a background check.
+
+## FIXED, PART 2 of 2 (2026-08-19): cookies were not the (whole) problem — yt-dlp itself needed three more things
+
+After PART 1 (a real cookies export at `data/cookies.txt`), retrying a
+403'd download failed again with the *identical* error, at the *identical*
+byte offset (~10MB into a 64MB 1080p stream), every single retry. That
+signature — succeeds at extraction, streams normally for a few seconds, then
+a hard, perfectly reproducible cutoff — is not a cookies problem, and chasing
+cookies further would not have fixed it. Three separate, independent gaps
+had to be closed, in this order, before a single 1080p download completed:
+
+**1. No JS runtime.** `docker logs` had been printing this on *every*
+extraction since the container's first startup on 2026-08-10, including runs
+that completed successfully that same day:
+
+```
+WARNING: [youtube] No supported JavaScript runtime could be found. Only deno
+is enabled by default... YouTube extraction without a JS runtime has been
+deprecated, and some formats may be missing.
+```
+
+**Lesson: a warning present since day one, on both successful and failing
+runs, is not automatically ruled out as the cause** — it just means whatever
+depends on it wasn't *always* on the failure path. YouTube tightening
+enforcement over the following nine days made it load-bearing. The Dockerfile
+now installs Deno (`curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh`),
+which yt-dlp auto-detects with no extra config. Confirmed present with
+`docker exec vidshelf which deno`.
+
+**2. No PO Token, and no local JS-challenge solver script.** With Deno
+installed, the same warning was gone, but the 403 at ~10MB persisted
+identically. Verbose yt-dlp (`python3 -m yt_dlp -v ...`) showed two separate
+gaps:
+
+- `[pot] PO Token Providers: ... (external, unavailable)` — nothing could
+  mint a PO Token. Fixed by adding `bgutil-ytdlp-pot-provider` to
+  `requirements.txt` (registers as a yt-dlp plugin automatically, no code
+  changes needed) and a companion `bgutil-provider` service in
+  `docker-compose.yml` (the published `brainicism/bgutil-ytdlp-pot-provider`
+  image) that it talks to over the compose-internal network. `downloader.py`
+  points yt-dlp at it via `extractor_args:
+  {'youtubepot-bgutilhttp': {'base_url': [...]}}`, overridable with the
+  `POT_PROVIDER_URL` env var for non-Docker installs.
+- `n challenge solving failed` / `Remote components challenge solver script
+  (deno) ... were skipped` — Deno itself being present is not enough; yt-dlp
+  also needs the actual challenge-solving script, which it will only fetch
+  itself if you explicitly pass `--remote-components` (a deliberate
+  anti-supply-chain-surprise default: yt-dlp does not fetch remote code
+  unless told to). Installing the `yt-dlp-ejs` PyPI package bundles that
+  script locally instead, so nothing needs to be fetched at runtime.
+
+**Both were necessary and neither alone was sufficient** — with only the PO
+Token provider, format extraction still silently dropped every high-res
+format ("skipped as they are missing a URL") because nsig resolution was
+still failing; with only `yt-dlp-ejs`, PO-Token-gated clients still 403'd
+immediately.
+
+**3. Stable yt-dlp itself (through `2026.7.4`) cannot get past YouTube's
+current SABR enforcement for DASH-only formats.** Even with cookies, Deno,
+a working PO Token provider, and `yt-dlp-ejs`, every high-resolution format
+(itag 137/136/135/etc — anything that isn't the legacy progressive-muxed
+itag 18, capped at 360p) still 403'd at ~10MB, **across every player_client
+tried** (`web_safari`, `android_vr`, `tv_embedded`, `mweb`, `android`) and
+regardless of `--http-chunk-size`. This matches yt-dlp's own open, upstream,
+"external-issue"/"not planned" tracker items (#12482, #15689, #17368) — an
+active YouTube-side rollout stable yt-dlp had not caught up to as of
+`2026.7.4`. Confirmed by installing `yt-dlp-nightly-builds` build
+`2026.08.18.122307`, which completed the exact same 1080p download that
+every stable build through `2026.7.4` failed on, immediately and repeatably.
+
+`requirements.txt` now pins yt-dlp to that nightly build via a direct URL
+(`yt-dlp @ https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.08.18.122307/yt-dlp.tar.gz`)
+instead of the usual `yt-dlp==X.Y.Z`. **This is a deliberate, documented
+exception to "pin exact stable releases"** — there was no stable release that
+worked. `bump-yt-dlp.yml` now checks for a plain `^yt-dlp==` line before
+doing anything; when it doesn't find one (this pin), it logs why and skips,
+rather than either crashing on the missing match or bumping down to the
+broken `2026.7.4` every week. **Revert to a normal stable pin the moment a
+stable release is verified to include this fix** — re-run the verification
+below against the candidate stable version first.
+
+### Two dead ends worth remembering, so they aren't re-tried
+
+- **The stale `.part` file was not the cause.** Deleting it and starting a
+  clean, non-resumed download still hit the identical 403 at almost the same
+  byte count — the resume mechanism was a red herring; the URL itself only
+  serves ~10MB before YouTube cuts it regardless of Range/resume state.
+- **`yt-dlp-ytse` (a plugin claiming native SABR downloader support) doesn't
+  work with pinned stable yt-dlp** — it imports internal yt-dlp symbols
+  (`STREAMING_DATA_INITIAL_PO_TOKEN`, `short_client_name`) that don't exist in
+  `2026.7.4`, and fails to load at all. Not used in the final fix.
+
+### How to verify
+
+1. `docker exec vidshelf which deno` — must print a path.
+2. `docker exec bgutil-provider` running, and
+   `docker exec vidshelf python3 -c "import urllib.request; print(urllib.request.urlopen('http://bgutil-provider:4416/ping').read())"`
+   returns `{"server_uptime":...}`.
+3. `docker exec vidshelf python3 -m yt_dlp --version` matches the nightly
+   pin, not a stable-looking `YYYY.M.D`.
+4. Retry a previously-403'd download from the Downloads page (or trigger a
+   full channel/music-artist backfill) and confirm **1080p** files complete —
+   not just 360p (itag 18 succeeding while everything else fails is exactly
+   the PART 2 symptom, still present).
+5. `ffprobe` the resulting file: `width=1920 height=1080 codec_name=h264`.
+
+### What to check first if it regresses
+
+- 403 again at a suspiciously consistent byte offset, itag 18 (360p) working
+  while higher resolutions fail: this is the SABR wall again, not cookies.
+  Check whether a newer nightly (or by then, stable) yt-dlp fixes it before
+  touching anything else.
+- `bgutil-provider` container not running, or unreachable at
+  `http://bgutil-provider:4416`: PO Token generation fails closed with a
+  warning, not a hard error, so downloads will still *attempt* to run and
+  still 403 — check `docker ps` and the ping command above, not just app logs.
+- Heavy concurrent load (a full channel backfill retried in bulk) can produce
+  a transient `[Errno 12] Cannot allocate memory` from spawning many
+  yt-dlp+ffmpeg+Deno subprocesses at once — distinct from HTTP 403, self-heals
+  on retry, and is not part of this bug. Don't conflate the two failure modes
+  when reading logs from a bulk retry.

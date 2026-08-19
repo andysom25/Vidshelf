@@ -1,10 +1,24 @@
 name: vidshelf
 
 services:
+  # Mints YouTube PO Tokens for yt-dlp (via the bgutil-ytdlp-pot-provider
+  # plugin in requirements.txt). Without one, YouTube serves an unauthenticated
+  # client a throttled stream that a valid JS runtime alone doesn't fix — it
+  # downloads normally for a few seconds/megabytes, then dies mid-stream with
+  # HTTP 403, every single time (see REFERENCE.md, 2026-08-19). Not exposed to
+  # the host: vidshelf reaches it over the compose-internal network at
+  # http://bgutil-provider:4416, the default downloader.py points at.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    restart: unless-stopped
+
   vidshelf:
     build: .
     container_name: vidshelf
     restart: unless-stopped
+    depends_on:
+      - bgutil-provider
     ports:
       - "5000:5000"
       # If the page hangs for ~30s on Windows and assets show as "(failed)" in

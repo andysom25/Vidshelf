@@ -33,6 +33,21 @@ jobs:
       - name: Find the latest yt-dlp
         id: latest
         run: |
+          # requirements.txt is sometimes deliberately pinned past the current
+          # PyPI stable via a direct URL (see REFERENCE.md, 2026-08-19: every
+          # stable release through 2026.7.4 hit a hard YouTube-side 403 wall
+          # that only a specific nightly build got past). That pin has no
+          # `^yt-dlp==` line for this grep to find, and — until a stable
+          # release actually incorporates the fix — PyPI's "latest" is older
+          # than what's pinned, so a plain string-inequality bump would
+          # regress it back to the broken build. Skip rather than fight it;
+          # revert requirements.txt to a plain pin by hand once a stable
+          # release is verified to carry the fix.
+          if ! grep -qP '^yt-dlp==' requirements.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "requirements.txt has no plain yt-dlp==X.Y.Z pin (likely a deliberate override, see REFERENCE.md) — skipping"
+            exit 0
+          fi
           latest=$(curl -fsSL https://pypi.org/pypi/yt-dlp/json | python -c "import json,sys; print(json.load(sys.stdin)['info']['version'])")
           current=$(grep -oP '^yt-dlp==\K.*' requirements.txt)
           echo "latest=$latest"   >> "$GITHUB_OUTPUT"

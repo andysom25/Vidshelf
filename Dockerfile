@@ -12,7 +12,23 @@ ENV PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-dejavu-core \
+    curl \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Deno — yt-dlp's YouTube extractor needs an external JS runtime to solve
+# YouTube's signature/n-parameter/PoToken challenge (its "EJS" requirement;
+# see https://github.com/yt-dlp/yt-dlp/wiki/EJS). Without one, extraction logs
+# "No supported JavaScript runtime could be found" and falls back to formats
+# whose signed googlevideo.com URLs are invalid or throttled — downloads start
+# fine and then die mid-stream with HTTP 403, every single time, once YouTube
+# stops accepting the un-solved fallback (see REFERENCE.md, 2026-08-19). Deno
+# is what yt-dlp auto-detects with zero extra config, so no --js-runtimes flag
+# is needed. curl/unzip above are only for this install step, not runtime deps
+# of the app itself.
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && apt-get purge -y --auto-remove curl unzip \
+    && rm -rf /var/lib/apt/lists/* /root/.cache
 
 WORKDIR /app
 

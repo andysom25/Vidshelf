@@ -215,6 +215,51 @@ def _cookies_file():
     return None
 
 
+# Any real YouTube session carries at least one of these on a youtube.com/
+# google.com line. A file exported from the wrong tab (e.g. Vidshelf's own
+# localhost login page) has neither — it passes the old "does a file exist"
+# check while doing nothing for yt-dlp, which is exactly how this went
+# unnoticed until every download started failing with HTTP 403s.
+_YOUTUBE_AUTH_COOKIE_NAMES = ('SAPISID', 'SSID', 'HSID', 'SID', 'LOGIN_INFO',
+                              '__Secure-1PSID', '__Secure-3PSID')
+
+
+def _cookies_status():
+    """Whether a *usable* cookies file is present — not just one that exists.
+
+    A cookies.txt with no real YouTube auth cookies (e.g. exported from the
+    wrong browser tab) used to report 'available: true' here, because the old
+    check only asked whether a file existed at the path. That let a broken
+    export sit invisible until age-restricted/members-only downloads failed
+    with no indication why.
+    """
+    path = _cookies_file()
+    if not path:
+        return {
+            'available': False,
+            'path': None,
+            'detail': 'Not found — age-restricted and members-only videos will '
+                       'fail. Drop a yt-dlp cookies.txt into the data directory '
+                       'to enable them.',
+        }
+    try:
+        with open(path, encoding='utf-8') as f:
+            content = f.read()
+    except OSError:
+        content = ''
+    has_youtube_domain = 'youtube.com' in content or 'google.com' in content
+    has_auth_cookie = any(name in content for name in _YOUTUBE_AUTH_COOKIE_NAMES)
+    if has_youtube_domain and has_auth_cookie:
+        return {'available': True, 'path': path, 'detail': f'In use: {path}'}
+    return {
+        'available': False,
+        'path': path,
+        'detail': f'Found at {path}, but it has no YouTube login cookies — '
+                  'export cookies.txt from your browser while logged into '
+                  'youtube.com (not this app), then replace the file.',
+    }
+
+
 # The download tracker and the music-video key scheme live in tracker.py as of
 # v1.11.0. Re-exported for the routes still here; blueprints import directly.
 MUSIC_KEY_PREFIX = tracker.MUSIC_KEY_PREFIX
@@ -1341,20 +1386,12 @@ def api_system_health():
     # cookies.txt sat in the repo for months while nothing passed it to yt-dlp,
     # so age-restricted downloads failed with no indication why. Reporting it
     # here means "is it being used" is answerable without reading the source.
-    cookies = _cookies_file()
     return jsonify({
         'ffmpeg': binaries['ffmpeg'],
         'ffprobe': binaries['ffprobe'],
         'pillow': title_card_deps['pillow'],
         'fonts': title_card_deps['fonts'],
-        'cookies': {
-            'available': bool(cookies),
-            'path': cookies,
-            'detail': (f'In use: {cookies}' if cookies else
-                       'Not found — age-restricted and members-only videos will '
-                       'fail. Drop a yt-dlp cookies.txt into the data directory '
-                       'to enable them.'),
-        },
+        'cookies': _cookies_status(),
     })
 
 

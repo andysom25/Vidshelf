@@ -387,6 +387,15 @@ def download_video(video_id, download_path, plex_media_path, title='Unknown', ch
     # Use ffmpeg from PATH by default; override via env var if needed
     ffmpeg_bin = os.environ.get('FFMPEG_PATH')
 
+    # PO Token provider (bgutil-ytdlp-pot-provider, registered via
+    # requirements.txt). Without one, YouTube throttles the unauthenticated
+    # client and the download dies mid-stream with HTTP 403 a few megabytes
+    # in — a JS runtime alone (see build_format_selector's neighbor, the
+    # Dockerfile's Deno install) only fixes signature descrambling, not this.
+    # docker-compose.yml's default points at the bundled bgutil-provider
+    # service; overridable for non-Docker installs running their own.
+    pot_provider_url = os.environ.get('POT_PROVIDER_URL', 'http://bgutil-provider:4416')
+
     # Cookies unlock age-restricted and members-only content. The file existed
     # in this repo (gitignored) since long before this, but nothing ever passed
     # it to yt-dlp — so those downloads simply failed with no indication why.
@@ -400,6 +409,7 @@ def download_video(video_id, download_path, plex_media_path, title='Unknown', ch
             'merge_output_format': 'mp4',
             'quiet': False, # Set quiet to False for debugging
             'no_warnings': False, # Set no_warnings to False for debugging
+            'extractor_args': {'youtubepot-bgutilhttp': {'base_url': [pot_provider_url]}},
         }
         if ffmpeg_bin:
             opts['ffmpeg_location'] = ffmpeg_bin
