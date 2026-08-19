@@ -5844,3 +5844,130 @@ below against the candidate stable version first.
   yt-dlp+ffmpeg+Deno subprocesses at once — distinct from HTTP 403, self-heals
   on retry, and is not part of this bug. Don't conflate the two failure modes
   when reading logs from a bulk retry.
+
+---
+
+## v1.11.0 — decoupling app.py, and the trap that made ordering matter
+
+Written up in v1.11.1, because v1.11.0's release notes are entirely about the
+HTTP 403 download fix that shipped in the same release — the restructuring below
+went out undocumented, which is the one thing CLAUDE.md says not to let happen.
+
+`app.py` was 3,262 lines and 66 routes. Five modules came out of it, taking it to
+2,398; the routes themselves move later. What is worth recording is not the file
+layout — it is the three things the move exposed, and the one that would have made
+the whole refactor dangerous.
+
+### The invariants were keyed to a filename, which a refactor defeats
+
+Ten invariants in `tests/test_invariants.py` read `_read('app.py')`. Moving a
+route out of that file does not fail them. It **satisfies** them, silently,
+because the pattern each one forbids is no longer in the file being read. Five of
+the ten guard bugs that actually shipped: the v1.6.1/v1.7.0 missing session
+checks, v1.8.0's dropped cookies, v1.10.1's unbounded probe and its inert timeout.
+
+This is the same failure already recorded here for the retention invariant —
+*"defeated by any rename"* — and it is worse in a refactor, because a refactor
+touches many files at once and every test stays green.
+
+Demonstrated before relying on it. A hand-written `if 'username' not in session`
+was planted in a new `webauth.py`, and an unbounded `ydl_opts = {...}` probe in a
+new `routes/scratch.py`, then both suites were run against the same tree:
+
+    old invariants:  27/27 passed    <- caught neither
+    new invariants:  both FAIL
+
+`APP_MODULES` + `_app_sources()` now name what "the app" means, and
+`test_the_app_source_list_covers_every_route_module` walks every `.py` in the repo
+and fails on any that registers Flask routes from outside that set — so a future
+`api/v2/` package cannot be invisible to the `routes/*.py` glob.
+
+**Do not blanket-convert such checks.** `test_werkzeug_dev_server_is_not_the_default`
+deliberately still reads `app.py` alone: it asserts `app.run(` sits under
+`debug_mode`, and made app-wide it would pass if *any* file had `app.run(` with
+`debug_mode` within twelve lines. Widening a guard's input can weaken it.
+
+**And a marker comment cannot delimit files for these checks.** `_code_lines()`
+splits each line on `#` and drops what remains when empty, so a
+`# ==== name ====` separator is gone before any window is taken — verified, not
+assumed. Two invariants slice a fixed character window after a `def`, which in a
+concatenated string would run off one file's end and assert against the next
+module's text. `_app_code_by_file()` and `_find_in_app_code()` search within a
+single module instead, which removes the question rather than mitigating it.
+
+### `import x` succeeding does not mean `x` works
+
+`library.py` called `downloader_module.sweep_staging()` without importing
+`downloader`. `import library` succeeded, because Python resolves a module-level
+global at call time — so `ci.yml`'s "check every module imports" step stayed
+green while `_sweep_staging_dirs()` was a guaranteed `NameError`, and that runs
+during **startup**. Every boot would have hit it.
+
+No test caught this. `pyflakes` did, in one second. **Any extraction of this kind
+should be followed by a static undefined-name pass**, because the failure mode is
+a name that only resolves when a line runs, and the import check is precisely the
+thing that looks like it would catch it.
+
+It found the same class of bug again in `tracker.py` on the next commit.
+
+### Rebinding a re-export does not change what the owner sees
+
+`tests/test_downloads.py` substituted the quality probe with
+`app.get_video_formats_info = fake`. Once `_enrich_video_qualities` moved to
+`youtube.py`, it resolved that name against **its own** module globals, so
+patching the app's re-export did nothing — and all three v1.10.1 regression tests
+failed on the extraction commit. `tests/test_library.py` had the same problem with
+`app._LIBRARY_SCAN_CACHE`.
+
+Both now address the owning module. The general rule: a test that patches module
+state must patch the module that *defines* it, and `app.py`'s convenience
+re-exports are not that module. This is also the good news — the tests failing
+loudly is what a "pure move" is supposed to do when it isn't pure.
+
+### One rule, two implementations, and it decided folder names
+
+`_music_retry_destination` needed `_sanitize_folder_name`, which turned out to be
+a second byte-identical implementation of `titles.artist_to_folder` — whose own
+docstring read *"mirrors _sanitize_folder_name"*. Two copies of the rule that
+names every artist folder on disk, either editable without the other, and the
+first place a divergence surfaces is **where a retried music video lands**: wrong
+folder means no artwork, no collection, invisible on the Artists page.
+
+Collapsed onto `titles.artist_to_folder` — after checking rather than reading:
+3,029 inputs, 3,000 randomised over spaces, dots, underscores, the
+Windows-invalid set, tabs and newlines. Identical on every one.
+`test_there_is_one_folder_name_sanitiser` keeps the copy from returning.
+
+### The route inventory is pinned before the routes move
+
+`test_the_complete_route_inventory_is_unchanged` holds all 67 rules with their
+exact method sets. `test_routes_are_registered` spot-checks ~20 known paths, which
+cannot notice a route dropped outside that list or a method quietly added.
+Mutation-checked both ways: deleting `/api/monitor/status` is caught, and adding
+`GET` to `/api/monitor/run` is caught **while the existing spot-check missed it**.
+
+`test_no_route_is_registered_twice` covers what a set comparison cannot — one path
+served by two endpoints, which is what registering a blueprint twice produces.
+
+### Why the routes did not move with the helpers
+
+The plan costed this as "extract the helpers, then move the routes". An AST
+pass over the 64 route functions found they reference **22 app-level names** that
+are neither Flask nor already extracted: `_DOWNLOAD_EXECUTOR`, `_CONVERSION_STATE`
+and its lock, `_CHANNEL_MONITOR`, the two search caches with their TTLs and page
+sizes, `_cache_put`, `_download_options`, `_notify_download`, `_cookies_file`.
+
+A blueprint importing any of them imports `app`, and `app` imports the
+blueprints — the cycle the whole design exists to avoid. So the routes cannot move
+until roughly four more service modules (`caches`, `downloads`, `conversion`,
+`monitor`) come out first. That is a second chunk the size of the extraction, and
+it was deferred rather than reached for with `current_app` or inside-the-function
+imports, which is how this file became hard to reason about in the first place.
+
+### Note for whoever moves the routes
+
+`app.py` keeps re-export aliases for every extracted name (`load_config = 
+config_store.load_config`, and so on). That is deliberate and is what let this
+land without touching any of the 66 route bodies — including, as it happened, a
+feature someone else had in flight in the working tree at the time. Delete those
+aliases only once nothing in `app.py` reads them.
