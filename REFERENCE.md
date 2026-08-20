@@ -6081,3 +6081,67 @@ library` succeeded, CI's import check passed, and the function was a guaranteed
 Installed in its own CI step rather than added to `requirements.txt`, so the suite
 stays dependency-free. The project is clean as of this release: no unused imports,
 no unreachable locals.
+
+---
+
+## v1.12.1 — the release that looked broken because the browser kept the old page
+
+Reported immediately after upgrading to v1.12.0: none of the new sort/filter
+controls were there, and the search help text still described the old ranking —
+while the sidebar read **v1.12.0**.
+
+That combination is the whole diagnosis, and it is worth recognising on sight:
+**new version reported, old interface shown** means the markup is stale and the
+scripts are not. The version in the sidebar comes from `/api/system/version`,
+which a cached script still fetches correctly.
+
+### What was actually wrong
+
+Flask served rendered HTML with **no cache headers whatsoever**:
+
+    HTTP/1.1 200 OK
+    (no Cache-Control, no ETag, no Expires)
+
+so a browser applied its own heuristic freshness and reused the page. Static files
+were fine — Flask gives them `Cache-Control: no-cache` plus an ETag, so they
+revalidate and update. The result after an upgrade is the **new JavaScript running
+against the previous release's DOM**. In v1.12.0 the sort and filter controls live
+in the template, so `document.getElementById('music-video-controls')` found
+nothing and the feature was invisible.
+
+Fixed in `webauth._set_security_headers`, which is already an `after_request` hook
+on every response:
+
+    if response.mimetype == 'text/html':
+        response.headers['Cache-Control'] = 'no-store, must-revalidate'
+
+**Only HTML, deliberately.** Static assets keep revalidate-with-ETag: a 304 is
+nearly free, and `no-store` there would re-download ~170 KB of JavaScript on every
+navigation to solve a problem those files never had.
+
+`test_html_is_not_cacheable_but_static_assets_are` pins both halves and is
+mutation-checked — removing the header fails it with the real message.
+
+**This affected every release that changed the interface**, not only v1.12.0. It
+was merely most visible on one that added new controls rather than altering
+existing ones.
+
+### Two tooling mistakes made while diagnosing it, both already documented here
+
+Worth recording that the notes did not prevent them:
+
+- **`grep -c` in a truthiness test.** The first check of whether the running
+  container had the new code was
+  `present=$(docker exec ... "grep -c '$name' /app/$file || echo 0")`. `grep -c`
+  prints `0` *and* exits non-zero on no match, so `|| echo 0` appended a second
+  line: the value became `"0\n0"`, which is not equal to `"0"`, and every absent
+  marker was reported **present**. It showed a v1.11.1 container as already having
+  v1.12.0's code. Use `grep -q` and branch on the exit status.
+- **`MSYS_NO_PATHCONV=1` with `curl -o`.** Already in this file from v1.10.0, and
+  walked into again: the output path is passed through literally, curl writes
+  nothing, and every subsequent check reports ABSENT for a file that was never
+  created. Drop the variable for the call, or write to a relative path.
+
+Both produced confident, wrong readings about whether the deployed code was
+current — the exact question being asked. When a check disagrees with another
+observation, suspect the check.
