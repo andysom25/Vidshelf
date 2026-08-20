@@ -59,6 +59,23 @@ jobs:
           node --check static/js/dashboard.js
           node tests/test_artists_filter.js
 
+      # pyflakes, not a style linter: the only rule that matters here is
+      # "a name is used but never defined or imported".
+      #
+      # That is a real failure this project has already had. library.py called
+      # downloader_module.sweep_staging() without importing downloader; `import
+      # library` still succeeded, because Python resolves a module-level global
+      # at call time, so the import check below was green while the function was
+      # a guaranteed NameError -- and it runs during startup, so every boot would
+      # have hit it. No test caught it; pyflakes did, instantly.
+      #
+      # Installed here rather than added to requirements.txt: it is a CI/dev tool,
+      # and the suite itself stays dependency-free.
+      - name: Check for undefined names
+        run: |
+          pip install pyflakes
+          python -m pyflakes *.py tests/*.py
+
       - name: Check every module imports
         # Catches the class of breakage that only shows up at import time,
         # which is exactly where the pre-v1.1.0 fresh-install crash lived.

@@ -241,8 +241,44 @@
                                onfocus="this.style.borderColor='#e94560'" onblur="this.style.borderColor='rgba(255,255,255,0.1)'">
                         <button class="btn btn-primary" onclick="searchMusicVideos()" id="music-video-search-btn" style="padding:12px 28px;">🔍 Search</button>
                     </div>
-                    <div class="help-text" style="margin-top:8px;">Searches YouTube for official music videos, ranked by quality signals (official channel, views, quality, recency)</div>
+                    <div class="help-text" style="margin-top:8px;">Searches YouTube for official music videos, ranked by quality signals (official channel, views, title quality)</div>
                 </div>
+
+                <!-- Sort re-queries the server; filter is client-side over the
+                     cards already loaded. They are deliberately different: the
+                     ranked result set lives in a server-side cache and is paged
+                     from there, so changing the order has to come from the
+                     server (and resets to page 1), while narrowing what you can
+                     already see should not cost a round trip. The summary line
+                     says "loaded results" for that reason - filtering cannot
+                     reach results that have not been paged in yet. -->
+                <div id="music-video-controls" style="display:none;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:16px;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:0.85em;color:#8888a0;">
+                        Sort
+                        <select id="music-video-sort" onchange="onMusicVideoSortChange()"
+                                style="padding:7px 10px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#e0e0e0;font-size:0.95em;">
+                            <option value="score">Best match</option>
+                            <option value="views">Most viewed</option>
+                            <option value="duration">Longest</option>
+                        </select>
+                    </label>
+
+                    <div style="position:relative;flex:1;min-width:180px;max-width:320px;">
+                        <input type="text" id="music-video-filter-input" placeholder="Filter loaded results..."
+                               oninput="onMusicVideoFilterInput()"
+                               style="width:100%;padding:7px 28px 7px 10px;background:#0f0f1a;border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#e0e0e0;font-size:0.95em;">
+                        <button id="music-video-filter-clear" onclick="clearMusicVideoFilter()" title="Clear filter"
+                                style="display:none;position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:#8888a0;cursor:pointer;font-size:1em;line-height:1;padding:2px 4px;">&times;</button>
+                    </div>
+
+                    <label style="display:flex;align-items:center;gap:6px;font-size:0.85em;color:#8888a0;cursor:pointer;">
+                        <input type="checkbox" id="music-video-hide-downloaded" onchange="applyMusicVideoFilter()"
+                               style="cursor:pointer;">
+                        Hide already downloaded
+                    </label>
+                </div>
+                <div id="music-video-filter-summary" style="font-size:0.85em;color:#8888a0;margin-bottom:12px;"></div>
+
                 <div id="music-video-search-status" style="min-height:60px;"></div>
                 <div id="music-video-results" class="video-grid"></div>
             </div>

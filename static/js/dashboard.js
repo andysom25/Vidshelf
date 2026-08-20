@@ -985,6 +985,8 @@
 
         let musicVideoSearchPage = 1;
 
+        let musicVideoSearchSort = 'score';
+
         // Comfortably above what the server allows itself: the search is a few
         // seconds plus PROBE_WALL_CLOCK_TIMEOUT (25s) for the quality labels, so
         // a healthy request finishes well inside this. Set it below the server's
@@ -1012,8 +1014,17 @@
                 qualityBadge = `<span style="font-size:0.7em;padding:2px 8px;border-radius:4px;background:${qColor}22;color:${qColor};border:1px solid ${qColor}44;font-weight:600;">${quality}</span>`;
             }
 
+            const downloaded = !!v.already_downloaded;
+            const downloadedBadge = downloaded
+                ? `<span style="font-size:0.7em;padding:2px 8px;border-radius:4px;background:#7ddf9022;color:#7ddf90;border:1px solid #7ddf9044;font-weight:600;">✓ Downloaded</span>`
+                : '';
+
+            // data-title/data-channel back the in-results text filter
+            // (applyMusicVideoFilter) — reading them via .dataset decodes the
+            // escaped HTML back to plain text, so no separate JS-side copy of
+            // the search results needs to be retained just for filtering.
             return `
-                <div class="video-card">
+                <div class="video-card"${downloaded ? ' style="opacity:0.6;"' : ''} data-video-id="${escapeHtml(v.id)}" data-title="${escapeHtml(title)}" data-channel="${escapeHtml(channel)}" data-downloaded="${downloaded}">
                     ${thumb ? `<img class="video-thumb" src="${thumb}" alt="${escapeHtml(title)}" onerror="this.style.display='none'">` : '<div class="video-thumb" style="display:flex;align-items:center;justify-content:center;font-size:2em;">🎬</div>'}
                     <div class="video-info">
                         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px;">
@@ -1030,12 +1041,88 @@
                             <span>⏱ ${duration}</span>
                             <span>👁 ${views}</span>
                             ${qualityBadge ? '<span>' + qualityBadge + '</span>' : ''}
+                            ${downloadedBadge ? '<span>' + downloadedBadge + '</span>' : ''}
                         </div>
                         <div class="video-actions">
                             <button class="btn btn-primary btn-sm" data-video-id="${escapeHtml(v.id)}" data-title="${escapeHtml(title)}" onclick="downloadMusicVideo(this)">⬇ Download</button>
                         </div>
                     </div>
                 </div>`;
+        }
+
+        // ---------- Music Videos: filter bar (sort / hide-downloaded / in-results search) ----------
+
+        function updateMusicVideoFilterBarVisibility() {
+            const bar = document.getElementById('music-video-filters');
+            if (bar) bar.style.display = musicVideoSearchArtist ? 'flex' : 'none';
+        }
+
+        // Pure client-side — only ever hides/shows cards already in the DOM.
+        // Sort (unlike this) has to be a full re-search: see onMusicVideoSortChange.
+        function setMusicVideoControlsVisible(visible) {
+            const bar = document.getElementById('music-video-controls');
+            if (bar) bar.style.display = visible ? 'flex' : 'none';
+            if (!visible) {
+                const summary = document.getElementById('music-video-filter-summary');
+                if (summary) summary.innerHTML = '';
+            }
+        }
+
+        function applyMusicVideoFilter() {
+            const grid = document.getElementById('music-video-results');
+            const summary = document.getElementById('music-video-filter-summary');
+            if (!grid) return;
+
+            const queryInput = document.getElementById('music-video-filter-input');
+            const query = (queryInput ? queryInput.value : '').trim().toLowerCase();
+            const hideDownloaded = !!document.getElementById('music-video-hide-downloaded')?.checked;
+
+            const clearBtn = document.getElementById('music-video-filter-clear');
+            if (clearBtn) clearBtn.style.display = query ? 'block' : 'none';
+
+            const cards = grid.querySelectorAll('.video-card');
+            let visible = 0;
+            cards.forEach(card => {
+                const matchesQuery = !query
+                    || card.dataset.title.toLowerCase().includes(query)
+                    || card.dataset.channel.toLowerCase().includes(query);
+                const matchesDownloaded = !hideDownloaded || card.dataset.downloaded !== 'true';
+                const show = matchesQuery && matchesDownloaded;
+                card.style.display = show ? '' : 'none';
+                if (show) visible += 1;
+            });
+
+            if (summary) {
+                summary.innerHTML = cards.length === 0 ? '' :
+                    (visible === cards.length
+                        ? `Showing all <strong>${cards.length}</strong> loaded results`
+                        : `Showing <strong>${visible}</strong> of <strong>${cards.length}</strong> loaded results`)
+                    + ' — "Load More" to search/filter further results.';
+            }
+        }
+
+        let _musicVideoFilterTimer = null;
+        function onMusicVideoFilterInput() {
+            clearTimeout(_musicVideoFilterTimer);
+            _musicVideoFilterTimer = setTimeout(applyMusicVideoFilter, 120);
+        }
+
+        function clearMusicVideoFilter() {
+            const input = document.getElementById('music-video-filter-input');
+            if (input) { input.value = ''; input.focus(); }
+            applyMusicVideoFilter();
+        }
+
+        // Sort is applied server-side against the *whole* cached result set,
+        // not just what's loaded — so unlike the text filter/hide-downloaded
+        // toggle above, changing it has to re-run the search from page 1
+        // rather than reordering the cards already in the DOM. Reordering
+        // in place would leave an already-loaded "page 2" in the old sort
+        // order sitting after a freshly-resorted "page 1", silently wrong.
+        async function onMusicVideoSortChange() {
+            musicVideoSearchSort = document.getElementById('music-video-sort').value;
+            if (!musicVideoSearchArtist) return;
+            await fetchMusicVideoPage(/*append=*/false);
         }
 
         function removeMusicVideoLoadMoreButton() {
@@ -1058,22 +1145,25 @@
         }
 
         async function fetchMusicVideoPage(append) {
-            const input = document.getElementById('music-video-search-input');
             const btn = document.getElementById('music-video-search-btn');
             const status = document.getElementById('music-video-search-status');
             const grid = document.getElementById('music-video-results');
 
+            // musicVideoSearchArtist must already be set by the caller —
+            // searchMusicVideos() sets it from the search box;
+            // onMusicVideoSortChange() re-runs the existing artist with a new
+            // sort. Reading the search box's *current* value here instead
+            // would re-search whatever's typed at that moment rather than
+            // what was actually last searched, which is wrong when the box
+            // has since been edited without clicking Search.
             if (!append) {
-                const artist = input.value.trim();
-                if (!artist) {
+                if (!musicVideoSearchArtist) {
                     showToast('❌ Please enter an artist name', 'error');
-                    input.focus();
                     return;
                 }
-                musicVideoSearchArtist = artist;
                 musicVideoSearchPage = 1;
                 grid.innerHTML = '';
-                status.innerHTML = '<div class="loading"><div class="spinner"></div><p>Searching for music videos by ' + escapeHtml(artist) + '...</p></div>';
+                status.innerHTML = '<div class="loading"><div class="spinner"></div><p>Searching for music videos by ' + escapeHtml(musicVideoSearchArtist) + '...</p></div>';
             } else {
                 musicVideoSearchPage += 1;
                 removeMusicVideoLoadMoreButton();
@@ -1095,7 +1185,8 @@
                 const resp = await fetch('/api/music-videos/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ artist: musicVideoSearchArtist, page: musicVideoSearchPage }),
+                    body: JSON.stringify({ artist: musicVideoSearchArtist, page: musicVideoSearchPage,
+                                           sort: musicVideoSearchSort }),
                     signal: controller.signal
                 });
 
@@ -1124,6 +1215,7 @@
 
                 if (!data.videos || data.videos.length === 0) {
                     if (!append) {
+                        setMusicVideoControlsVisible(false);
                         status.innerHTML = '<div class="empty-state"><div class="empty-icon">🎵</div><p>No music videos found for "' + escapeHtml(musicVideoSearchArtist) + '". Try a different search term.</p></div>';
                     }
                     return;
@@ -1136,6 +1228,16 @@
                 });
 
                 if (data.has_more) addMusicVideoLoadMoreButton(grid);
+
+                setMusicVideoControlsVisible(true);
+
+                // Reapply the text/hide-downloaded filter to what was just
+                // rendered. applyMusicVideoFilter() walks the DOM rather than a
+                // retained copy of the results, so cards appended by "Load More"
+                // start out unfiltered — without this, filtering to one artist
+                // and then loading more silently shows every new result. Also
+                // covers a sort change, which re-renders page 1 from scratch.
+                applyMusicVideoFilter();
             } catch (e) {
                 // "Failed to fetch" is the browser's TypeError for a connection
                 // that died, and on its own it is indistinguishable from an
@@ -1162,6 +1264,17 @@
         }
 
         async function searchMusicVideos() {
+            // Read the box HERE, not in fetchMusicVideoPage. That function is
+            // also the "Load More" and sort-change path, and both must re-query
+            // the artist that was actually searched rather than whatever is
+            // currently typed — which is why it documents the artist as the
+            // caller's responsibility. This is the caller that owns it, and it
+            // was the one place not doing so: the Search button called through
+            // without setting it, so on a fresh page musicVideoSearchArtist was
+            // still '' and the search aborted with "Please enter an artist name"
+            // no matter what had been typed.
+            const input = document.getElementById('music-video-search-input');
+            musicVideoSearchArtist = (input ? input.value : '').trim();
             await fetchMusicVideoPage(/*append=*/false);
         }
 

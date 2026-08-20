@@ -265,6 +265,11 @@ def rank_videos_by_quality(videos, artist):
             score += view_score
 
         # --- Recency bonus (up to 10 pts) ---
+        # Inert as things stand: the flat search this runs over does not return
+        # upload_date (0 of 34 on a real query), so this bonus has never actually
+        # been awarded. Left in place rather than deleted because it is correct
+        # the moment the field is populated -- but do not count it as a live
+        # ranking signal, and do not claim it in the README.
         upload_date = v.get('upload_date') or ''
         if upload_date and len(upload_date) == 8:
             try:
@@ -297,7 +302,6 @@ def get_video_formats_info(video_id):
             # Extract the best available quality label
             max_height = 0
             best_quality = 'unknown'
-            has_audio = False
             
             for f in formats:
                 height = f.get('height') or 0

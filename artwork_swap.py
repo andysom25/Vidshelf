@@ -1,15 +1,12 @@
 import os
-import json
 import shutil
 import requests
-from urllib.parse import quote
 from artwork_sync import (
     download_image,
     plex_find_library_key,
     plex_upload_collection_poster,
     _plex_headers,
     _plex_url,
-    folder_to_artist,
     artist_to_folder,
 )
 

@@ -265,6 +265,76 @@ def test_intermediate_detection():
         assert not downloader._is_intermediate(name), name
 
 
+def test_already_downloaded_is_asked_across_every_source():
+    """Regression, v1.12.0.
+
+    A YouTube video id is globally unique, so "do we already have this?" does not
+    depend on which source it was filed under. Asking per-source got it wrong
+    whenever the folder and the uploader spell the artist differently.
+
+    The real case: five Matchbox Twenty videos are tracked under
+    `music_video_Matchbox_20`, because the folder is `Matchbox_20`. A search for
+    "Matchbox Twenty" resolves to `music_video_Matchbox_Twenty`, misses, and
+    reported all five as not downloaded — so the Music Videos page offered a
+    Download button for videos already on disk, and taking it would fork a second
+    artist folder and Plex collection.
+    """
+    import tracker
+    state.write_json(tracker.TRACKER_FILE, {
+        'music_video_Matchbox_20': ['C-Naa1HXeDQ', 'HAkHqYlqops'],
+        'https://www.youtube.com/@somechannel': ['CHANNELVID1'],
+    }, indent=2)
+
+    # The spelling mismatch that used to miss.
+    for vid in ('C-Naa1HXeDQ', 'HAkHqYlqops'):
+        assert tracker.is_video_downloaded(vid, 'music_video_Matchbox_Twenty') is False, (
+            'the per-source check is expected to miss here — that is the bug')
+        assert tracker.is_video_downloaded_anywhere(vid) is True, (
+            f'{vid} is in the tracker under a different key and must count as '
+            'downloaded; otherwise the UI offers a duplicate download')
+
+    # A channel download counts too: the file is on disk either way.
+    assert tracker.is_video_downloaded_anywhere('CHANNELVID1') is True
+
+    # And something genuinely absent must still be absent.
+    assert tracker.is_video_downloaded_anywhere('NEVERSEEN01') is False
+
+    # The per-source check still works when the key does match — the music
+    # download route relies on it to decide where to file a new download.
+    assert tracker.is_video_downloaded('C-Naa1HXeDQ', 'music_video_Matchbox_20') is True
+
+
+def test_a_repeat_download_is_filed_under_the_source_it_already_has():
+    """Regression, v1.12.0 — the other half of the Matchbox case.
+
+    _resolve_existing_artist snaps a search query to an existing artist FOLDER,
+    which only works when both spell the name the same way. It cannot bridge
+    "Matchbox Twenty" to the folder `Matchbox_20`, so downloading a video that is
+    already in `Matchbox_20` after searching the band's own spelling created a
+    second `Matchbox_Twenty` folder and a second Plex collection.
+
+    The tracker already records where the video went, with no spelling involved.
+    source_holding_video() reads that back so the repeat is filed alongside the
+    original.
+    """
+    import tracker
+    state.write_json(tracker.TRACKER_FILE, {
+        'music_video_Matchbox_20': ['C-Naa1HXeDQ'],
+        'https://www.youtube.com/@somechannel': ['CHANNELVID1'],
+    }, indent=2)
+
+    assert tracker.source_holding_video('C-Naa1HXeDQ') == 'music_video_Matchbox_20'
+    assert tracker._artist_from_music_key('music_video_Matchbox_20') == 'Matchbox 20'
+
+    # A channel-sourced video must NOT redirect the artist: filing a music
+    # download under a channel URL would put it outside the artist library.
+    assert tracker.source_holding_video('CHANNELVID1') == 'https://www.youtube.com/@somechannel'
+    assert tracker._artist_from_music_key('https://www.youtube.com/@somechannel') is None
+
+    # An unseen video leaves the caller's artist untouched.
+    assert tracker.source_holding_video('NEVERSEEN01') is None
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failures = 0

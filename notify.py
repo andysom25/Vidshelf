@@ -19,7 +19,6 @@ Every failure is swallowed and logged. A broken notification URL must never
 stop a download or wedge the scheduler.
 """
 
-import json
 import threading
 import time
 from urllib.parse import urlparse
