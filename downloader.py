@@ -2,7 +2,6 @@ import os
 import shutil
 import itertools
 import re
-import json
 import threading
 import time
 import yt_dlp

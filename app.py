@@ -1,14 +1,10 @@
 import os
-import json
 import shutil
 import threading
 import concurrent.futures
 import time
-import math
-import datetime
 import secrets
 import requests
-import functools
 import state
 import config_store
 import youtube
@@ -24,7 +20,7 @@ from flask import Flask, render_template, request, redirect, url_for, session, f
 from werkzeug.security import generate_password_hash, check_password_hash
 import downloader as downloader_module
 from downloader import (download_video, get_active_downloads, queue_download,
-                        request_cancel, DownloadCancelled, build_format_selector,
+                        request_cancel, DownloadCancelled,
                         reconcile_interrupted)
 from artwork_sync import (
     ArtworkWatcher, sync_artist_artwork, sync_all_artists,
@@ -270,6 +266,8 @@ load_downloaded_tracker = tracker.load_downloaded_tracker
 save_downloaded_tracker = tracker.save_downloaded_tracker
 mark_video_downloaded = tracker.mark_video_downloaded
 is_video_downloaded = tracker.is_video_downloaded
+is_video_downloaded_anywhere = tracker.is_video_downloaded_anywhere
+source_holding_video = tracker.source_holding_video
 
 
 
@@ -869,6 +867,22 @@ def favicon():
     return Response(svg, mimetype='image/svg+xml')
 
 
+# No 'date' entry, deliberately. yt-dlp's flat search does not return
+# upload_date -- measured at 0 of 34 results for a real query -- so sorting by it
+# put every item at '' and returned the list untouched. A "Newest" option that
+# silently does nothing is worse than not offering one.
+#
+# Making it work needs a full (non-flat) probe of EVERY result, not just the nine
+# on the current page, because the sort is over the whole cached set. That is ~34
+# extra network round trips per search, which is the cost profile that made the
+# search hang in v1.10.1.
+_MUSIC_VIDEO_SORTS = {
+    'score': None,  # already the cached list's own order (rank_videos_by_quality)
+    'views': lambda v: v.get('view_count') or 0,
+    'duration': lambda v: v.get('duration') or 0,
+}
+
+
 @app.route('/api/music-videos/search', methods=['POST'])
 @require_auth
 def api_music_videos_search():
@@ -890,6 +904,9 @@ def api_music_videos_search():
         page = max(1, int(data.get('page', 1)))
     except (TypeError, ValueError):
         page = 1
+    sort = data.get('sort') or 'score'
+    if sort not in _MUSIC_VIDEO_SORTS:
+        sort = 'score'
 
     try:
         cache_key = artist.lower()
@@ -900,6 +917,13 @@ def api_music_videos_search():
             videos = search_music_videos(artist)
             _cache_put(_MUSIC_VIDEO_SEARCH_CACHE, cache_key, videos,
                        _MUSIC_VIDEO_SEARCH_CACHE_TTL)
+
+        # Sort a copy, never the cached list itself — the same cache entry
+        # is shared across requests with different `sort` values (and
+        # concurrent requests) within the TTL window. 'score' needs no
+        # resort: it's already how rank_videos_by_quality left the list.
+        sort_key = _MUSIC_VIDEO_SORTS[sort]
+        videos = sorted(videos, key=sort_key, reverse=True) if sort_key else list(videos)
 
         start = (page - 1) * MUSIC_VIDEO_SEARCH_PAGE_SIZE
         end = start + MUSIC_VIDEO_SEARCH_PAGE_SIZE
@@ -919,11 +943,23 @@ def api_music_videos_search():
         # never trade the search results for it.
         _enrich_video_qualities(page_videos)
 
+        # Asked across every source rather than under this artist's key.
+        # Resolving the artist first (as the download route does) is still not
+        # enough: five Matchbox Twenty videos are tracked under
+        # `music_video_Matchbox_20` because the folder is `Matchbox_20`, so a
+        # search for "Matchbox Twenty" reported all five as not downloaded.
+        # A video id is globally unique, so the source it was filed under does
+        # not change whether the file exists. See
+        # tracker.is_video_downloaded_anywhere.
+        for v in page_videos:
+            v['already_downloaded'] = is_video_downloaded_anywhere(v['id'])
+
         return jsonify({
             'videos': page_videos,
             'artist': artist,
             'page': page,
             'page_size': MUSIC_VIDEO_SEARCH_PAGE_SIZE,
+            'sort': sort,
             'total': len(videos),
             'has_more': end < len(videos),
         })
@@ -953,6 +989,24 @@ def api_music_videos_download():
     # near-duplicate artist folder/collection if the artist is already
     # known — snap back to the existing artist's canonical name.
     artist = _resolve_existing_artist(artist, final_path)
+
+    # Snapping to an existing FOLDER only works when the query and the folder
+    # spell the artist the same way. It cannot close a numeral-versus-word gap:
+    # five Matchbox Twenty videos live in `Matchbox_20`, so downloading one after
+    # searching "Matchbox Twenty" produced a second `Matchbox_Twenty` folder and a
+    # second Plex collection — the exact fork _resolve_existing_artist exists to
+    # prevent, just via a route it could not see.
+    #
+    # If this specific video id is already tracked, that record says where it was
+    # filed, with no spelling involved. Prefer it. Only for music keys: a video
+    # previously taken from a monitored channel should still be filed under the
+    # artist asked for here, not under that channel's URL.
+    existing_key = source_holding_video(video_id)
+    existing_artist = _artist_from_music_key(existing_key) if existing_key else None
+    if existing_artist and existing_artist != artist:
+        print(f'[music] {video_id} is already filed under {existing_artist!r}; '
+              f'using that instead of {artist!r} to avoid a duplicate artist folder')
+        artist = existing_artist
 
     channel_url = _music_key_for_artist(artist)
     download_id = queue_download(video_id, title, channel_url, final_path=final_path)
@@ -1101,7 +1155,6 @@ def api_browse_folder():
 def api_artists():
     """Return a list of artists for which videos have been downloaded (based on artwork folder names)."""
     config = load_config()
-    artwork_cfg = config.get('artwork_sync', {})
     root_path = _music_root(config)
 
     if not os.path.isdir(root_path):

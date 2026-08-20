@@ -112,6 +112,56 @@ def mark_video_downloaded(video_id, channel_url):
     # place that reliably knows the library changed.
     _invalidate_library_scan()
 
+def is_video_downloaded_anywhere(video_id):
+    """Do we already have this video, under ANY source?
+
+    A YouTube video id is globally unique, so "have we downloaded this?" does not
+    actually depend on which artist or channel we filed it under — and asking
+    per-source gets the answer wrong whenever the folder and the uploader spell
+    the artist differently.
+
+    The case that motivated this: five Matchbox Twenty videos are tracked under
+    `music_video_Matchbox_20`, because the folder is `Matchbox_20`. Searching for
+    "Matchbox Twenty" — the spelling the band's own uploads use — resolves to
+    `music_video_Matchbox_Twenty`, misses, and reports every one of them as not
+    downloaded. Numerals versus words (`20`/`Twenty`, `3`/`Three`, `&`/`and`) are
+    not something _resolve_existing_artist can close, and a substitution table
+    would break artists whose names contain a real number (`Sum 41`, `Blink-182`,
+    `Front 242`).
+
+    Scanning every source sidesteps the question. The tracker is a few dozen ids
+    per source and already in memory, so this is cheaper than the filesystem
+    lookup the caller does to resolve the artist in the first place.
+
+    A video that turns up under a different source than expected still means the
+    file is on disk, which is what the caller is really asking.
+    """
+    tracker = load_downloaded_tracker()
+    for ids in tracker.values():
+        if video_id in ids:
+            return True
+    return False
+
+
+def source_holding_video(video_id):
+    """The tracker key this video is already filed under, or None.
+
+    Used to stop a re-download forking a second artist folder. is_video_downloaded_anywhere()
+    answers "do we have it"; this answers "where did we put it", which is what
+    the download route needs to file a repeat under the same artist instead of
+    inventing a near-duplicate from the search text.
+
+    Returns the first match. A video under two sources is possible (a collab
+    filed under both artists) and either answer is equally correct for this
+    purpose — the point is to reuse an existing folder rather than create one.
+    """
+    tracker = load_downloaded_tracker()
+    for key, ids in tracker.items():
+        if video_id in ids:
+            return key
+    return None
+
+
 def is_video_downloaded(video_id, channel_url):
     tracker = load_downloaded_tracker()
     return video_id in tracker.get(channel_url, [])

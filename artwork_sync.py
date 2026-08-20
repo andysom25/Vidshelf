@@ -10,10 +10,8 @@ Integrated into Vidshelf as a background watcher thread + API endpoint.
 
 import os
 import json
-import time
 import logging
 import re
-import hashlib
 import threading
 import socket
 import ipaddress
@@ -1132,11 +1130,11 @@ def plex_oauth_start(config):
     except requests.exceptions.RequestException as req_exc:
         _log.error("Network or HTTP error during Plex OAuth initiation: %s. Response status: %s, Response text: %s",
                    req_exc, getattr(req_exc.response, 'status_code', 'N/A'), getattr(req_exc.response, 'text', 'N/A'))
-        _log.debug(f"DEBUG: plex_oauth_start returning: (None, None, None) due to RequestException")
+        _log.debug("plex_oauth_start returning (None, None, None) after a RequestException")
         return None, None, None
     except Exception as exc:
         _log.error("An unexpected error occurred during Plex OAuth initiation: %s", exc)
-        _log.debug(f"DEBUG: plex_oauth_start returning: (None, None, None) due to unexpected Exception")
+        _log.debug("plex_oauth_start returning (None, None, None) after an unexpected exception")
         return None, None, None
 
 def plex_oauth_check_pin(config, pin_id):

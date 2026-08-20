@@ -5971,3 +5971,113 @@ config_store.load_config`, and so on). That is deliberate and is what let this
 land without touching any of the 66 route bodies — including, as it happened, a
 feature someone else had in flight in the working tree at the time. Delete those
 aliases only once nothing in `app.py` reads them.
+
+---
+
+## v1.12.0 — the search feature, and the bug that made it dead on arrival
+
+Music Video search gained sorting, an in-results filter and an already-downloaded
+badge. Five bugs surfaced getting it working, and one of them is the useful
+lesson.
+
+### The feature never worked, and the comment said it did
+
+`fetchMusicVideoPage()` carries this:
+
+    // musicVideoSearchArtist must already be set by the caller —
+    // searchMusicVideos() sets it from the search box
+
+`searchMusicVideos()` did not. It was:
+
+    async function searchMusicVideos() {
+        await fetchMusicVideoPage(/*append=*/false);
+    }
+
+So on a fresh page `musicVideoSearchArtist` was `''`, `fetchMusicVideoPage` hit its
+own guard, and the Search button showed "Please enter an artist name" no matter
+what had been typed. **The entire feature was unreachable**, and the first browser
+run against it simply timed out waiting for cards that were never going to render.
+
+The refactor that introduced `onMusicVideoSortChange()` moved "read the box" out
+of `fetchMusicVideoPage` — correctly, since Load More and sort-change must reuse
+the artist actually searched rather than whatever is currently typed — and
+documented the new contract in a comment without giving it to the one caller that
+owned it. A comment asserting a contract is not the contract.
+
+### "Do we have this?" does not depend on where we filed it
+
+The badge first asked per-artist: resolve the query to an existing artist folder,
+build that artist's tracker key, look the video up under it.
+
+That is wrong whenever the folder and the uploader spell the artist differently,
+and this library has exactly that case. Five Matchbox Twenty videos are tracked
+under `music_video_Matchbox_20`, because the folder is `Matchbox_20`. Searching
+"Matchbox Twenty" — the band's own spelling — resolves to
+`music_video_Matchbox_Twenty`, misses all five, and:
+
+  - the badge reported videos already on disk as not downloaded
+  - "hide already downloaded" would not hide them
+  - **downloading one created a second `Matchbox_Twenty` folder and a second Plex
+    collection** — precisely the fork `_resolve_existing_artist` exists to
+    prevent, reached by a route it could not see
+
+`_resolve_existing_artist` cannot close this. It matches names, and no amount of
+name matching bridges `20` to `Twenty`. A substitution table would, and would also
+break `Sum 41`, `Blink-182` and `Front 242`.
+
+**A YouTube video id is globally unique**, so the question does not need the
+artist at all:
+
+  - `tracker.is_video_downloaded_anywhere(video_id)` — for the badge. Scans every
+    source. Cheaper than the `listdir` the caller was already doing to resolve the
+    artist.
+  - `tracker.source_holding_video(video_id)` — for the download route. The
+    existing record says where the video went, with no spelling involved, so a
+    repeat is filed alongside the original.
+
+Only music keys redirect the artist: a video previously taken from a monitored
+channel must still be filed under the artist asked for here, or a music download
+would land outside the artist library entirely.
+
+**Remaining limit, deliberately not closed.** This fixes videos already held. A
+*brand new* Matchbox Twenty video still creates `Matchbox_Twenty`, because there is
+no record to consult. Documented in the release notes rather than papered over.
+
+### Two claims the app was making that were never true
+
+`upload_date` is not returned by yt-dlp's flat search — measured at **0 of 34**
+results on a real query. Two things depended on it:
+
+  - the new "Newest" sort, which therefore sorted every item by `''` and returned
+    the list untouched. Removed. Making it work needs a full probe of *every*
+    result, not just the nine on the current page, because the sort spans the whole
+    cached set — ~34 extra round trips per search, the cost profile that caused the
+    v1.10.1 hang.
+  - `rank_videos_by_quality`'s `score += 10  # Very recent`, gated on an 8-character
+    `upload_date`. **It has never been awarded.** The README and the in-app help
+    text both advertised "upload recency" as a ranking signal. Both corrected; the
+    code is left in place with a comment, since it is right the moment the field is
+    populated. Scoring behaviour is unchanged — only the description was wrong.
+
+### One suspicion that measurement killed
+
+`_resolve_existing_artist` does `os.listdir` plus an `isdir` per entry, and the
+search route now calls it per request. Against a real CIFS mount with 34 artist
+folders that looked like the v1.9.x dashboard problem returning.
+
+Measured: **22ms** (42ms cold). A cached library scan in a cold process is
+**1,326ms**. Reusing the scan would have been slower, not faster, whenever the
+cache was cold. Left alone. Worth stating because the instinct to "fix" it was
+wrong and only a measurement said so.
+
+### pyflakes is now a CI step
+
+Not for style — for one rule: a name used but never defined or imported. That is a
+real failure this project has already had (v1.11.0's `library.py` calling
+`downloader_module.sweep_staging()` without importing `downloader`; `import
+library` succeeded, CI's import check passed, and the function was a guaranteed
+`NameError` during startup).
+
+Installed in its own CI step rather than added to `requirements.txt`, so the suite
+stays dependency-free. The project is clean as of this release: no unused imports,
+no unreachable locals.

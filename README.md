@@ -61,9 +61,11 @@ The Artists page mirrors what shows up in Plex: each tracked artist here becomes
 ### Music Video Finder
 - **Search by artist** — enter an artist name (or artist + song to narrow results), get ranked music video results
 - **Paginated results** — search results are cached server-side; click "Load More" to page through everything found instead of a fixed cutoff
-- **Quality ranking** — results are scored on official-channel match, title quality keywords ("official", "music video", "HD", "4K", "lyric video"), view count, upload recency, and penalized for covers/karaoke/remixes/live versions/Shorts/trailers
+- **Quality ranking** — results are scored on official-channel match, title quality keywords ("official", "music video", "HD", "4K", "lyric video") and view count, and penalized for covers/karaoke/remixes/live versions/Shorts/trailers
 - **Quality labels** — each result shows the best available resolution (4K, 1440p, 1080p, 720p)
-- **Automatic artist matching** — searching "Artist + Song" to narrow results won't fork a duplicate artist folder/collection if that artist is already tracked
+- **Sort and filter results** (v1.12.0+) — sort by best match, most viewed or longest; filter the loaded results by title or channel without a round trip
+- **"✓ Downloaded" badge** (v1.12.0+) — videos already in your library are marked and dimmed, with a "hide already downloaded" toggle. Matched on the video's YouTube ID, so it is right regardless of which artist folder the file was filed under
+- **Automatic artist matching** — searching "Artist + Song" to narrow results won't fork a duplicate artist folder/collection if that artist is already tracked. Re-downloading a video you already have is filed under the artist it is already filed under, which also covers the case where your folder and the uploader spell the artist differently (`Matchbox_20` vs "Matchbox Twenty"). A *brand new* video by such an artist still uses the name you searched for
 - **"Artist - Song" filenames** — music videos are named from the artist you searched for, not from whatever the uploader called the file. A video titled just "Closer" is saved as "Nine Inch Nails - Closer", which is what makes the Plex smart collection pick it up. Uses YouTube's own music metadata when it's available, and handles en-dashes and stylized quote characters
 - **Cookies and the quality cap apply here too** — as of v1.8.0. Age-restricted music videos previously failed with no explanation, and the resolution cap was ignored
 
