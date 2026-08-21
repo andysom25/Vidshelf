@@ -87,4 +87,19 @@ def _set_security_headers(response):
     response.headers.setdefault('X-Content-Type-Options', 'nosniff')
     response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'same-origin')
+
+    # Rendered HTML must not be cached. It carried NO cache headers at all, so
+    # browsers were free to reuse it indefinitely by heuristic — and after an
+    # upgrade that meant the old markup with the new JavaScript. v1.12.0 added
+    # sort/filter controls to the template, and on an updated container they
+    # simply were not there: the page was the previous release's HTML, while the
+    # sidebar happily reported the new version because that comes from an API
+    # call the stale script still makes. It looks exactly like a broken release.
+    #
+    # Only HTML. Flask serves static files with Cache-Control: no-cache and an
+    # ETag already, which is the right trade there: revalidate cheaply, and a
+    # 304 costs nothing. Applying no-store to them would re-download ~170 KB of
+    # JavaScript on every navigation for no benefit.
+    if response.mimetype == 'text/html':
+        response.headers['Cache-Control'] = 'no-store, must-revalidate'
     return response

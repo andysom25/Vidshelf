@@ -758,6 +758,43 @@ def test_no_route_is_registered_twice():
     assert not real, f'the same path is served by more than one endpoint: {real}'
 
 
+def test_html_is_not_cacheable_but_static_assets_are():
+    """Regression, v1.12.1.
+
+    Rendered HTML carried no cache headers at all, so a browser could reuse the
+    previous release's markup indefinitely. After upgrading to v1.12.0 that meant
+    the new JavaScript running against the old template: the sort/filter controls
+    were simply absent, while the sidebar reported the new version because that
+    value comes from an API call the stale script still makes. Indistinguishable
+    from a broken release, and it would recur on every UI change.
+
+    Static assets are deliberately NOT covered: Flask already serves them with
+    Cache-Control: no-cache plus an ETag, so they revalidate for the price of a
+    304. Forcing no-store there would re-download ~170 KB of JavaScript on every
+    navigation to fix a problem it does not have.
+    """
+    client = _client(authenticated=True)
+
+    for path in ('/dashboard', '/login'):
+        resp = client.get(path, follow_redirects=False)
+        # /login redirects when already authenticated; the header must be on
+        # whatever HTML actually comes back.
+        if resp.mimetype != 'text/html':
+            continue
+        cc = resp.headers.get('Cache-Control', '')
+        assert 'no-store' in cc, (
+            f'{path} returned HTML with Cache-Control={cc!r}. Without no-store a '
+            'browser may serve markup from the previous release against the new '
+            'JavaScript.')
+
+    # And the static path must keep its revalidate-with-ETag behaviour.
+    resp = client.get('/static/js/dashboard.js')
+    assert resp.status_code == 200, resp.status_code
+    assert 'no-store' not in resp.headers.get('Cache-Control', ''), (
+        'static assets should revalidate via ETag, not be re-downloaded every '
+        'time — no-store here costs ~170 KB per navigation')
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failures = 0
