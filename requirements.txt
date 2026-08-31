@@ -32,7 +32,7 @@ yt-dlp @ https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.
 # valid cookies and a working JS runtime for signature descrambling (see
 # REFERENCE.md, 2026-08-19). Runs its BotGuard-challenge script through Deno,
 # which the Dockerfile already installs for yt-dlp's own EJS requirement.
-bgutil-ytdlp-pot-provider==1.3.1
+bgutil-ytdlp-pot-provider==1.3.2
 # Bundles yt-dlp's own JS-challenge (nsig/signature) solver script so it runs
 # locally through Deno instead of yt-dlp fetching remote code at runtime via
 # --remote-components. Without this, "n challenge solving failed" and most
